@@ -1,0 +1,32 @@
+<?xml version="1.0"?>
+<info xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:noNamespaceSchemaLocation="https://apps.nextcloud.com/schema/apps/info.xsd">
+    <id>w3ds_login</id>
+    <name>W3DS Login</name>
+    <summary>Cryptographic authentication via the W3DS protocol</summary>
+    <description><![CDATA[
+Enables passwordless login to Nextcloud using the W3DS decentralized identity protocol.
+Users authenticate by scanning a QR code with their eID wallet, which signs a session
+challenge using ECDSA P-256. No passwords are transmitted or stored.
+
+Features:
+- QR code login on the Nextcloud login page
+- Auto-provisioning of new users on first authentication
+- Link/unlink W3DS identity from personal settings
+- Signature verification via the W3DS Registry
+    ]]></description>
+    <version>0.1.0</version>
+    <licence>AGPL-3.0-or-later</licence>
+    <author>Patrick</author>
+    <namespace>W3dsLogin</namespace>
+    <category>security</category>
+    <bugs>https://github.com/patrick/nextcloud-w3ds-login/issues</bugs>
+    <dependencies>
+        <nextcloud min-version="28" max-version="33"/>
+        <php min-version="8.1"/>
+    </dependencies>
+    <settings>
+        <personal>OCA\W3dsLogin\Settings\PersonalSettings</personal>
+        <personal-section>security</personal-section>
+    </settings>
+</info>

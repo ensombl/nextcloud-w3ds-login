@@ -1,0 +1,43 @@
+{
+    "name": "nextcloud/w3ds-login",
+    "description": "W3DS cryptographic authentication for Nextcloud",
+    "license": "AGPL-3.0-or-later",
+    "type": "project",
+    "require": {
+        "php": ">=8.1"
+    },
+    "require-dev": {
+        "nextcloud/ocp": "dev-master",
+        "phpunit/phpunit": "^10",
+        "vimeo/psalm": "^5",
+        "nextcloud/coding-standard": "^1"
+    },
+    "autoload": {
+        "psr-4": {
+            "OCA\\W3dsLogin\\": "app/lib/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "OCA\\W3dsLogin\\Tests\\": "tests/"
+        }
+    },
+    "config": {
+        "optimize-autoloader": true,
+        "classmap-authoritative": true,
+        "platform": {
+            "php": "8.1"
+        },
+        "allow-plugins": {
+            "composer/package-versions-deprecated": true
+        }
+    },
+    "scripts": {
+        "lint": "find app/lib app/appinfo -name '*.php' -print0 | xargs -0 -n1 php -l",
+        "cs:check": "php-cs-fixer fix --dry-run --diff",
+        "cs:fix": "php-cs-fixer fix",
+        "psalm": "psalm --no-cache",
+        "test": "phpunit --configuration tests/phpunit.xml",
+        "test:coverage": "phpunit --configuration tests/phpunit.xml --coverage-text"
+    }
+}

@@ -1,0 +1,46 @@
+services:
+  db:
+    image: mariadb:10.11
+    restart: unless-stopped
+    command: >-
+      --transaction-isolation=READ-COMMITTED
+      --log-bin=binlog
+      --binlog-format=ROW
+      --innodb-read-only-compressed=OFF
+    volumes:
+      - db_data:/var/lib/mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-rootpassword}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-nextcloud}
+      MYSQL_USER: ${MYSQL_USER:-nextcloud}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-nextcloud}
+
+  app:
+    build:
+      context: ./docker
+      args:
+        NEXTCLOUD_IMAGE_TAG: ${NEXTCLOUD_IMAGE_TAG:-stable}
+    restart: unless-stopped
+    ports:
+      - "${NEXTCLOUD_PORT:-8080}:80"
+    depends_on:
+      - db
+    volumes:
+      - nextcloud_data:/var/www/html
+      - ./app:/var/www/html/custom_apps/w3ds_login
+      - ./docker/nextcloud-dev.config.php:/var/www/html/config/dev.config.php:ro
+    environment:
+      MYSQL_HOST: db
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-nextcloud}
+      MYSQL_USER: ${MYSQL_USER:-nextcloud}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-nextcloud}
+      NEXTCLOUD_ADMIN_USER: ${NEXTCLOUD_ADMIN_USER:-admin}
+      NEXTCLOUD_ADMIN_PASSWORD: ${NEXTCLOUD_ADMIN_PASSWORD:-admin}
+      NEXTCLOUD_TRUSTED_DOMAINS: localhost
+      XDEBUG_MODE: ${XDEBUG_MODE:-off}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  db_data:
+  nextcloud_data:

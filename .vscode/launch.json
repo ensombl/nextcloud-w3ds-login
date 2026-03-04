@@ -1,0 +1,28 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Start Dev Environment",
+            "type": "php",
+            "request": "launch",
+            "port": 9003,
+            "pathMappings": {
+                "/var/www/html/custom_apps/w3ds_login": "${workspaceFolder}/app"
+            },
+            "preLaunchTask": "docker-compose-up",
+            "hostname": "0.0.0.0",
+            "log": true
+        },
+        {
+            "name": "Listen for Xdebug",
+            "type": "php",
+            "request": "launch",
+            "port": 9003,
+            "pathMappings": {
+                "/var/www/html/custom_apps/w3ds_login": "${workspaceFolder}/app"
+            },
+            "hostname": "0.0.0.0",
+            "log": true
+        }
+    ]
+}

@@ -1,0 +1,80 @@
+name: Build and Publish to App Store
+
+on:
+  release:
+    types: [published]
+
+env:
+  APP_NAME: w3ds_login
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    environment: release
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          path: ${{ env.APP_NAME }}
+
+      - name: Get release version
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          coverage: none
+
+      - name: Install Composer dependencies
+        working-directory: ${{ env.APP_NAME }}
+        run: composer install --no-dev --optimize-autoloader --no-progress
+
+      - name: Build app package
+        run: |
+          mkdir -p build
+          rsync -a \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='.vscode' \
+            --exclude='.env' \
+            --exclude='.env.example' \
+            --exclude='.gitignore' \
+            --exclude='.nextcloudignore' \
+            --exclude='.php-cs-fixer.dist.php' \
+            --exclude='.php-cs-fixer.cache' \
+            --exclude='docker' \
+            --exclude='docker-compose.yml' \
+            --exclude='Makefile' \
+            --exclude='krankerl.toml' \
+            --exclude='psalm.xml' \
+            --exclude='tests' \
+            --exclude='CHANGELOG.md' \
+            --exclude='composer.json' \
+            --exclude='composer.lock' \
+            "${{ env.APP_NAME }}/app/" "build/${{ env.APP_NAME }}/"
+
+      - name: Create tarball
+        run: |
+          cd build
+          tar -czf "${{ env.APP_NAME }}-${{ steps.version.outputs.version }}.tar.gz" "${{ env.APP_NAME }}"
+
+      - name: Upload tarball to release
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: build/${{ env.APP_NAME }}-${{ steps.version.outputs.version }}.tar.gz
+          tag: ${{ github.ref }}
+
+      - name: Publish to Nextcloud App Store
+        if: "!github.event.release.prerelease"
+        uses: R0Wi/nextcloud-appstore-push-action@v1
+        with:
+          app_name: ${{ env.APP_NAME }}
+          appstore_token: ${{ secrets.APPSTORE_TOKEN }}
+          download_url: https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/${{ env.APP_NAME }}-${{ steps.version.outputs.version }}.tar.gz
+          app_private_key: ${{ secrets.APP_PRIVATE_KEY }}
+          app_public_cert: ${{ secrets.APP_PUBLIC_CRT }}
+          nightly: ${{ github.event.release.prerelease }}

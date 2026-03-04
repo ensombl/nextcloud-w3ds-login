@@ -1,0 +1,26 @@
+# Environment
+.env
+
+# Docker volumes
+volumes/
+
+# PHP dependencies
+app/vendor/
+app/vendor-bin/*/vendor/
+
+# Tooling caches
+app/.php-cs-fixer.cache
+app/tests/.phpunit.cache
+.php-cs-fixer.cache
+.phpunit.cache
+
+# Build artifacts
+build/
+
+# IDE
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
