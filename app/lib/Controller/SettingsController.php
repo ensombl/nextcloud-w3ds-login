@@ -11,9 +11,9 @@ use OCA\W3dsLogin\Service\W3dsAuthService;
 use OCP\AppFramework\Controller;
 use OCP\AppFramework\Http;
 use OCP\AppFramework\Http\JSONResponse;
-use OCP\AppFramework\Http\TemplateResponse;
 use OCP\IRequest;
 use OCP\IURLGenerator;
+use OCP\IUserManager;
 use OCP\IUserSession;
 use Psr\Log\LoggerInterface;
 
@@ -24,6 +24,7 @@ class SettingsController extends Controller {
         private UserProvisioningService $provisioningService,
         private QrCodeService $qrCodeService,
         private IURLGenerator $urlGenerator,
+        private IUserManager $userManager,
         private IUserSession $userSession,
         private LoggerInterface $logger,
     ) {
@@ -31,44 +32,11 @@ class SettingsController extends Controller {
     }
 
     /**
-     * Show the QR code linking page for an authenticated user.
+     * Start a linking session and return JSON with QR data.
      *
      * @NoAdminRequired
-     * @NoCSRFRequired
      */
-    public function linkOffer(): TemplateResponse {
-        $callbackUrl = $this->urlGenerator->linkToRouteAbsolute(
-            Application::APP_ID . '.settings.linkCallback',
-        );
-
-        $authSession = $this->authService->createSession($callbackUrl, 'Nextcloud (link account)');
-
-        $statusUrl = $this->urlGenerator->linkToRouteAbsolute(
-            Application::APP_ID . '.auth.status',
-            ['session' => $authSession['sessionId']],
-        );
-
-        $qrSvg = $this->qrCodeService->generateSvg($authSession['uri']);
-
-        return new TemplateResponse(
-            Application::APP_ID,
-            'link',
-            [
-                'w3dsUri' => $authSession['uri'],
-                'sessionId' => $authSession['sessionId'],
-                'statusUrl' => $statusUrl,
-                'qrSvg' => $qrSvg,
-            ],
-        );
-    }
-
-    /**
-     * Receive the signed callback for account linking.
-     *
-     * @NoAdminRequired
-     * @NoCSRFRequired
-     */
-    public function linkCallback(): JSONResponse {
+    public function linkStart(): JSONResponse {
         $user = $this->userSession->getUser();
         if ($user === null) {
             return new JSONResponse(
@@ -77,49 +45,72 @@ class SettingsController extends Controller {
             );
         }
 
-        $w3id = $this->request->getParam('w3id', '');
-        $sessionId = $this->request->getParam('session', '');
-        $signature = $this->request->getParam('signature', '');
+        $callbackUrl = $this->urlGenerator->linkToRouteAbsolute(
+            Application::APP_ID . '.auth.callback',
+        );
 
-        if (empty($w3id) || empty($sessionId) || empty($signature)) {
+        $authSession = $this->authService->createSession(
+            $callbackUrl,
+            'Nextcloud',
+            $user->getUID(),
+        );
+
+        $statusUrl = $this->urlGenerator->linkToRouteAbsolute(
+            Application::APP_ID . '.settings.linkStatus',
+            ['session' => $authSession['sessionId']],
+        );
+
+        $qrSvg = $this->qrCodeService->generateSvg($authSession['uri']);
+
+        return new JSONResponse([
+            'qrSvg' => $qrSvg,
+            'w3dsUri' => $authSession['uri'],
+            'statusUrl' => $statusUrl,
+            'sessionId' => $authSession['sessionId'],
+        ]);
+    }
+
+    /**
+     * Poll endpoint for the linking modal to check status.
+     *
+     * @NoAdminRequired
+     * @NoCSRFRequired
+     */
+    public function linkStatus(): JSONResponse {
+        $sessionId = $this->request->getParam('session', '');
+
+        if (empty($sessionId)) {
             return new JSONResponse(
-                ['error' => 'Missing required fields'],
+                ['error' => 'Missing session parameter'],
                 Http::STATUS_BAD_REQUEST,
             );
         }
 
         $sessionData = $this->authService->getSessionStatus($sessionId);
-        if ($sessionData === null || $sessionData['status'] !== 'pending') {
-            return new JSONResponse(
-                ['error' => 'Session expired or invalid'],
-                Http::STATUS_UNAUTHORIZED,
-            );
+        if ($sessionData === null) {
+            return new JSONResponse(['status' => 'expired']);
         }
 
-        if (!$this->authService->verifySignature($w3id, $sessionId, $signature)) {
-            return new JSONResponse(
-                ['error' => 'Signature verification failed'],
-                Http::STATUS_UNAUTHORIZED,
-            );
+        // Verify the polling user owns this session
+        $user = $this->userSession->getUser();
+        if ($user === null || ($sessionData['ncUid'] ?? null) !== $user->getUID()) {
+            return new JSONResponse(['status' => 'expired']);
         }
 
-        try {
-            $this->provisioningService->linkUser($w3id, $user->getUID());
-        } catch (\RuntimeException $e) {
-            return new JSONResponse(
-                ['error' => $e->getMessage()],
-                Http::STATUS_CONFLICT,
-            );
+        if ($sessionData['status'] === 'authenticated') {
+            $this->authService->consumeSession($sessionId);
+            return new JSONResponse(['status' => 'linked']);
         }
 
-        $this->authService->markSessionComplete($sessionId, $user->getUID());
+        if ($sessionData['status'] === 'failed') {
+            $this->authService->consumeSession($sessionId);
+            return new JSONResponse([
+                'status' => 'failed',
+                'error' => $sessionData['error'] ?? 'Unknown error',
+            ]);
+        }
 
-        $this->logger->info('User linked W3DS identity', [
-            'uid' => $user->getUID(),
-            'w3id' => $w3id,
-        ]);
-
-        return new JSONResponse(['status' => 'linked']);
+        return new JSONResponse(['status' => $sessionData['status']]);
     }
 
     /**
@@ -133,6 +124,14 @@ class SettingsController extends Controller {
             return new JSONResponse(
                 ['error' => 'Not authenticated'],
                 Http::STATUS_UNAUTHORIZED,
+            );
+        }
+
+        $email = $user->getEMailAddress();
+        if (empty($email)) {
+            return new JSONResponse(
+                ['error' => 'Set an email address before unlinking'],
+                Http::STATUS_FORBIDDEN,
             );
         }
 

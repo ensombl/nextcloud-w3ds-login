@@ -14,6 +14,7 @@ class QrCodeService {
     public function generateSvg(string $data, int $scale = 6): string {
         $options = new QROptions([
             'outputType' => QRCode::OUTPUT_MARKUP_SVG,
+            'outputBase64' => false,
             'svgViewBoxSize' => null,
             'addQuietzone' => true,
             'quietzoneSize' => 2,

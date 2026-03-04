@@ -37,13 +37,17 @@ class W3dsAuthService {
     /**
      * @return array{sessionId: string, uri: string}
      */
-    public function createSession(string $callbackUrl, string $platform = 'Nextcloud'): array {
+    public function createSession(string $callbackUrl, string $platform = 'Nextcloud', ?string $ncUid = null): array {
         $sessionId = $this->secureRandom->generate(32, ISecureRandom::CHAR_ALPHANUMERIC);
 
-        $this->cache->set(self::SESSION_PREFIX . $sessionId, [
+        $data = [
             'status' => 'pending',
             'created' => time(),
-        ], self::SESSION_TTL);
+        ];
+        if ($ncUid !== null) {
+            $data['ncUid'] = $ncUid;
+        }
+        $this->cache->set(self::SESSION_PREFIX . $sessionId, $data, self::SESSION_TTL);
 
         $uri = 'w3ds://auth?' . http_build_query([
             'redirect' => $callbackUrl,
@@ -59,6 +63,16 @@ class W3dsAuthService {
      */
     public function getSessionStatus(string $sessionId): ?array {
         return $this->cache->get(self::SESSION_PREFIX . $sessionId);
+    }
+
+    public function markSessionFailed(string $sessionId, string $error): void {
+        $data = $this->cache->get(self::SESSION_PREFIX . $sessionId);
+        if ($data === null) {
+            return;
+        }
+        $data['status'] = 'failed';
+        $data['error'] = $error;
+        $this->cache->set(self::SESSION_PREFIX . $sessionId, $data, self::SESSION_TTL);
     }
 
     public function markSessionComplete(string $sessionId, string $userId): void {
@@ -168,7 +182,7 @@ class W3dsAuthService {
 
     private function getRegistryBaseUrl(): string {
         return rtrim(
-            $this->config->getAppValue(Application::APP_ID, 'registry_base_url', 'https://registry.w3ds.org'),
+            $this->config->getAppValue(Application::APP_ID, 'registry_base_url', 'https://registry.w3ds.metastate.foundation'),
             '/',
         );
     }
@@ -183,7 +197,7 @@ class W3dsAuthService {
         $response = $client->get($url, ['timeout' => 10]);
         $body = json_decode($response->getBody(), true);
 
-        return $body['evaultUrl'] ?? null;
+        return $body['uri'] ?? $body['evaultUrl'] ?? null;
     }
 
     /**
@@ -200,6 +214,10 @@ class W3dsAuthService {
         $body = json_decode($response->getBody(), true);
 
         // The response contains an array of JWT strings
+        if (is_array($body) && isset($body['keyBindingCertificates'])) {
+            return $body['keyBindingCertificates'];
+        }
+
         if (is_array($body) && isset($body['certificates'])) {
             return $body['certificates'];
         }
@@ -409,7 +427,7 @@ class W3dsAuthService {
         $data = substr($encoded, 1);
 
         return match ($prefix) {
-            'z' => $this->base58btcDecode($data),
+            'z' => $this->base58btcDecode($data) ?? (ctype_xdigit($data) ? hex2bin($data) ?: null : null),
             'm' => base64_decode($data, true) ?: null,
             'f' => hex2bin($data) ?: null,
             default => null,

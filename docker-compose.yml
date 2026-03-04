@@ -28,7 +28,9 @@ services:
     volumes:
       - nextcloud_data:/var/www/html
       - ./app:/var/www/html/custom_apps/w3ds_login
-      - ./docker/nextcloud-dev.config.php:/var/www/html/config/dev.config.php:ro
+      - ./vendor:/var/www/html/custom_apps/w3ds_login/vendor
+      - ./docker/nextcloud-dev.config.php:/dev-config/nextcloud-dev.config.php:ro
+      - ./docker/hooks/before-starting.sh:/docker-entrypoint-hooks.d/before-starting/dev-config.sh:ro
     environment:
       MYSQL_HOST: db
       MYSQL_DATABASE: ${MYSQL_DATABASE:-nextcloud}

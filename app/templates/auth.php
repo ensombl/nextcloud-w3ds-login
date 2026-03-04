@@ -110,12 +110,13 @@ $qrSvg = $_['qrSvg'];
     }
 
     .w3ds-status-success {
-        color: var(--color-success, #46ba61);
+        color: #46ba61;
         font-weight: 500;
     }
 
     .w3ds-status-error {
-        color: var(--color-error, #e9322d);
+        color: #ff6b6b;
+        font-weight: 500;
     }
 
     .w3ds-spinner {

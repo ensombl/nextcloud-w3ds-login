@@ -77,8 +77,14 @@ class UserProvisioningService {
      * @throws \RuntimeException If the W3ID is already linked to another user
      */
     public function linkUser(string $w3id, string $ncUid): void {
-        if ($this->mapper->existsByW3id($w3id)) {
+        try {
+            $existing = $this->mapper->findByW3id($w3id);
+            if ($existing->getNcUid() === $ncUid) {
+                return; // Already linked to this user, nothing to do
+            }
             throw new \RuntimeException('This W3DS identity is already linked to another account');
+        } catch (DoesNotExistException) {
+            // Not linked yet, proceed
         }
 
         // Remove any existing mapping for this NC user

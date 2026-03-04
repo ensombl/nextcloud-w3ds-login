@@ -5,6 +5,7 @@
 volumes/
 
 # PHP dependencies
+vendor/
 app/vendor/
 app/vendor-bin/*/vendor/
 

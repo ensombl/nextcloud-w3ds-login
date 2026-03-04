@@ -22,13 +22,15 @@ class PersonalSettings implements ISettings {
     public function getForm(): TemplateResponse {
         $user = $this->userSession->getUser();
         $linkedW3id = null;
-        $linkUrl = '';
+        $hasEmail = false;
+        $linkStartUrl = '';
         $unlinkUrl = '';
 
         if ($user !== null) {
             $linkedW3id = $this->provisioningService->getLinkedW3id($user->getUID());
-            $linkUrl = $this->urlGenerator->linkToRoute(
-                Application::APP_ID . '.settings.linkOffer',
+            $hasEmail = !empty($user->getEMailAddress());
+            $linkStartUrl = $this->urlGenerator->linkToRoute(
+                Application::APP_ID . '.settings.linkStart',
             );
             $unlinkUrl = $this->urlGenerator->linkToRoute(
                 Application::APP_ID . '.settings.unlink',
@@ -40,7 +42,8 @@ class PersonalSettings implements ISettings {
             'settings-personal',
             [
                 'linkedW3id' => $linkedW3id,
-                'linkUrl' => $linkUrl,
+                'hasEmail' => $hasEmail,
+                'linkStartUrl' => $linkStartUrl,
                 'unlinkUrl' => $unlinkUrl,
             ],
         );

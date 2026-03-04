@@ -67,18 +67,64 @@ class AuthController extends Controller {
     }
 
     /**
+     * CORS preflight for the callback endpoint.
+     *
+     * @PublicPage
+     * @NoCSRFRequired
+     */
+    public function preflight(): JSONResponse {
+        $response = new JSONResponse(null, Http::STATUS_NO_CONTENT);
+        $this->addCorsHeaders($response);
+        return $response;
+    }
+
+    /**
      * Receive the signed authentication callback from the eID wallet.
      *
      * @PublicPage
      * @NoCSRFRequired
      */
     public function callback(): JSONResponse {
-        $w3id = $this->request->getParam('w3id', '');
+        // The wallet sends JSON with "ename" (docs say "w3id", accept both)
+        $w3id = $this->request->getParam('w3id', '') ?: $this->request->getParam('ename', '');
         $sessionId = $this->request->getParam('session', '');
         $signature = $this->request->getParam('signature', '');
 
+        // Fallback: parse raw body if params are empty (Nextcloud may not
+        // auto-parse JSON for public/CSRF-free routes)
+        if (empty($w3id) && empty($sessionId) && empty($signature)) {
+            $raw = file_get_contents('php://input');
+            $body = json_decode($raw ?: '', true) ?? [];
+            $w3id = $body['w3id'] ?? $body['ename'] ?? '';
+            $sessionId = $body['session'] ?? '';
+            $signature = $body['signature'] ?? '';
+
+            $this->logger->debug('W3DS callback raw body', [
+                'raw_length' => strlen($raw ?: ''),
+                'parsed_keys' => array_keys($body),
+                'content_type' => $this->request->getHeader('Content-Type'),
+            ]);
+        }
+
         if (empty($w3id) || empty($sessionId) || empty($signature)) {
-            return new JSONResponse(
+            // Log all received params to discover wallet's actual field names
+            $allParams = [];
+            foreach (['w3id', 'eName', 'ename', 'e_name', 'session', 'signature', 'appVersion'] as $k) {
+                $v = $this->request->getParam($k);
+                if ($v !== null) {
+                    $allParams[$k] = substr((string)$v, 0, 40);
+                }
+            }
+            $raw = file_get_contents('php://input') ?: '';
+            $this->logger->warning('W3DS callback missing fields', [
+                'has_w3id' => !empty($w3id),
+                'has_session' => !empty($sessionId),
+                'has_signature' => !empty($signature),
+                'known_params' => $allParams,
+                'raw_body' => substr($raw, 0, 500),
+                'content_type' => $this->request->getHeader('Content-Type'),
+            ]);
+            return $this->corsResponse(
                 ['error' => 'Missing required fields'],
                 Http::STATUS_BAD_REQUEST,
             );
@@ -86,14 +132,14 @@ class AuthController extends Controller {
 
         $sessionData = $this->authService->getSessionStatus($sessionId);
         if ($sessionData === null) {
-            return new JSONResponse(
+            return $this->corsResponse(
                 ['error' => 'Session expired or invalid'],
                 Http::STATUS_UNAUTHORIZED,
             );
         }
 
         if ($sessionData['status'] !== 'pending') {
-            return new JSONResponse(
+            return $this->corsResponse(
                 ['error' => 'Session already consumed'],
                 Http::STATUS_CONFLICT,
             );
@@ -104,15 +150,49 @@ class AuthController extends Controller {
                 'w3id' => $w3id,
                 'session' => $sessionId,
             ]);
-            return new JSONResponse(
+            return $this->corsResponse(
                 ['error' => 'Signature verification failed'],
                 Http::STATUS_UNAUTHORIZED,
             );
         }
 
+        // Check if this is a linking session (has ncUid) or a login session
+        $ncUid = $sessionData['ncUid'] ?? null;
+
+        if ($ncUid !== null) {
+            // Linking flow: attach W3ID to existing account
+            if ($this->userManager->get($ncUid) === null) {
+                $this->logger->warning('W3DS link: user no longer exists', ['ncUid' => $ncUid]);
+                return $this->corsResponse(
+                    ['error' => 'User account no longer exists'],
+                    Http::STATUS_BAD_REQUEST,
+                );
+            }
+            try {
+                $this->provisioningService->linkUser($w3id, $ncUid);
+            } catch (\RuntimeException $e) {
+                $this->logger->warning('W3DS link failed: ' . $e->getMessage(), [
+                    'w3id' => $w3id,
+                    'ncUid' => $ncUid,
+                ]);
+                $this->authService->markSessionFailed($sessionId, $e->getMessage());
+                return $this->corsResponse(
+                    ['error' => $e->getMessage()],
+                    Http::STATUS_CONFLICT,
+                );
+            }
+            $this->authService->markSessionComplete($sessionId, $ncUid);
+            $this->logger->info('User linked W3DS identity', [
+                'uid' => $ncUid,
+                'w3id' => $w3id,
+            ]);
+            return $this->corsResponse(['status' => 'ok']);
+        }
+
+        // Login flow: find or create user
         $user = $this->provisioningService->findOrCreateUser($w3id);
         if ($user === null) {
-            return new JSONResponse(
+            return $this->corsResponse(
                 ['error' => 'Failed to provision user'],
                 Http::STATUS_INTERNAL_SERVER_ERROR,
             );
@@ -120,7 +200,20 @@ class AuthController extends Controller {
 
         $this->authService->markSessionComplete($sessionId, $user->getUID());
 
-        return new JSONResponse(['status' => 'ok']);
+        return $this->corsResponse(['status' => 'ok']);
+    }
+
+    private function corsResponse(mixed $data, int $status = Http::STATUS_OK): JSONResponse {
+        $response = new JSONResponse($data, $status);
+        $this->addCorsHeaders($response);
+        return $response;
+    }
+
+    private function addCorsHeaders(JSONResponse $response): void {
+        $response->addHeader('Access-Control-Allow-Origin', '*');
+        $response->addHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+        $response->addHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+        $response->addHeader('Access-Control-Max-Age', '86400');
     }
 
     /**
@@ -195,6 +288,6 @@ class AuthController extends Controller {
 
         $this->logger->info('W3DS login completed', ['uid' => $userId]);
 
-        return new RedirectResponse($this->urlGenerator->linkToDefaultPage());
+        return new RedirectResponse($this->urlGenerator->getAbsoluteURL('/'));
     }
 }
