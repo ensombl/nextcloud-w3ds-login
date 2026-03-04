@@ -9,6 +9,9 @@ vendor/
 app/vendor/
 app/vendor-bin/*/vendor/
 
+# Docker autoloader symlink (app/app -> . for container path resolution)
+app/app
+
 # Tooling caches
 app/.php-cs-fixer.cache
 app/tests/.phpunit.cache
