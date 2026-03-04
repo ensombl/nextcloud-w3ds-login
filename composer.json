@@ -4,7 +4,10 @@
     "license": "AGPL-3.0-or-later",
     "type": "project",
     "require": {
-        "php": ">=8.1"
+        "php": ">=8.1",
+        "ext-gmp": "*",
+        "ext-openssl": "*",
+        "chillerlan/php-qrcode": "^5"
     },
     "require-dev": {
         "nextcloud/ocp": "dev-master",

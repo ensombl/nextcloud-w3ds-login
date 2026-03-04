@@ -10,6 +10,7 @@ Util::addScript('w3ds_login', 'poll');
 $w3dsUri = $_['w3dsUri'];
 $sessionId = $_['sessionId'];
 $statusUrl = $_['statusUrl'];
+$qrSvg = $_['qrSvg'];
 
 ?>
 
@@ -23,21 +24,8 @@ $statusUrl = $_['statusUrl'];
         </div>
 
         <div class="w3ds-qr-container">
-            <div id="w3ds-qr" class="w3ds-qr">
-                <div class="w3ds-qr-placeholder">
-                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200">
-                        <rect width="200" height="200" rx="12" fill="#f5f5f5" stroke="#ddd" stroke-width="1"/>
-                        <g transform="translate(100,80)" text-anchor="middle">
-                            <text font-size="48" fill="#0082c9">&#x2B1A;</text>
-                        </g>
-                        <text x="100" y="140" text-anchor="middle" font-size="11" fill="#666" font-family="sans-serif">
-                            QR Code
-                        </text>
-                        <text x="100" y="158" text-anchor="middle" font-size="9" fill="#999" font-family="sans-serif">
-                            Install php-qrcode for production
-                        </text>
-                    </svg>
-                </div>
+            <div class="w3ds-qr">
+                <?php print_unescaped($qrSvg); ?>
             </div>
 
             <div id="w3ds-status" class="w3ds-status">

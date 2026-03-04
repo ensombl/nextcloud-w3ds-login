@@ -8,6 +8,7 @@ return [
         ['name' => 'auth#offer', 'url' => '/auth/offer', 'verb' => 'GET'],
         ['name' => 'auth#callback', 'url' => '/auth/callback', 'verb' => 'POST'],
         ['name' => 'auth#status', 'url' => '/auth/status', 'verb' => 'GET'],
+        ['name' => 'auth#completeLogin', 'url' => '/auth/complete', 'verb' => 'GET'],
 
         // Personal settings (authenticated)
         ['name' => 'settings#linkOffer', 'url' => '/settings/link', 'verb' => 'GET'],

@@ -5,15 +5,17 @@ declare(strict_types=1);
 namespace OCA\W3dsLogin\Controller;
 
 use OCA\W3dsLogin\AppInfo\Application;
+use OCA\W3dsLogin\Service\QrCodeService;
 use OCA\W3dsLogin\Service\UserProvisioningService;
 use OCA\W3dsLogin\Service\W3dsAuthService;
 use OCP\AppFramework\Controller;
 use OCP\AppFramework\Http;
 use OCP\AppFramework\Http\JSONResponse;
+use OCP\AppFramework\Http\RedirectResponse;
 use OCP\AppFramework\Http\TemplateResponse;
 use OCP\IRequest;
-use OCP\ISession;
 use OCP\IURLGenerator;
+use OCP\IUserManager;
 use OCP\IUserSession;
 use Psr\Log\LoggerInterface;
 
@@ -22,9 +24,10 @@ class AuthController extends Controller {
         IRequest $request,
         private W3dsAuthService $authService,
         private UserProvisioningService $provisioningService,
+        private QrCodeService $qrCodeService,
         private IURLGenerator $urlGenerator,
+        private IUserManager $userManager,
         private IUserSession $userSession,
-        private ISession $session,
         private LoggerInterface $logger,
     ) {
         parent::__construct(Application::APP_ID, $request);
@@ -48,6 +51,8 @@ class AuthController extends Controller {
             ['session' => $authSession['sessionId']],
         );
 
+        $qrSvg = $this->qrCodeService->generateSvg($authSession['uri']);
+
         return new TemplateResponse(
             Application::APP_ID,
             'auth',
@@ -55,6 +60,7 @@ class AuthController extends Controller {
                 'w3dsUri' => $authSession['uri'],
                 'sessionId' => $authSession['sessionId'],
                 'statusUrl' => $statusUrl,
+                'qrSvg' => $qrSvg,
             ],
             'guest',
         );
@@ -70,7 +76,6 @@ class AuthController extends Controller {
         $w3id = $this->request->getParam('w3id', '');
         $sessionId = $this->request->getParam('session', '');
         $signature = $this->request->getParam('signature', '');
-        $appVersion = $this->request->getParam('appVersion', '');
 
         if (empty($w3id) || empty($sessionId) || empty($signature)) {
             return new JSONResponse(
@@ -136,15 +141,13 @@ class AuthController extends Controller {
 
         $sessionData = $this->authService->getSessionStatus($sessionId);
         if ($sessionData === null) {
-            return new JSONResponse([
-                'status' => 'expired',
-            ]);
+            return new JSONResponse(['status' => 'expired']);
         }
 
         if ($sessionData['status'] === 'authenticated') {
             $userId = $this->authService->consumeSession($sessionId);
             if ($userId !== null) {
-                $loginToken = $this->createLoginToken($userId);
+                $loginToken = $this->authService->createLoginToken($userId);
                 return new JSONResponse([
                     'status' => 'authenticated',
                     'loginUrl' => $this->urlGenerator->linkToRouteAbsolute(
@@ -155,21 +158,43 @@ class AuthController extends Controller {
             }
         }
 
-        return new JSONResponse([
-            'status' => $sessionData['status'],
-        ]);
+        return new JSONResponse(['status' => $sessionData['status']]);
     }
 
     /**
-     * Generate a one-time login token and store it in the session cache.
+     * Complete the login by consuming a one-time token, creating a session,
+     * and redirecting the user to the Nextcloud home page.
+     *
+     * @PublicPage
+     * @NoCSRFRequired
+     * @UseSession
      */
-    private function createLoginToken(string $userId): string {
-        $token = bin2hex(random_bytes(32));
+    public function completeLogin(): RedirectResponse {
+        $token = $this->request->getParam('token', '');
+        $loginPage = $this->urlGenerator->linkToRouteAbsolute('core.login.showLoginForm');
 
-        // Store the login token temporarily so completeLogin can verify it
-        $this->session->set('w3ds_login_token', $token);
-        $this->session->set('w3ds_login_user', $userId);
+        if (empty($token)) {
+            return new RedirectResponse($loginPage);
+        }
 
-        return $token;
+        $userId = $this->authService->consumeLoginToken($token);
+        if ($userId === null) {
+            $this->logger->warning('Invalid or expired login token');
+            return new RedirectResponse($loginPage);
+        }
+
+        $user = $this->userManager->get($userId);
+        if ($user === null) {
+            $this->logger->error('Login token referenced non-existent user', ['uid' => $userId]);
+            return new RedirectResponse($loginPage);
+        }
+
+        // Establish the Nextcloud session
+        $this->userSession->setUser($user);
+        $this->userSession->createSessionToken($this->request, $userId, $userId);
+
+        $this->logger->info('W3DS login completed', ['uid' => $userId]);
+
+        return new RedirectResponse($this->urlGenerator->linkToDefaultPage());
     }
 }

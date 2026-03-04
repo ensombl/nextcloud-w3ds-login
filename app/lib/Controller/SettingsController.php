@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace OCA\W3dsLogin\Controller;
 
 use OCA\W3dsLogin\AppInfo\Application;
+use OCA\W3dsLogin\Service\QrCodeService;
 use OCA\W3dsLogin\Service\UserProvisioningService;
 use OCA\W3dsLogin\Service\W3dsAuthService;
 use OCP\AppFramework\Controller;
@@ -21,6 +22,7 @@ class SettingsController extends Controller {
         IRequest $request,
         private W3dsAuthService $authService,
         private UserProvisioningService $provisioningService,
+        private QrCodeService $qrCodeService,
         private IURLGenerator $urlGenerator,
         private IUserSession $userSession,
         private LoggerInterface $logger,
@@ -46,6 +48,8 @@ class SettingsController extends Controller {
             ['session' => $authSession['sessionId']],
         );
 
+        $qrSvg = $this->qrCodeService->generateSvg($authSession['uri']);
+
         return new TemplateResponse(
             Application::APP_ID,
             'link',
@@ -53,6 +57,7 @@ class SettingsController extends Controller {
                 'w3dsUri' => $authSession['uri'],
                 'sessionId' => $authSession['sessionId'],
                 'statusUrl' => $statusUrl,
+                'qrSvg' => $qrSvg,
             ],
         );
     }
