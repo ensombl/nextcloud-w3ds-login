@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(docker compose exec -T app ls -la /var/www/html/custom_apps/w3ds_login/app/lib/Controller/)"
+    ]
+  }
+}

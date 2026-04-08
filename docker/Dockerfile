@@ -9,3 +9,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY xdebug.ini /usr/local/etc/php/conf.d/xdebug.ini
+COPY entrypoint-wrapper.sh /entrypoint-wrapper.sh
+RUN chmod +x /entrypoint-wrapper.sh
+
+ENTRYPOINT ["/entrypoint-wrapper.sh"]
+CMD ["apache2-foreground"]
