@@ -55,4 +55,14 @@ class W3dsMappingMapper extends QBMapper {
             return false;
         }
     }
+
+    /**
+     * @return W3dsMapping[]
+     */
+    public function findAll(): array {
+        $qb = $this->db->getQueryBuilder();
+        $qb->select('*')->from($this->getTableName());
+
+        return $this->findEntities($qb);
+    }
 }
