@@ -15,5 +15,11 @@ return [
         ['name' => 'settings#linkStart', 'url' => '/settings/link/start', 'verb' => 'POST'],
         ['name' => 'settings#linkStatus', 'url' => '/settings/link/status', 'verb' => 'GET'],
         ['name' => 'settings#unlink', 'url' => '/settings/unlink', 'verb' => 'POST'],
+
+        // eVault webhook (public, receives awareness protocol packets)
+        ['name' => 'webhook#receive', 'url' => '/api/webhook', 'verb' => 'POST'],
+
+        // Per-room poll of participant eVaults (authenticated; client-driven every ~15s)
+        ['name' => 'poll#pollRoom', 'url' => '/api/rooms/{token}/poll', 'verb' => 'POST'],
     ],
 ];
