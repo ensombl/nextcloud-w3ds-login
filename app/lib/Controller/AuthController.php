@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace OCA\W3dsLogin\Controller;
 
 use OCA\W3dsLogin\AppInfo\Application;
+use OCA\W3dsLogin\BackgroundJob\InitialSyncJob;
 use OCA\W3dsLogin\Service\QrCodeService;
 use OCA\W3dsLogin\Service\UserProvisioningService;
 use OCA\W3dsLogin\Service\W3dsAuthService;
@@ -13,6 +14,7 @@ use OCP\AppFramework\Http;
 use OCP\AppFramework\Http\JSONResponse;
 use OCP\AppFramework\Http\RedirectResponse;
 use OCP\AppFramework\Http\TemplateResponse;
+use OCP\BackgroundJob\IJobList;
 use OCP\IRequest;
 use OCP\IURLGenerator;
 use OCP\IUserManager;
@@ -28,6 +30,7 @@ class AuthController extends Controller {
         private IURLGenerator $urlGenerator,
         private IUserManager $userManager,
         private IUserSession $userSession,
+        private IJobList $jobList,
         private LoggerInterface $logger,
     ) {
         parent::__construct(Application::APP_ID, $request);
@@ -182,6 +185,10 @@ class AuthController extends Controller {
                 );
             }
             $this->authService->markSessionComplete($sessionId, $ncUid);
+
+            // Queue initial sync now that user has a W3DS identity
+            $this->jobList->add(InitialSyncJob::class, ['ncUid' => $ncUid]);
+
             $this->logger->info('User linked W3DS identity', [
                 'uid' => $ncUid,
                 'w3id' => $w3id,
@@ -285,6 +292,9 @@ class AuthController extends Controller {
         // Establish the Nextcloud session
         $this->userSession->setUser($user);
         $this->userSession->createSessionToken($this->request, $userId, $userId);
+
+        // Queue initial sync of user's Talk chats to/from their eVault
+        $this->jobList->add(InitialSyncJob::class, ['ncUid' => $userId]);
 
         $this->logger->info('W3DS login completed', ['uid' => $userId]);
 
