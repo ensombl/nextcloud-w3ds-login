@@ -75,6 +75,20 @@ class ChatSyncService {
 		// Read CURRENT participants + admins from the live Talk room.
 		[$participantUids, $adminUids, $roomType, $roomName] = $this->readRoomState($localId, $roomData);
 
+		$existingGlobalId = $this->idMappingMapper->getGlobalId('chat', $localId);
+
+		// If the room read returned no users, the Talk read failed (a real
+		// room always has at least the owner). Refuse to overwrite an existing
+		// eVault chat with a degraded participant list — that would silently
+		// drop everyone but the owner. Only allow CREATE on initial sync.
+		if (empty($participantUids) && $existingGlobalId !== null) {
+			$this->logger->warning('[W3DS Sync] Aborting chat update: empty local participant read would shrink eVault state', [
+				'localId' => $localId,
+				'globalId' => $existingGlobalId,
+			]);
+			return;
+		}
+
 		// Resolve each participant/admin NC UID → W3ID → profile envelope ID.
 		[$participantEnvelopeIds, $participantW3ids] = $this->resolveParticipantProfileIds($participantUids);
 		[$adminEnvelopeIds, ] = $this->resolveParticipantProfileIds($adminUids);
@@ -112,8 +126,6 @@ class ChatSyncService {
 
 		// ACL by W3ID (eVault access is keyed on W3IDs, not envelope IDs)
 		$acl = !empty($participantW3ids) ? $participantW3ids : ['*'];
-
-		$existingGlobalId = $this->idMappingMapper->getGlobalId('chat', $localId);
 
 		if ($existingGlobalId !== null) {
 			$payload['updatedAt'] = $this->toIso8601(time());
