@@ -243,9 +243,6 @@ class ChatSyncService {
 
 		// senderId in the Message schema is the sender's User profile envelope ID
 		$senderEnvelopeId = $this->getOrFallbackProfileId($w3id);
-		if ($senderEnvelopeId === null) {
-			return;
-		}
 
 		$payload = [
 			'id' => $this->generateUuid(),

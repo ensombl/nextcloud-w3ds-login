@@ -59,7 +59,7 @@ class W3dsAuthService {
 	}
 
 	/**
-	 * @return array{status: string, userId?: string}|null
+	 * @return array<string, mixed>|null
 	 */
 	public function getSessionStatus(string $sessionId): ?array {
 		return $this->cache->get(self::SESSION_PREFIX . $sessionId);

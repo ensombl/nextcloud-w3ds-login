@@ -22,8 +22,8 @@ Features:
     <category>security</category>
     <bugs>https://github.com/ensombl/nextcloud-w3ds-login/issues</bugs>
     <dependencies>
-        <nextcloud min-version="28" max-version="33"/>
         <php min-version="8.1"/>
+        <nextcloud min-version="28" max-version="33"/>
     </dependencies>
     <settings>
         <personal>OCA\W3dsLogin\Settings\PersonalSettings</personal>

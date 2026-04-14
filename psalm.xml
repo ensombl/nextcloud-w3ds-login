@@ -27,7 +27,19 @@
             <errorLevel type="suppress">
                 <referencedClass name="OC"/>
                 <referencedClass name="OC_App"/>
+                <referencedClass name="OCA\Talk\*"/>
             </errorLevel>
         </UndefinedClass>
+        <UndefinedDocblockClass>
+            <errorLevel type="suppress">
+                <referencedClass name="OCA\Talk\*"/>
+                <referencedClass name="Doctrine\DBAL\Schema\Table"/>
+            </errorLevel>
+        </UndefinedDocblockClass>
+        <UndefinedInterfaceMethod>
+            <errorLevel type="suppress">
+                <referencedMethod name="OCP\IUserSession::createSessionToken"/>
+            </errorLevel>
+        </UndefinedInterfaceMethod>
     </issueHandlers>
 </psalm>
