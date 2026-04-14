@@ -18,66 +18,66 @@ use Psr\Log\LoggerInterface;
  * @implements IEventListener<Event>
  */
 class AttendeesChangedListener implements IEventListener {
-    public function __construct(
-        private ChatSyncService $chatSyncService,
-        private IUserSession $userSession,
-        private LoggerInterface $logger,
-    ) {
-    }
+	public function __construct(
+		private ChatSyncService $chatSyncService,
+		private IUserSession $userSession,
+		private LoggerInterface $logger,
+	) {
+	}
 
-    public function handle(Event $event): void {
-        try {
-            $room = null;
-            if (method_exists($event, 'getRoom')) {
-                $room = $event->getRoom();
-            }
-            if ($room === null) {
-                return;
-            }
+	public function handle(Event $event): void {
+		try {
+			$room = null;
+			if (method_exists($event, 'getRoom')) {
+				$room = $event->getRoom();
+			}
+			if ($room === null) {
+				return;
+			}
 
-            $roomToken = $room->getToken();
+			$roomToken = $room->getToken();
 
-            // Prefer the session user -- this runs during the HTTP request
-            // that's mutating the room, so the current user is the one
-            // performing the action.
-            $ncUid = '';
-            $sessionUser = $this->userSession->getUser();
-            if ($sessionUser !== null) {
-                $ncUid = $sessionUser->getUID();
-            }
+			// Prefer the session user -- this runs during the HTTP request
+			// that's mutating the room, so the current user is the one
+			// performing the action.
+			$ncUid = '';
+			$sessionUser = $this->userSession->getUser();
+			if ($sessionUser !== null) {
+				$ncUid = $sessionUser->getUID();
+			}
 
-            if (empty($ncUid)) {
-                // Fall back to any owner/moderator already in the room.
-                try {
-                    $participantService = \OCP\Server::get(\OCA\Talk\Service\ParticipantService::class);
-                    foreach ($participantService->getParticipantsForRoom($room) as $p) {
-                        if ($p->getAttendee()->getActorType() !== 'users') {
-                            continue;
-                        }
-                        $level = (int)$p->getAttendee()->getParticipantType();
-                        if ($level === \OCA\Talk\Participant::OWNER
-                            || $level === \OCA\Talk\Participant::MODERATOR) {
-                            $ncUid = $p->getAttendee()->getActorId();
-                            break;
-                        }
-                    }
-                } catch (\Throwable) {
-                }
-            }
+			if (empty($ncUid)) {
+				// Fall back to any owner/moderator already in the room.
+				try {
+					$participantService = \OCP\Server::get(\OCA\Talk\Service\ParticipantService::class);
+					foreach ($participantService->getParticipantsForRoom($room) as $p) {
+						if ($p->getAttendee()->getActorType() !== 'users') {
+							continue;
+						}
+						$level = (int)$p->getAttendee()->getParticipantType();
+						if ($level === \OCA\Talk\Participant::OWNER
+							|| $level === \OCA\Talk\Participant::MODERATOR) {
+							$ncUid = $p->getAttendee()->getActorId();
+							break;
+						}
+					}
+				} catch (\Throwable) {
+				}
+			}
 
-            if (empty($ncUid)) {
-                return;
-            }
+			if (empty($ncUid)) {
+				return;
+			}
 
-            \ignore_user_abort(true);
-            $this->chatSyncService->pushChat($ncUid, [
-                'token' => $roomToken,
-                'createdAt' => time(),
-            ]);
-        } catch (\Throwable $e) {
-            $this->logger->error('[W3DS Sync] AttendeesChangedListener error', [
-                'exception' => $e,
-            ]);
-        }
-    }
+			\ignore_user_abort(true);
+			$this->chatSyncService->pushChat($ncUid, [
+				'token' => $roomToken,
+				'createdAt' => time(),
+			]);
+		} catch (\Throwable $e) {
+			$this->logger->error('[W3DS Sync] AttendeesChangedListener error', [
+				'exception' => $e,
+			]);
+		}
+	}
 }

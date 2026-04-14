@@ -17,13 +17,13 @@ use OCP\Util;
  * @implements IEventListener<Event>
  */
 class BeforeTemplateRenderedListener implements IEventListener {
-    public function handle(Event $event): void {
-        if (!($event instanceof BeforeTemplateRenderedEvent)) {
-            return;
-        }
-        if (!$event->isLoggedIn()) {
-            return;
-        }
-        Util::addScript(Application::APP_ID, 'talk-poller');
-    }
+	public function handle(Event $event): void {
+		if (!($event instanceof BeforeTemplateRenderedEvent)) {
+			return;
+		}
+		if (!$event->isLoggedIn()) {
+			return;
+		}
+		Util::addScript(Application::APP_ID, 'talk-poller');
+	}
 }

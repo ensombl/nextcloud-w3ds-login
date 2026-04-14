@@ -15,6 +15,13 @@
         </ignoreFiles>
     </projectFiles>
 
+    <extraFiles>
+        <directory name="vendor/nextcloud/ocp"/>
+        <ignoreFiles>
+            <directory name="vendor/nextcloud/ocp/.github"/>
+        </ignoreFiles>
+    </extraFiles>
+
     <issueHandlers>
         <UndefinedClass>
             <errorLevel type="suppress">

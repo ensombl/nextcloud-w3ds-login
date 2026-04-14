@@ -17,15 +17,15 @@ use OCP\AppFramework\Db\Entity;
  * @method void setLastSyncAt(int $lastSyncAt)
  */
 class SyncCursor extends Entity {
-    protected string $w3id = '';
-    protected string $schemaId = '';
-    protected ?string $cursor = null;
-    protected int $lastSyncAt = 0;
+	protected string $w3id = '';
+	protected string $schemaId = '';
+	protected ?string $cursor = null;
+	protected int $lastSyncAt = 0;
 
-    public function __construct() {
-        $this->addType('w3id', 'string');
-        $this->addType('schemaId', 'string');
-        $this->addType('cursor', 'string');
-        $this->addType('lastSyncAt', 'integer');
-    }
+	public function __construct() {
+		$this->addType('w3id', 'string');
+		$this->addType('schemaId', 'string');
+		$this->addType('cursor', 'string');
+		$this->addType('lastSyncAt', 'integer');
+	}
 }
