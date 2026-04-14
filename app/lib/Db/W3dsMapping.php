@@ -15,13 +15,13 @@ use OCP\AppFramework\Db\Entity;
  * @method void setCreatedAt(int $createdAt)
  */
 class W3dsMapping extends Entity {
-    protected string $w3id = '';
-    protected string $ncUid = '';
-    protected int $createdAt = 0;
+	protected string $w3id = '';
+	protected string $ncUid = '';
+	protected int $createdAt = 0;
 
-    public function __construct() {
-        $this->addType('w3id', 'string');
-        $this->addType('ncUid', 'string');
-        $this->addType('createdAt', 'integer');
-    }
+	public function __construct() {
+		$this->addType('w3id', 'string');
+		$this->addType('ncUid', 'string');
+		$this->addType('createdAt', 'integer');
+	}
 }
