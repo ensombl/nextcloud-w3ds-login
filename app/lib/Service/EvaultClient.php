@@ -302,6 +302,36 @@ class EvaultClient {
 	}
 
 	/**
+	 * Fetch a single MetaEnvelope by ID. Used for read-back verification.
+	 *
+	 * @return array<string, mixed>|null Decoded envelope (id, ontology, parsed) or null
+	 */
+	public function fetchMetaEnvelopeById(string $w3id, string $globalId): ?array {
+		$query = <<<'GRAPHQL'
+        query FetchMetaEnvelopeById($id: ID!) {
+            metaEnvelope(id: $id) {
+                id
+                ontology
+                parsed
+            }
+        }
+        GRAPHQL;
+
+		try {
+			$data = $this->graphql($w3id, $query, ['id' => $globalId]);
+			$env = $data['metaEnvelope'] ?? null;
+			return is_array($env) ? $env : null;
+		} catch (\Throwable $e) {
+			$this->logger->warning('fetchMetaEnvelopeById failed', [
+				'w3id' => $w3id,
+				'globalId' => $globalId,
+				'exception' => $e->getMessage(),
+			]);
+			return null;
+		}
+	}
+
+	/**
 	 * Resolve a W3ID to the MetaEnvelope ID of their User profile envelope.
 	 * This is the ID other platforms expect in participantIds / senderId fields.
 	 */

@@ -87,9 +87,9 @@ class RoomCreatedListener implements IEventListener {
 				return;
 			}
 
-			// Push inline so sync is near-real-time.
-			\ignore_user_abort(true);
-			$this->chatSyncService->pushChat($creatorUid, [
+			// Coalesced with any AttendeesAddedEvent fired in the same HTTP
+			// request, flushed once at shutdown with the final roster.
+			$this->chatSyncService->queueChatPush($creatorUid, [
 				'token' => $roomToken,
 				'type' => $roomType,
 				'name' => $roomName,

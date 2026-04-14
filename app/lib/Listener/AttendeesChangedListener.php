@@ -26,16 +26,27 @@ class AttendeesChangedListener implements IEventListener {
 	}
 
 	public function handle(Event $event): void {
+		$eventClass = get_class($event);
+		$this->logger->info('[W3DS Sync] AttendeesChangedListener FIRED', [
+			'eventClass' => $eventClass,
+		]);
 		try {
 			$room = null;
 			if (method_exists($event, 'getRoom')) {
 				$room = $event->getRoom();
 			}
 			if ($room === null) {
+				$this->logger->info('[W3DS Sync] AttendeesChangedListener: no room on event', [
+					'eventClass' => $eventClass,
+				]);
 				return;
 			}
 
 			$roomToken = $room->getToken();
+			$this->logger->info('[W3DS Sync] AttendeesChangedListener: handling room', [
+				'eventClass' => $eventClass,
+				'roomToken' => $roomToken,
+			]);
 
 			// Prefer the session user -- this runs during the HTTP request
 			// that's mutating the room, so the current user is the one
@@ -69,8 +80,7 @@ class AttendeesChangedListener implements IEventListener {
 				return;
 			}
 
-			\ignore_user_abort(true);
-			$this->chatSyncService->pushChat($ncUid, [
+			$this->chatSyncService->queueChatPush($ncUid, [
 				'token' => $roomToken,
 				'createdAt' => time(),
 			]);

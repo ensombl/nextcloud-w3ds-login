@@ -26,7 +26,6 @@ class Application extends App implements IBootstrap {
 	private const TALK_ATTENDEES_ADDED_EVENT = 'OCA\\Talk\\Events\\AttendeesAddedEvent';
 	private const TALK_ATTENDEES_REMOVED_EVENT = 'OCA\\Talk\\Events\\AttendeesRemovedEvent';
 	private const TALK_ATTENDEE_REMOVED_EVENT = 'OCA\\Talk\\Events\\AttendeeRemovedEvent';
-	private const TALK_PARTICIPANT_MODIFIED_EVENT = 'OCA\\Talk\\Events\\ParticipantModifiedEvent';
 
 	public function __construct() {
 		parent::__construct(self::APP_ID);
@@ -44,10 +43,12 @@ class Application extends App implements IBootstrap {
 		// so these are safe even if Talk is not installed (events just never fire)
 		$context->registerEventListener(self::TALK_MESSAGE_SENT_EVENT, MessageSentListener::class);
 		$context->registerEventListener(self::TALK_ROOM_CREATED_EVENT, RoomCreatedListener::class);
+		// Only roster-change events. ParticipantModifiedEvent fires on read-marker
+		// updates and similar per-user state changes, which would re-push the chat
+		// constantly and risk shrinking it if the live participant read is partial.
 		$context->registerEventListener(self::TALK_ATTENDEES_ADDED_EVENT, AttendeesChangedListener::class);
 		$context->registerEventListener(self::TALK_ATTENDEES_REMOVED_EVENT, AttendeesChangedListener::class);
 		$context->registerEventListener(self::TALK_ATTENDEE_REMOVED_EVENT, AttendeesChangedListener::class);
-		$context->registerEventListener(self::TALK_PARTICIPANT_MODIFIED_EVENT, AttendeesChangedListener::class);
 
 		// Inject the Talk room poller script on all logged-in pages
 		$context->registerEventListener(BeforeTemplateRenderedEvent::class, BeforeTemplateRenderedListener::class);

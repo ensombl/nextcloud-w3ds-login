@@ -23,11 +23,22 @@ class ChatSyncService {
 	private const INBOUND_POST_LOCK_TTL = 10;
 	private const MESSAGE_SIG_CACHE_PREFIX = 'w3ds_msg_sig_';
 	private const MESSAGE_SIG_CACHE_TTL = 86400; // 24h — enough to span a typical poll window
+	private const CHAT_PARTICIPANT_HWM_PREFIX = 'w3ds_chat_pmax_';
+	private const CHAT_PARTICIPANT_HWM_TTL = 604800; // 7d high-water mark guard against pushChat shrinkage
 
 	private const PULL_PAGE_SIZE = 50;
 	private const PULL_MAX_PAGES = 5;
 
 	private ICache $cache;
+
+	/**
+	 * Per-request coalesced chat-push queue. Each room maps to its latest
+	 * {ncUid, roomData} pair; flushed once at request shutdown.
+	 *
+	 * @var array<string, array{ncUid: string, roomData: array}>
+	 */
+	private array $pendingChatPushes = [];
+	private bool $shutdownRegistered = false;
 
 	public function __construct(
 		private EvaultClient $evaultClient,
@@ -39,6 +50,64 @@ class ChatSyncService {
 		private LoggerInterface $logger,
 	) {
 		$this->cache = $cacheFactory->createDistributed(Application::APP_ID);
+	}
+
+	/**
+	 * Queue a chat push to run once at request shutdown, coalescing repeat
+	 * calls for the same room. Talk fires RoomCreatedEvent + one
+	 * AttendeesAddedEvent per participant within a single HTTP request, so
+	 * pushing inline produces a CREATE + several UPDATEs and the eVault's
+	 * webhook retry queue can deliver the original CREATE *after* the final
+	 * UPDATE — the receiving side then reverts to the 1-participant state.
+	 * Coalescing collapses the burst into a single push with the final
+	 * roster so there's only one webhook to deliver.
+	 */
+	public function queueChatPush(string $ncUid, array $roomData): void {
+		$localId = (string)($roomData['token'] ?? '');
+		if ($localId === '') {
+			return;
+		}
+
+		$this->pendingChatPushes[$localId] = ['ncUid' => $ncUid, 'roomData' => $roomData];
+
+		if (!$this->shutdownRegistered) {
+			$this->shutdownRegistered = true;
+			register_shutdown_function(function (): void {
+				$this->flushPendingChatPushes();
+			});
+		}
+	}
+
+	/**
+	 * Drain the pending chat-push queue. Called from the shutdown handler
+	 * registered by {@see queueChatPush()}; safe to call directly in tests.
+	 */
+	public function flushPendingChatPushes(): void {
+		if (empty($this->pendingChatPushes)) {
+			return;
+		}
+
+		// Release the HTTP response before doing eVault network I/O so the
+		// Talk client doesn't wait on us. PHP-FPM only.
+		if (function_exists('fastcgi_finish_request')) {
+			@fastcgi_finish_request();
+		}
+
+		\ignore_user_abort(true);
+
+		$pending = $this->pendingChatPushes;
+		$this->pendingChatPushes = [];
+
+		foreach ($pending as $localId => $task) {
+			try {
+				$this->pushChat($task['ncUid'], $task['roomData']);
+			} catch (\Throwable $e) {
+				$this->logger->error('[W3DS Sync] Deferred pushChat failed', [
+					'localId' => $localId,
+					'exception' => $e,
+				]);
+			}
+		}
 	}
 
 	// ---------------------------------------------------------------
@@ -57,23 +126,52 @@ class ChatSyncService {
 	 * @param array $roomData Talk room data: token, type, name, createdAt (timestamp)
 	 */
 	public function pushChat(string $ncUid, array $roomData): void {
+		// Caller trace: who triggered this push? We need this because chat
+		// shrinkage bugs are otherwise impossible to source-trace from logs.
+		$bt = debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 6);
+		$callerChain = [];
+		foreach (array_slice($bt, 1, 5) as $frame) {
+			$callerChain[] = ($frame['class'] ?? '') . ($frame['type'] ?? '') . ($frame['function'] ?? '');
+		}
+
+		$this->logger->info('[W3DS Sync] pushChat ENTER', [
+			'ncUid' => $ncUid,
+			'localId' => (string)($roomData['token'] ?? ''),
+			'roomDataParticipants' => $roomData['participants'] ?? null,
+			'roomDataParticipantCount' => is_array($roomData['participants'] ?? null) ? count($roomData['participants']) : null,
+			'callers' => $callerChain,
+		]);
+
 		$w3id = $this->userProvisioning->getLinkedW3id($ncUid);
 		if ($w3id === null) {
+			$this->logger->info('[W3DS Sync] pushChat skip: user not linked', ['ncUid' => $ncUid]);
 			return; // User not linked to W3DS
 		}
 
 		$localId = (string)($roomData['token'] ?? '');
 		if (empty($localId)) {
+			$this->logger->info('[W3DS Sync] pushChat skip: empty localId');
 			return;
 		}
 
 		// Anti-ping-pong: skip if this entity was just created from an inbound webhook
 		if ($this->isSyncLocked('chat', $localId)) {
+			$this->logger->info('[W3DS Sync] pushChat skip: sync lock active', ['localId' => $localId]);
 			return;
 		}
 
 		// Read CURRENT participants + admins from the live Talk room.
 		[$participantUids, $adminUids, $roomType, $roomName] = $this->readRoomState($localId, $roomData);
+
+		$this->logger->info('[W3DS Sync] pushChat readRoomState result', [
+			'localId' => $localId,
+			'participantUids' => $participantUids,
+			'participantCount' => count($participantUids),
+			'adminUids' => $adminUids,
+			'adminCount' => count($adminUids),
+			'roomType' => $roomType,
+			'roomName' => $roomName,
+		]);
 
 		$existingGlobalId = $this->idMappingMapper->getGlobalId('chat', $localId);
 
@@ -107,12 +205,27 @@ class ChatSyncService {
 			$adminEnvelopeIds[] = $ownerProfileId;
 		}
 
+		// On UPDATE, reuse the inner `id` from the existing envelope. Regenerating
+		// it makes downstream consumers (eVault UI, awareness replication) treat
+		// each push as a brand-new chat — that's why the chat appeared to lose
+		// participants after every update.
+		$existingInnerId = null;
+		$existingCreatedAt = null;
+		if ($existingGlobalId !== null) {
+			$existing = $this->evaultClient->fetchMetaEnvelopeById($w3id, $existingGlobalId);
+			$existingParsed = is_array($existing) ? ($existing['parsed'] ?? null) : null;
+			if (is_array($existingParsed)) {
+				$existingInnerId = is_string($existingParsed['id'] ?? null) ? $existingParsed['id'] : null;
+				$existingCreatedAt = is_string($existingParsed['createdAt'] ?? null) ? $existingParsed['createdAt'] : null;
+			}
+		}
+
 		$payload = [
-			'id' => $this->generateUuid(),
+			'id' => $existingInnerId ?? $this->generateUuid(),
 			'type' => $this->mapRoomTypeToGlobal($roomType),
 			'participantIds' => $participantEnvelopeIds,
 			'admins' => $adminEnvelopeIds,
-			'createdAt' => $this->toIso8601($roomData['createdAt'] ?? time()),
+			'createdAt' => $existingCreatedAt ?? $this->toIso8601($roomData['createdAt'] ?? time()),
 		];
 
 		if (!empty($roomName)) {
@@ -127,23 +240,72 @@ class ChatSyncService {
 		// ACL by W3ID (eVault access is keyed on W3IDs, not envelope IDs)
 		$acl = !empty($participantW3ids) ? $participantW3ids : ['*'];
 
+		$newCount = count($participantEnvelopeIds);
+
+		$this->logger->info('[W3DS Sync] pushChat payload prepared', [
+			'localId' => $localId,
+			'localUidCount' => count($participantUids),
+			'localUids' => $participantUids,
+			'resolvedW3ids' => $participantW3ids,
+			'envelopeIdCount' => $newCount,
+			'envelopeIds' => $participantEnvelopeIds,
+			'ownerW3id' => $w3id,
+			'aclCount' => count($acl),
+			'acl' => $acl,
+			'isUpdate' => $existingGlobalId !== null,
+		]);
+
 		if ($existingGlobalId !== null) {
+			// High-water mark guard: if we've ever pushed N participants for
+			// this chat, refuse to push fewer. Catches transient Talk reads
+			// that return only the current user instead of the full roster.
+			$hwmKey = self::CHAT_PARTICIPANT_HWM_PREFIX . $localId;
+			$hwm = $this->cache->get($hwmKey);
+			if (is_int($hwm) && $newCount < $hwm) {
+				$this->logger->warning('[W3DS Sync] Aborting chat update: participant count would shrink', [
+					'localId' => $localId,
+					'globalId' => $existingGlobalId,
+					'newCount' => $newCount,
+					'highWaterMark' => $hwm,
+				]);
+				return;
+			}
+
 			$payload['updatedAt'] = $this->toIso8601(time());
 			$this->evaultClient->updateMetaEnvelope($w3id, $existingGlobalId, self::CHAT_SCHEMA_ID, $payload, $acl);
+			$this->cache->set($hwmKey, max((int)$hwm, $newCount), self::CHAT_PARTICIPANT_HWM_TTL);
 			$this->logger->info('[W3DS Sync] Updated chat in eVault', [
 				'localId' => $localId,
 				'globalId' => $existingGlobalId,
-				'participantCount' => count($participantEnvelopeIds),
+				'participantCount' => $newCount,
 				'adminCount' => count($adminEnvelopeIds),
+			]);
+
+			$readback = $this->evaultClient->fetchMetaEnvelopeById($w3id, $existingGlobalId);
+			$rbParsed = is_array($readback) ? ($readback['parsed'] ?? null) : null;
+			$rbParticipants = is_array($rbParsed) ? ($rbParsed['participantIds'] ?? null) : null;
+			$this->logger->info('[W3DS Sync] pushChat readback after update', [
+				'localId' => $localId,
+				'globalId' => $existingGlobalId,
+				'gotEnvelope' => $readback !== null,
+				'rbParticipantIdsType' => gettype($rbParticipants),
+				'rbParticipantIdsCount' => is_array($rbParticipants) ? count($rbParticipants) : null,
+				'rbParticipantIds' => $rbParticipants,
+				'rbParsed' => $rbParsed,
 			]);
 		} else {
 			$globalId = $this->evaultClient->createMetaEnvelope($w3id, self::CHAT_SCHEMA_ID, $payload, $acl);
 			if ($globalId !== null) {
 				$this->idMappingMapper->storeMapping('chat', $localId, $globalId, $w3id);
+				$this->cache->set(
+					self::CHAT_PARTICIPANT_HWM_PREFIX . $localId,
+					$newCount,
+					self::CHAT_PARTICIPANT_HWM_TTL,
+				);
 				$this->logger->info('[W3DS Sync] Pushed new chat to eVault', [
 					'localId' => $localId,
 					'globalId' => $globalId,
-					'participantCount' => count($participantEnvelopeIds),
+					'participantCount' => $newCount,
 					'adminCount' => count($adminEnvelopeIds),
 				]);
 			} else {
@@ -165,9 +327,11 @@ class ChatSyncService {
 		$roomName = (string)($fallback['name'] ?? '');
 
 		if (!$this->isTalkAvailable()) {
+			$this->logger->info('[W3DS Sync] readRoomState: Talk not available', ['roomToken' => $roomToken]);
 			return [$participantUids, $adminUids, $roomType, $roomName];
 		}
 
+		$rawAttendees = [];
 		try {
 			$manager = \OCP\Server::get(\OCA\Talk\Manager::class);
 			$room = $manager->getRoomByToken($roomToken);
@@ -175,8 +339,18 @@ class ChatSyncService {
 			$roomName = $room->getName();
 
 			$participantService = \OCP\Server::get(\OCA\Talk\Service\ParticipantService::class);
-			foreach ($participantService->getParticipantsForRoom($room) as $p) {
+			$participants = $participantService->getParticipantsForRoom($room);
+			$this->logger->info('[W3DS Sync] readRoomState: getParticipantsForRoom returned', [
+				'roomToken' => $roomToken,
+				'totalParticipants' => count($participants),
+			]);
+			foreach ($participants as $p) {
 				$attendee = $p->getAttendee();
+				$rawAttendees[] = [
+					'actorType' => $attendee->getActorType(),
+					'actorId' => $attendee->getActorId(),
+					'participantType' => $attendee->getParticipantType(),
+				];
 				if ($attendee->getActorType() !== 'users') {
 					continue;
 				}
@@ -189,10 +363,16 @@ class ChatSyncService {
 					$adminUids[] = $uid;
 				}
 			}
+			$this->logger->info('[W3DS Sync] readRoomState: enumerated attendees', [
+				'roomToken' => $roomToken,
+				'rawAttendees' => $rawAttendees,
+				'userParticipantUids' => $participantUids,
+			]);
 		} catch (\Throwable $e) {
-			$this->logger->debug('[W3DS Sync] readRoomState fallback', [
+			$this->logger->warning('[W3DS Sync] readRoomState THREW (returning fallback)', [
 				'roomToken' => $roomToken,
 				'exception' => $e->getMessage(),
+				'trace' => $e->getTraceAsString(),
 			]);
 		}
 
