@@ -21,5 +21,9 @@ return [
 
 		// Per-room poll of participant eVaults (authenticated; client-driven every ~15s)
 		['name' => 'poll#pollRoom', 'url' => '/api/rooms/{token}/poll', 'verb' => 'POST'],
+
+		// First-login password setup for W3DS-provisioned users
+		['name' => 'password_setup#show', 'url' => '/password-setup', 'verb' => 'GET'],
+		['name' => 'password_setup#submit', 'url' => '/password-setup', 'verb' => 'POST'],
 	],
 ];

@@ -4,9 +4,11 @@ declare(strict_types=1);
 
 namespace OCA\W3dsLogin\Service;
 
+use OCA\W3dsLogin\AppInfo\Application;
 use OCA\W3dsLogin\Db\W3dsMapping;
 use OCA\W3dsLogin\Db\W3dsMappingMapper;
 use OCP\AppFramework\Db\DoesNotExistException;
+use OCP\IConfig;
 use OCP\IUser;
 use OCP\IUserManager;
 use OCP\Security\ISecureRandom;
@@ -17,6 +19,8 @@ class UserProvisioningService {
 		private W3dsMappingMapper $mapper,
 		private IUserManager $userManager,
 		private ISecureRandom $secureRandom,
+		private EvaultClient $evaultClient,
+		private IConfig $config,
 		private LoggerInterface $logger,
 	) {
 	}
@@ -63,12 +67,81 @@ class UserProvisioningService {
 		$mapping->setCreatedAt(time());
 		$this->mapper->insert($mapping);
 
+		// Best-effort: replace the W3ID-based display name and empty email
+		// with whatever the user's eVault profile has.
+		$this->hydrateProfileFromEvault($user, $w3id);
+
+		// The random password above is a throwaway -- force the user to set
+		// a real one on first login so WebDAV / desktop clients / mobile
+		// apps can still authenticate.
+		$this->config->setUserValue(
+			$user->getUID(),
+			Application::APP_ID,
+			'must_set_password',
+			'1',
+		);
+
 		$this->logger->info('Provisioned new user from W3DS', [
 			'w3id' => $w3id,
 			'uid' => $user->getUID(),
 		]);
 
 		return $user;
+	}
+
+	/**
+	 * Copy the user's displayName and email from their eVault User profile
+	 * onto the freshly-created NC account. Never throws: a broken eVault
+	 * must not prevent login.
+	 */
+	private function hydrateProfileFromEvault(IUser $user, string $w3id): void {
+		try {
+			$profileId = $this->evaultClient->getProfileEnvelopeId($w3id);
+			if ($profileId === null) {
+				return;
+			}
+
+			$envelope = $this->evaultClient->fetchMetaEnvelopeById($w3id, $profileId);
+			$parsed = $envelope['parsed'] ?? null;
+			if (!is_array($parsed)) {
+				return;
+			}
+
+			$displayName = $this->pickDisplayName($parsed, $w3id);
+			if ($displayName !== '' && $displayName !== $w3id) {
+				$user->setDisplayName($displayName);
+			}
+
+			$email = $parsed['email'] ?? null;
+			if (is_string($email) && $email !== '') {
+				$user->setEMailAddress($email);
+			}
+		} catch (\Throwable $e) {
+			$this->logger->info('Could not hydrate profile from eVault; continuing with defaults', [
+				'w3id' => $w3id,
+				'uid' => $user->getUID(),
+				'exception' => $e->getMessage(),
+			]);
+		}
+	}
+
+	/**
+	 * @param array<string, mixed> $parsed
+	 */
+	private function pickDisplayName(array $parsed, string $w3id): string {
+		$candidate = $parsed['displayName'] ?? null;
+		if (is_string($candidate) && trim($candidate) !== '') {
+			return trim($candidate);
+		}
+
+		$given = is_string($parsed['givenName'] ?? null) ? trim($parsed['givenName']) : '';
+		$family = is_string($parsed['familyName'] ?? null) ? trim($parsed['familyName']) : '';
+		$joined = trim($given . ' ' . $family);
+		if ($joined !== '') {
+			return $joined;
+		}
+
+		return $w3id;
 	}
 
 	/**

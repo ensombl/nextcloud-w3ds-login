@@ -289,8 +289,12 @@ class AuthController extends Controller {
 			return new RedirectResponse($loginPage);
 		}
 
-		// Establish the Nextcloud session
+		// Establish the Nextcloud session. setLoginName() is required so later
+		// flows that call $userSession->getLoginName() (e.g. the Security tab
+		// password-change controller) can resolve the user -- without it,
+		// checkPassword() receives null and always returns false.
 		$this->userSession->setUser($user);
+		$this->userSession->setLoginName($userId);
 		$this->userSession->createSessionToken($this->request, $userId, $userId);
 
 		// Queue initial sync of user's Talk chats to/from their eVault
