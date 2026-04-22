@@ -13,10 +13,10 @@ use OCP\Security\ISecureRandom;
 use Psr\Log\LoggerInterface;
 
 class W3dsAuthService {
-	private const SESSION_TTL = 300; // 5 minutes
+	private const SESSION_TTL = 0; // no expiry — QR flow completes in seconds, consumption deletes the entry
 	private const SESSION_PREFIX = 'w3ds_session_';
 	private const LOGIN_TOKEN_PREFIX = 'w3ds_login_';
-	private const LOGIN_TOKEN_TTL = 60; // 1 minute
+	private const LOGIN_TOKEN_TTL = 0;
 
 	private ICache $cache;
 
