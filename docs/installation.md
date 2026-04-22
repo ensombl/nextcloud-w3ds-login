@@ -89,7 +89,72 @@ This triggers the migrations, which create the `oc_w3ds_login_*` tables. You can
 sudo -u www-data php occ migrations:migrate w3ds_login
 ```
 
-### 5. Verify
+### 5. Configure a shared cache (required)
+
+Nextcloud's per-request memory cache is the default, and it isn't shared across PHP-FPM workers. The W3DS QR flow writes a session from one request (the wallet's callback) and reads it from another (the browser's poll) — so if there's no shared cache, the poll can't see the session and reports it as expired immediately.
+
+If `sudo -u www-data php occ config:system:get memcache.distributed` prints an empty line, you need to pick one. The two options below are both supported by Nextcloud out of the box.
+
+**APCu (simplest, single host):**
+
+```bash
+# Make sure the PHP extension is loaded
+php -m | grep -i apcu
+
+# Enable APCu in both CLI and FPM (package installs it disabled on some distros)
+PHPVER=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')
+echo -e "apc.enabled=1\napc.enable_cli=1" | sudo tee /etc/php/$PHPVER/cli/conf.d/99-apcu.ini
+echo -e "apc.enabled=1\napc.shm_size=64M" | sudo tee /etc/php/$PHPVER/fpm/conf.d/99-apcu.ini
+
+# Wire Nextcloud to APCu
+sudo -u www-data php occ config:system:set memcache.local       --value='\OC\Memcache\APCu'
+sudo -u www-data php occ config:system:set memcache.distributed --value='\OC\Memcache\APCu'
+
+sudo systemctl restart php*-fpm
+```
+
+`restart` (not `reload`) is needed the first time because FPM only picks up new `.ini` files on a full restart.
+
+**Redis (multi-host, survives restarts):**
+
+```bash
+sudo apt install redis-server
+sudo systemctl enable --now redis-server
+
+sudo -u www-data php occ config:system:set memcache.local       --value='\OC\Memcache\Redis'
+sudo -u www-data php occ config:system:set memcache.distributed --value='\OC\Memcache\Redis'
+sudo -u www-data php occ config:system:set memcache.locking     --value='\OC\Memcache\Redis'
+sudo -u www-data php occ config:system:set redis host --value='127.0.0.1'
+sudo -u www-data php occ config:system:set redis port --value=6379 --type=integer
+
+sudo systemctl restart php*-fpm
+```
+
+Confirm the change stuck:
+
+```bash
+sudo -u www-data php occ config:system:get memcache.distributed
+```
+
+Should print `\OC\Memcache\APCu` or `\OC\Memcache\Redis`, not an empty line.
+
+### 6. Allow outbound requests to the registry and eVaults
+
+The W3DS Registry sometimes returns an eVault URL whose host is a bare IP address rather than a DNS name. Nextcloud's built-in HTTP client has SSRF protection that rejects those by default, and you'll see this in the log when a user tries to sign in:
+
+```
+w3ds_login: Signature verification error: No DNS record found for <ip>
+```
+
+To allow it:
+
+```bash
+sudo -u www-data php occ config:system:set allow_local_remote_servers --value=true --type=boolean
+```
+
+Strictly speaking this loosens Nextcloud's outbound SSRF guard for all apps, not just this one — the trade-off is acceptable for a single-purpose server but weigh it against your threat model if this box also hosts other apps. The long-term fix lives with the registry/eVault operator: have them return a hostname.
+
+### 7. Verify
 
 Open the Nextcloud login page in a browser. You should see a "Sign in with W3DS" button alongside the password form. If you don't, check `nextcloud.log` for errors and confirm the app is enabled:
 
@@ -98,6 +163,20 @@ sudo -u www-data php occ app:list | grep w3ds
 ```
 
 If you have Talk installed and a user has linked their W3DS identity from personal settings, sending a message should appear in their eVault within a couple of seconds. The plugin logs every sync attempt at info level, so `tail -f nextcloud.log | grep W3DS` is a good way to watch what it's doing the first time.
+
+### Troubleshooting
+
+**"Session expired" the moment the poll starts.** No shared cache — go back to step 5.
+
+**`Class "chillerlan\QRCode\QROptions" not found` or similar autoload failure.** The app's `vendor/` directory isn't where the PHP autoloader expects it. Depending on how you laid the app out, either (a) run `composer install --no-dev --optimize-autoloader` inside `apps/w3ds_login/`, or (b) if you kept the repo outside `apps/` and symlinked `apps/w3ds_login → /opt/.../app/`, the vendor directory is at the repo root and the app directory needs its own link: `ln -s /opt/.../vendor /opt/.../app/vendor && chown -h www-data:www-data /opt/.../app/vendor && sudo systemctl restart php*-fpm`. Opcache caches the missing-class failure, so a **restart** (not reload) of FPM is required.
+
+**`Config file has leading content, please remove everything before "<?php" in config.php`.** Something got prepended to `/var/www/nextcloud/config/config.php` — typically a BOM or a blank line introduced by a stray editor. Check the first bytes with `sudo head -c 200 /var/www/nextcloud/config/config.php | od -c | head`; everything before the first `<?php` needs to go. `sudo -u www-data sed -i '0,/<?php/{/<?php/!d}' /var/www/nextcloud/config/config.php` trims it.
+
+**Sign-in button missing.** Either the app isn't enabled (`occ app:list | grep w3ds`) or the autoloader tripped during app registration. Check `nextcloud.log` for fatal errors from `w3ds_login`.
+
+**403 on `/apps/dashboard` (or any other core app) after tightening nginx.** If your nginx `try_files` line includes `$uri/`, nginx tries to serve a directory, finds no `index.php` inside, and returns 403 since autoindex is off. Drop the `$uri/`: `try_files $uri /index.php$request_uri;`.
+
+**Psalm failing in CI with `UndefinedInterfaceMethod` or `UndefinedClass` on internal `OC\User\Session`.** The plugin duck-types a method on `IUserSession` that only exists on the concrete `\OC\User\Session` class, which Psalm can't see. The check is `method_exists($this->userSession, 'setLoginName')`. Keep the guard; don't try to typehint the concrete class or use `instanceof` — both trip Psalm because `\OC\User\Session` isn't in OCP's public stub paths.
 
 ### Updating
 
