@@ -12,11 +12,23 @@ use OCP\IConfig;
 use OCP\Security\ISecureRandom;
 use Psr\Log\LoggerInterface;
 
+/**
+ * W3DS signature verification.
+ *
+ * Port of the canonical TypeScript validator at
+ * `metastate/infrastructure/signature-validator/src/index.ts`.
+ * Anything in the verification path below should stay behaviour-compatible
+ * with that module; if the TS source changes, mirror the change here.
+ */
 class W3dsAuthService {
 	private const SESSION_TTL = 0; // no expiry — QR flow completes in seconds, consumption deletes the entry
 	private const SESSION_PREFIX = 'w3ds_session_';
 	private const LOGIN_TOKEN_PREFIX = 'w3ds_login_';
 	private const LOGIN_TOKEN_TTL = 0;
+
+	/** JWT algorithms accepted for key binding certificates. jose defaults to
+	 *  the alg(s) advertised by the JWKS; we accept ES256 explicitly. */
+	private const JWT_ALLOWED_ALGS = ['ES256'];
 
 	private ICache $cache;
 
@@ -114,61 +126,111 @@ class W3dsAuthService {
 	}
 
 	// ---------------------------------------------------------------
-	// W3DS signature verification
+	// W3DS signature verification — mirrors verifySignature() in the
+	// canonical TS validator.
 	// ---------------------------------------------------------------
 
-	/**
-	 * Verify a W3DS signature following the protocol spec:
-	 *
-	 * 1. Resolve eVault URL via Registry
-	 * 2. Fetch key binding certificates from eVault /whois
-	 * 3. Verify JWT certificates against Registry JWKS
-	 * 4. Extract and decode the public key
-	 * 5. Verify the ECDSA P-256 signature over the session ID
-	 */
 	public function verifySignature(string $w3id, string $sessionId, string $signature): bool {
+		if ($w3id === '' || $sessionId === '' || $signature === '') {
+			return false;
+		}
+
 		$registryBaseUrl = $this->getRegistryBaseUrl();
 		$client = $this->clientService->newClient();
 
 		try {
-			// Step 1: Resolve W3ID to eVault URL
-			$evaultUrl = $this->resolveEvault($client, $registryBaseUrl, $w3id);
-			if ($evaultUrl === null) {
-				$this->logger->error('Failed to resolve eVault for W3ID', ['w3id' => $w3id]);
-				return false;
+			$certificates = $this->getKeyBindingCertificates($client, $registryBaseUrl, $w3id);
+
+			// Canonical behaviour: if the eVault exposes no key-binding
+			// certificates, the signature is treated as valid. This matches
+			// `signature-validator/src/index.ts` and must not change without
+			// coordinating with that source of truth.
+			if (count($certificates) === 0) {
+				$this->logger->warning('W3DS: no key binding certificates returned, accepting per canonical behaviour', [
+					'w3id' => $w3id,
+				]);
+				return true;
 			}
 
-			// Step 2: Fetch key binding certificates from eVault
-			$certificates = $this->fetchCertificates($client, $evaultUrl, $w3id);
-			if (empty($certificates)) {
-				$this->logger->error('No certificates returned from eVault', ['w3id' => $w3id]);
-				return false;
-			}
-
-			// Step 3: Fetch Registry JWKS for JWT verification
 			$registryJwks = $this->fetchRegistryJwks($client, $registryBaseUrl);
-			if (empty($registryJwks)) {
-				$this->logger->error('Failed to fetch Registry JWKS');
+			if (count($registryJwks) === 0) {
+				$this->logger->error('W3DS: failed to fetch Registry JWKS');
 				return false;
 			}
 
-			// Step 4: Verify certificates and extract public keys
+			// Decode and normalise the signature once for every candidate.
+			$signatureBytes = $this->decodeSignature($signature);
+			if ($signatureBytes === null) {
+				$this->logger->warning('W3DS: could not decode signature');
+				return false;
+			}
+			$derSignature = $this->signatureToDer($signatureBytes);
+			if ($derSignature === null) {
+				$this->logger->warning('W3DS: signature has unrecognised length', [
+					'length' => strlen($signatureBytes),
+				]);
+				return false;
+			}
+
+			$lastError = null;
+
 			foreach ($certificates as $jwt) {
-				$publicKeyDer = $this->verifyAndExtractKey($jwt, $registryJwks);
-				if ($publicKeyDer === null) {
+				if (!is_string($jwt)) {
+					$lastError = 'non-string key binding certificate';
 					continue;
 				}
 
-				// Step 5: Verify the signature
-				if ($this->verifyEcdsaSignature($publicKeyDer, $sessionId, $signature)) {
-					return true;
+				try {
+					$payload = $this->verifyJwt($jwt, $registryJwks);
+					if ($payload === null) {
+						$lastError = 'JWT verification failed';
+						continue;
+					}
+
+					if (($payload['ename'] ?? null) !== $w3id) {
+						$lastError = sprintf(
+							'JWT ename mismatch: expected %s, got %s',
+							$w3id,
+							(string)($payload['ename'] ?? 'null'),
+						);
+						continue;
+					}
+
+					$publicKeyMultibase = $payload['publicKey'] ?? null;
+					if (!is_string($publicKeyMultibase) || $publicKeyMultibase === '') {
+						$lastError = 'JWT payload missing publicKey';
+						continue;
+					}
+
+					$publicKeyBytes = $this->decodeMultibasePublicKey($publicKeyMultibase);
+					if ($publicKeyBytes === null) {
+						$lastError = 'could not decode multibase publicKey';
+						continue;
+					}
+
+					$pem = $this->publicKeyToPem($publicKeyBytes);
+					if ($pem === null) {
+						$lastError = 'could not import publicKey';
+						continue;
+					}
+
+					$ok = openssl_verify($sessionId, $derSignature, $pem, OPENSSL_ALGO_SHA256);
+					if ($ok === 1) {
+						return true;
+					}
+					$lastError = 'signature verification failed';
+				} catch (\Throwable $e) {
+					$lastError = $e->getMessage();
 				}
 			}
 
-			$this->logger->warning('No certificate yielded a valid signature', ['w3id' => $w3id]);
+			$this->logger->warning('W3DS: no certificate yielded a valid signature', [
+				'w3id' => $w3id,
+				'lastError' => $lastError,
+			]);
 			return false;
 		} catch (\Throwable $e) {
-			$this->logger->error('Signature verification error: ' . $e->getMessage(), [
+			$this->logger->error('W3DS: signature verification error: ' . $e->getMessage(), [
 				'w3id' => $w3id,
 				'exception' => $e,
 			]);
@@ -188,72 +250,61 @@ class W3dsAuthService {
 	}
 
 	/**
-	 * GET {registryBaseUrl}/resolve?w3id=@user.w3id
-	 * Returns the eVault URL for the given W3ID.
+	 * Resolve eName → eVault URL via `/resolve`, then fetch
+	 * `/whois` and return the `keyBindingCertificates` array (or []).
+	 *
+	 * @return list<string>
 	 */
-	private function resolveEvault(mixed $client, string $registryBaseUrl, string $w3id): ?string {
-		$url = $registryBaseUrl . '/resolve?' . http_build_query(['w3id' => $w3id]);
+	private function getKeyBindingCertificates(mixed $client, string $registryBaseUrl, string $w3id): array {
+		$resolveUrl = $registryBaseUrl . '/resolve?' . http_build_query(['w3id' => $w3id]);
+		$resolveResponse = $client->get($resolveUrl, ['timeout' => 10]);
+		$resolveBody = json_decode($resolveResponse->getBody(), true);
 
-		$response = $client->get($url, ['timeout' => 10]);
-		$body = json_decode($response->getBody(), true);
+		$evaultUrl = $resolveBody['uri'] ?? null;
+		if (!is_string($evaultUrl) || $evaultUrl === '') {
+			throw new \RuntimeException('Failed to resolve eVault URL for eName: ' . $w3id);
+		}
 
-		return $body['uri'] ?? $body['evaultUrl'] ?? null;
-	}
-
-	/**
-	 * GET {evaultUrl}/whois with X-ENAME header.
-	 * Returns an array of JWT key binding certificates.
-	 */
-	private function fetchCertificates(mixed $client, string $evaultUrl, string $w3id): array {
-		$url = rtrim($evaultUrl, '/') . '/whois';
-
-		$response = $client->get($url, [
+		$whoisUrl = rtrim($evaultUrl, '/') . '/whois';
+		$whoisResponse = $client->get($whoisUrl, [
 			'timeout' => 10,
 			'headers' => ['X-ENAME' => $w3id],
 		]);
-		$body = json_decode($response->getBody(), true);
+		$whoisBody = json_decode($whoisResponse->getBody(), true);
 
-		// The response contains an array of JWT strings
-		if (is_array($body) && isset($body['keyBindingCertificates'])) {
-			return $body['keyBindingCertificates'];
+		$certs = $whoisBody['keyBindingCertificates'] ?? null;
+		if (!is_array($certs)) {
+			return [];
 		}
 
-		if (is_array($body) && isset($body['certificates'])) {
-			return $body['certificates'];
+		$out = [];
+		foreach ($certs as $c) {
+			if (is_string($c)) {
+				$out[] = $c;
+			}
 		}
-
-		// Some implementations return a flat array
-		if (is_array($body) && isset($body[0]) && is_string($body[0])) {
-			return $body;
-		}
-
-		return [];
+		return $out;
 	}
 
-	/**
-	 * GET {registryBaseUrl}/.well-known/jwks.json
-	 * Returns the Registry's JWKS keyset for verifying JWT certificates.
-	 */
 	private function fetchRegistryJwks(mixed $client, string $registryBaseUrl): array {
 		$url = $registryBaseUrl . '/.well-known/jwks.json';
-
 		$response = $client->get($url, ['timeout' => 10]);
 		$body = json_decode($response->getBody(), true);
-
-		return $body['keys'] ?? [];
+		$keys = $body['keys'] ?? [];
+		return is_array($keys) ? $keys : [];
 	}
 
 	// ---------------------------------------------------------------
-	// JWT verification and public key extraction
+	// JWT verification — analogue of jose.jwtVerify(jwt, JWKS)
 	// ---------------------------------------------------------------
 
 	/**
-	 * Verify a JWT key binding certificate against Registry JWKS
-	 * and extract the user's public key from the payload.
+	 * Verify a JWT key binding certificate against Registry JWKS and return
+	 * its decoded payload on success.
 	 *
-	 * @return string|null DER-encoded public key, or null on failure
+	 * @return array<string, mixed>|null
 	 */
-	private function verifyAndExtractKey(string $jwt, array $registryKeys): ?string {
+	private function verifyJwt(string $jwt, array $registryKeys): ?array {
 		$parts = explode('.', $jwt);
 		if (count($parts) !== 3) {
 			return null;
@@ -269,131 +320,113 @@ class W3dsAuthService {
 
 		$header = json_decode($headerJson, true);
 		$payload = json_decode($payloadJson, true);
-
 		if (!is_array($header) || !is_array($payload)) {
 			return null;
 		}
 
-		// Check expiration
-		if (isset($payload['exp']) && $payload['exp'] < time()) {
+		$alg = $header['alg'] ?? null;
+		if (!is_string($alg) || !in_array($alg, self::JWT_ALLOWED_ALGS, true)) {
 			return null;
 		}
 
-		// Find matching Registry key by kid
+		$now = time();
+		if (isset($payload['exp']) && is_numeric($payload['exp']) && (int)$payload['exp'] < $now) {
+			return null;
+		}
+		if (isset($payload['nbf']) && is_numeric($payload['nbf']) && (int)$payload['nbf'] > $now) {
+			return null;
+		}
+
+		// Narrow to keys whose kid matches the header, falling back to all
+		// keys — this mirrors jose's behaviour when the header has no kid.
 		$kid = $header['kid'] ?? null;
-		$registryKey = null;
+		$candidates = [];
 		foreach ($registryKeys as $key) {
-			if (($kid !== null && ($key['kid'] ?? null) === $kid) || $kid === null) {
-				$registryKey = $key;
-				break;
+			if (!is_array($key)) {
+				continue;
+			}
+			if ($kid === null || ($key['kid'] ?? null) === $kid) {
+				$candidates[] = $key;
+			}
+		}
+		if (count($candidates) === 0) {
+			$candidates = array_values(array_filter($registryKeys, 'is_array'));
+		}
+
+		$signedData = $parts[0] . '.' . $parts[1];
+		$derSig = $this->rawToDer($jwtSignature); // ES256 JWT signatures are raw r||s
+
+		foreach ($candidates as $jwk) {
+			$pem = $this->jwkToPem($jwk);
+			if ($pem === null) {
+				continue;
+			}
+			$ok = openssl_verify($signedData, $derSig, $pem, OPENSSL_ALGO_SHA256);
+			if ($ok === 1) {
+				return $payload;
 			}
 		}
 
-		if ($registryKey === null) {
-			return null;
-		}
-
-		// Build PEM from JWK for the Registry's key (ECDSA P-256)
-		$registryPem = $this->jwkToPem($registryKey);
-		if ($registryPem === null) {
-			return null;
-		}
-
-		// Verify the JWT signature
-		$signedData = $parts[0] . '.' . $parts[1];
-		$derSig = $this->rawToDer($jwtSignature);
-
-		$valid = openssl_verify($signedData, $derSig, $registryPem, OPENSSL_ALGO_SHA256);
-		if ($valid !== 1) {
-			return null;
-		}
-
-		// Extract user's public key from payload
-		$multibaseKey = $payload['publicKey'] ?? null;
-		if (!is_string($multibaseKey) || empty($multibaseKey)) {
-			return null;
-		}
-
-		return $this->decodeMultibaseKey($multibaseKey);
+		return null;
 	}
 
 	// ---------------------------------------------------------------
-	// ECDSA P-256 signature verification
+	// Public key handling — mirrors decodeMultibasePublicKey()
+	// and the raw-vs-SPKI import choice in the TS verifier.
 	// ---------------------------------------------------------------
 
 	/**
-	 * Verify an ECDSA P-256 signature over a payload string.
-	 *
-	 * @param string $publicKeyDer DER (SPKI) or raw uncompressed public key bytes
-	 * @param string $payload The session ID string to verify
-	 * @param string $signature Base64 or multibase-encoded raw signature (64 bytes: r || s)
+	 * Decode a multibase-encoded public key string. Accepts:
+	 *   - "0x..." / "0X..."            → plain hex
+	 *   - "z" + hex                    → hex (SoftwareKeyManager format)
+	 *   - "z" + base58btc              → standard multibase
 	 */
-	private function verifyEcdsaSignature(string $publicKeyDer, string $payload, string $signature): bool {
-		// Decode the signature from base64 or multibase
-		$rawSig = $this->decodeSignature($signature);
-		if ($rawSig === null || strlen($rawSig) !== 64) {
-			$this->logger->warning('Invalid signature length', [
-				'expected' => 64,
-				'actual' => $rawSig !== null ? strlen($rawSig) : 'null',
-			]);
-			return false;
-		}
-
-		// Build PEM from the raw/DER public key
-		$pem = $this->publicKeyToPem($publicKeyDer);
-		if ($pem === null) {
-			return false;
-		}
-
-		// Convert raw signature (r || s) to DER format for openssl_verify
-		$derSig = $this->rawToDer($rawSig);
-
-		// openssl_verify expects the original data, not the hash.
-		// OPENSSL_ALGO_SHA256 tells it to hash with SHA-256 before verifying.
-		$result = openssl_verify($payload, $derSig, $pem, OPENSSL_ALGO_SHA256);
-
-		return $result === 1;
-	}
-
-	// ---------------------------------------------------------------
-	// Key format conversions
-	// ---------------------------------------------------------------
-
-	/**
-	 * Convert a JWK (ECDSA P-256) to PEM format.
-	 */
-	private function jwkToPem(array $jwk): ?string {
-		if (($jwk['kty'] ?? '') !== 'EC' || ($jwk['crv'] ?? '') !== 'P-256') {
+	private function decodeMultibasePublicKey(string $multibaseKey): ?string {
+		if ($multibaseKey === '') {
 			return null;
 		}
 
-		$x = $this->base64urlDecode($jwk['x'] ?? '');
-		$y = $this->base64urlDecode($jwk['y'] ?? '');
+		if (str_starts_with($multibaseKey, '0x') || str_starts_with($multibaseKey, '0X')) {
+			$hex = substr($multibaseKey, 2);
+			if (!ctype_xdigit($hex)) {
+				return null;
+			}
+			$decoded = @hex2bin($hex);
+			return $decoded === false ? null : $decoded;
+		}
 
-		if ($x === false || $y === false || strlen($x) !== 32 || strlen($y) !== 32) {
+		if (!str_starts_with($multibaseKey, 'z')) {
 			return null;
 		}
 
-		// Build uncompressed point: 0x04 || x || y
-		$uncompressed = "\x04" . $x . $y;
+		$encoded = substr($multibaseKey, 1);
 
-		return $this->publicKeyToPem($uncompressed);
+		// Try hex first (as used by SoftwareKeyManager: 'z' + hex).
+		// The TS validator does the same — decoding hex-as-base58 silently
+		// succeeds with garbage bytes, so hex-first is required.
+		if (ctype_xdigit($encoded) && strlen($encoded) % 2 === 0) {
+			$decoded = @hex2bin($encoded);
+			if ($decoded !== false) {
+				return $decoded;
+			}
+		}
+
+		return $this->base58btcDecode($encoded);
 	}
 
 	/**
-	 * Wrap a raw uncompressed EC public key (65 bytes) or SPKI DER in PEM.
+	 * Wrap a raw uncompressed EC public key (65 bytes starting 0x04) or an
+	 * SPKI DER blob in a PEM envelope and validate it with OpenSSL.
 	 */
 	private function publicKeyToPem(string $keyBytes): ?string {
-		// If it's already SPKI DER (starts with 0x30), wrap directly
-		if (strlen($keyBytes) > 65 && ord($keyBytes[0]) === 0x30) {
-			$der = $keyBytes;
-		} elseif (strlen($keyBytes) === 65 && ord($keyBytes[0]) === 0x04) {
-			// Raw uncompressed point: wrap in SPKI DER structure
-			// SPKI header for EC P-256 (OID 1.2.840.10045.2.1 + 1.2.840.10045.3.1.7)
+		if ($this->looksLikeRawUncompressedEcKey($keyBytes)) {
 			$spkiHeader = hex2bin(
+				// SEQUENCE { SEQUENCE { id-ecPublicKey, prime256v1 }, BIT STRING }
 				'3059301306072a8648ce3d020106082a8648ce3d030107034200'
 			);
 			$der = $spkiHeader . $keyBytes;
+		} elseif ($this->looksLikeDerSpki($keyBytes)) {
+			$der = $keyBytes;
 		} else {
 			return null;
 		}
@@ -402,75 +435,181 @@ class W3dsAuthService {
 			 . chunk_split(base64_encode($der), 64, "\n")
 			 . "-----END PUBLIC KEY-----\n";
 
-		$key = openssl_pkey_get_public($pem);
-		if ($key === false) {
+		if (openssl_pkey_get_public($pem) === false) {
 			return null;
 		}
-
 		return $pem;
 	}
 
-	// ---------------------------------------------------------------
-	// Encoding helpers
-	// ---------------------------------------------------------------
-
 	/**
-	 * Decode a multibase-encoded public key.
-	 * Prefix 'z' = base58btc, 'm' = base64, 'f' = hex.
+	 * Convert a JWK (ECDSA P-256) to PEM format.
+	 *
+	 * @param array<string, mixed> $jwk
 	 */
-	private function decodeMultibaseKey(string $encoded): ?string {
-		if (empty($encoded)) {
+	private function jwkToPem(array $jwk): ?string {
+		if (($jwk['kty'] ?? '') !== 'EC' || ($jwk['crv'] ?? '') !== 'P-256') {
 			return null;
 		}
 
-		$prefix = $encoded[0];
-		$data = substr($encoded, 1);
+		$x = $this->base64urlDecode((string)($jwk['x'] ?? ''));
+		$y = $this->base64urlDecode((string)($jwk['y'] ?? ''));
 
-		return match ($prefix) {
-			'z' => $this->base58btcDecode($data) ?? (ctype_xdigit($data) ? hex2bin($data) ?: null : null),
-			'm' => base64_decode($data, true) ?: null,
-			'f' => hex2bin($data) ?: null,
-			default => null,
-		};
-	}
-
-	/**
-	 * Decode a signature from base64 or multibase base58btc.
-	 */
-	private function decodeSignature(string $encoded): ?string {
-		if (empty($encoded)) {
+		if ($x === false || $y === false || strlen($x) !== 32 || strlen($y) !== 32) {
 			return null;
 		}
 
-		// Multibase base58btc prefix
-		if ($encoded[0] === 'z') {
-			return $this->base58btcDecode(substr($encoded, 1));
+		return $this->publicKeyToPem("\x04" . $x . $y);
+	}
+
+	// ---------------------------------------------------------------
+	// Signature decoding — mirrors decodeSignature() in the TS verifier.
+	// ---------------------------------------------------------------
+
+	/**
+	 * Try base64/base64url first, then base58btc (only if the leading char
+	 * is 'z' and the remainder is valid base58). Prefer whichever decode
+	 * yields DER-looking bytes; otherwise return the first successful
+	 * decode. Final fallback: raw base64 without validation.
+	 */
+	private function decodeSignature(string $signature): ?string {
+		if ($signature === '') {
+			return null;
 		}
 
-		// Standard base64
-		$decoded = base64_decode($encoded, true);
-		return $decoded !== false ? $decoded : null;
+		$base64urlPattern = '/^[A-Za-z0-9_\-]+=*$/';
+		$base58Alphabet = '/^[123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz]+$/';
+
+		$base64Bytes = null;
+		if (preg_match($base64urlPattern, $signature)) {
+			$base64Bytes = $this->tryDecodeBase64Like($signature);
+		}
+
+		$base58Bytes = null;
+		if (str_starts_with($signature, 'z')) {
+			$rest = substr($signature, 1);
+			if ($rest !== '' && preg_match($base58Alphabet, $rest)) {
+				$base58Bytes = $this->base58btcDecode($rest);
+			}
+		}
+
+		// Prefer DER-looking output if we have one.
+		if ($base58Bytes !== null && $this->looksLikeDerEcdsaSignature($base58Bytes)) {
+			return $base58Bytes;
+		}
+		if ($base64Bytes !== null && $this->looksLikeDerEcdsaSignature($base64Bytes)) {
+			return $base64Bytes;
+		}
+
+		if ($base64Bytes !== null) {
+			return $base64Bytes;
+		}
+		if ($base58Bytes !== null) {
+			return $base58Bytes;
+		}
+
+		// Final fallback: plain base64 (no character restriction).
+		$decoded = base64_decode($signature, false);
+		return $decoded === false ? null : $decoded;
 	}
+
+	private function tryDecodeBase64Like(string $input): ?string {
+		$padded = strlen($input) % 4 === 0
+			? $input
+			: $input . str_repeat('=', 4 - (strlen($input) % 4));
+		$normalised = strtr($padded, '-_', '+/');
+		$decoded = base64_decode($normalised, true);
+		return $decoded === false ? null : $decoded;
+	}
+
+	/**
+	 * Normalise a decoded signature to DER for openssl_verify.
+	 *   - DER in → DER out
+	 *   - Raw 64-byte r||s in → DER out
+	 *   - Anything else → null (caller should fail verification)
+	 */
+	private function signatureToDer(string $signatureBytes): ?string {
+		if ($this->looksLikeDerEcdsaSignature($signatureBytes)) {
+			return $signatureBytes;
+		}
+		if (strlen($signatureBytes) === 64) {
+			return $this->rawToDer($signatureBytes);
+		}
+		return null;
+	}
+
+	// ---------------------------------------------------------------
+	// Byte-shape classifiers — direct PHP equivalents of the TS helpers.
+	// ---------------------------------------------------------------
+
+	private function looksLikeRawUncompressedEcKey(string $bytes): bool {
+		return strlen($bytes) === 65 && ord($bytes[0]) === 0x04;
+	}
+
+	private function looksLikeDerSpki(string $bytes): bool {
+		$len = strlen($bytes);
+		if ($len <= 2) {
+			return false;
+		}
+		if (ord($bytes[0]) !== 0x30) {
+			return false;
+		}
+		$lenByte = ord($bytes[1]);
+		return $lenByte >= 0x20 && $lenByte <= 0x82;
+	}
+
+	private function looksLikeDerEcdsaSignature(string $bytes): bool {
+		$len = strlen($bytes);
+		if ($len < 8) {
+			return false;
+		}
+		if (ord($bytes[0]) !== 0x30) {
+			return false;
+		}
+		$totalLen = ord($bytes[1]);
+		if ($totalLen !== $len - 2) {
+			return false;
+		}
+		if (ord($bytes[2]) !== 0x02) {
+			return false;
+		}
+		$rLen = ord($bytes[3]);
+		if (4 + $rLen >= $len) {
+			return false;
+		}
+		if (ord($bytes[4 + $rLen]) !== 0x02) {
+			return false;
+		}
+		$sLen = ord($bytes[5 + $rLen]);
+		return 6 + $rLen + $sLen === $len;
+	}
+
+	// ---------------------------------------------------------------
+	// DER ↔ raw signature conversion
+	// ---------------------------------------------------------------
 
 	/**
 	 * Convert a raw ECDSA signature (r || s, 64 bytes) to DER format
-	 * as expected by openssl_verify.
+	 * as expected by openssl_verify. If the input is not exactly 64 bytes,
+	 * assume it is already DER and return it unchanged.
 	 */
 	private function rawToDer(string $raw): string {
 		if (strlen($raw) !== 64) {
-			return $raw; // assume already DER
+			return $raw;
 		}
 
 		$r = substr($raw, 0, 32);
 		$s = substr($raw, 32, 32);
 
-		// Trim leading zero bytes, then prepend 0x00 if high bit set
 		$r = ltrim($r, "\x00");
-		if (ord($r[0]) & 0x80) {
+		if ($r === '') {
+			$r = "\x00";
+		} elseif (ord($r[0]) & 0x80) {
 			$r = "\x00" . $r;
 		}
 		$s = ltrim($s, "\x00");
-		if (ord($s[0]) & 0x80) {
+		if ($s === '') {
+			$s = "\x00";
+		} elseif (ord($s[0]) & 0x80) {
 			$s = "\x00" . $s;
 		}
 
@@ -481,6 +620,10 @@ class W3dsAuthService {
 		return "\x30" . chr(strlen($seq)) . $seq;
 	}
 
+	// ---------------------------------------------------------------
+	// Low-level encoding helpers
+	// ---------------------------------------------------------------
+
 	private function base64urlDecode(string $input): string|false {
 		$remainder = strlen($input) % 4;
 		if ($remainder > 0) {
@@ -490,9 +633,13 @@ class W3dsAuthService {
 	}
 
 	/**
-	 * Decode a base58btc string (Bitcoin alphabet).
+	 * Decode a base58btc string (Bitcoin alphabet, no multibase prefix).
 	 */
 	private function base58btcDecode(string $input): ?string {
+		if ($input === '') {
+			return null;
+		}
+
 		$alphabet = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
 
 		$result = gmp_init(0);
@@ -511,7 +658,6 @@ class W3dsAuthService {
 			$hex = '0' . $hex;
 		}
 
-		// Preserve leading zeros
 		$leadingZeros = 0;
 		for ($i = 0; $i < strlen($input); $i++) {
 			if ($input[$i] === '1') {
