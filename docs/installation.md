@@ -51,7 +51,25 @@ Make sure the `vendor/` directory ends up inside the app folder so Nextcloud's a
 
 ### 3. Fix permissions
 
-Whatever user runs Nextcloud (`www-data` on Debian/Ubuntu, `nginx` or `apache` on RHEL-likes) needs to own the app directory:
+Nextcloud runs under a web-server user, and that user needs to own the app directory. The examples below use `www-data` (the Debian/Ubuntu default for both Apache and nginx), but your system may differ:
+
+| Distro family | Typical user |
+|---|---|
+| Debian / Ubuntu | `www-data` |
+| RHEL / CentOS / Rocky / Fedora (Apache) | `apache` |
+| RHEL / CentOS / Rocky / Fedora (nginx) | `nginx` |
+| Alpine | `nginx` or `apache` |
+| Arch | `http` |
+
+What actually matters is the **PHP-FPM pool user** (or mod_php user), not the web server's own process. Confirm it on your host:
+
+```bash
+ps -eo user,cmd | grep -E 'php-fpm|php_fpm' | head
+# or
+grep '^user' /etc/php*/fpm/pool.d/*.conf
+```
+
+Substitute that user wherever the commands below say `www-data`:
 
 ```bash
 chown -R www-data:www-data /var/www/nextcloud/apps/w3ds_login
