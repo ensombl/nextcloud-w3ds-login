@@ -13,6 +13,7 @@ use OCP\HintException;
 use OCP\IConfig;
 use OCP\IRequest;
 use OCP\IURLGenerator;
+use OCP\IUserManager;
 use OCP\IUserSession;
 use Psr\Log\LoggerInterface;
 
@@ -23,6 +24,7 @@ class PasswordSetupController extends Controller {
 	public function __construct(
 		IRequest $request,
 		private IUserSession $userSession,
+		private IUserManager $userManager,
 		private IConfig $config,
 		private IURLGenerator $urlGenerator,
 		private LoggerInterface $logger,
@@ -80,9 +82,24 @@ class PasswordSetupController extends Controller {
 			return $this->render('Could not save the new password. Please try again.');
 		}
 
+		// Sanity-check: the hash we just wrote must verify against the string
+		// we handed in. If it doesn't, something between the form and the DB
+		// is mangling the password (whitespace, encoding, autofill, etc.).
+		$verified = $this->userManager->checkPassword($user->getUID(), $password);
+		if ($verified === false) {
+			$this->logger->error('setPassword succeeded but checkPassword rejected the same string', [
+				'uid' => $user->getUID(),
+				'passwordLength' => strlen($password),
+			]);
+			return $this->render('The password was saved but could not be verified. Please try again.');
+		}
+
 		$this->config->deleteUserValue($user->getUID(), Application::APP_ID, self::CONFIG_KEY);
 
-		$this->logger->info('W3DS user set their password', ['uid' => $user->getUID()]);
+		$this->logger->info('W3DS user set their password', [
+			'uid' => $user->getUID(),
+			'passwordLength' => strlen($password),
+		]);
 
 		return new RedirectResponse($this->urlGenerator->getAbsoluteURL('/'));
 	}
