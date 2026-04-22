@@ -18,27 +18,26 @@ If you eventually want to publish to the Nextcloud app store, see [Publishing to
 
 This is the path your Nextcloud admin would follow if the plugin isn't on the app store yet, or if they prefer to install from source.
 
-### 1. Download the plugin into custom_apps
+### 1. Download the plugin into the apps directory
 
-Nextcloud loads apps from `custom_apps/` inside its install directory. The exact path depends on how Nextcloud was installed:
+Nextcloud loads apps from `apps/` inside its install directory (always present) and, if configured, also from `custom_apps/`. A fresh tarball install only has `apps/`, so that's the safe default. The exact path depends on how Nextcloud was installed:
 
-- Tarball install: usually `/var/www/nextcloud/custom_apps/`
-- Snap install: `/var/snap/nextcloud/common/nextcloud/custom_apps/`
-- Docker official image: `/var/www/html/custom_apps/` inside the container
+- Tarball install: usually `/var/www/nextcloud/apps/`
+- Snap install: `/var/snap/nextcloud/common/nextcloud/extra-apps/`
+- Docker official image: `/var/www/html/apps/` inside the container
+
+If your instance is already set up with a separate `custom_apps/` directory (admins often do this to keep third-party apps outside the upgrade path), you can use that instead — everything below works the same way, just substitute the path.
 
 Drop the plugin in there as a directory called `w3ds_login`:
 
 ```bash
-cd /var/www/nextcloud/custom_apps
-git clone https://github.com/ensombl/nextcloud-w3ds-login.git w3ds_login
-cd w3ds_login
+cd /var/www/nextcloud/apps
+git clone https://github.com/ensombl/nextcloud-w3ds-login.git w3ds_login-src
+cp -r w3ds_login-src/app w3ds_login
+rm -rf w3ds_login-src
 ```
 
-The repo layout has the actual app under `app/` with a symlink so this works directly. If your filesystem doesn't follow symlinks (rare), copy `app/` to a sibling directory and rename it:
-
-```bash
-cp -r app /var/www/nextcloud/custom_apps/w3ds_login
-```
+The repo layout has the actual Nextcloud app under `app/`, so the app directory Nextcloud sees is the contents of that subfolder.
 
 ### 2. Install PHP dependencies
 
@@ -55,7 +54,7 @@ Make sure the `vendor/` directory ends up inside the app folder so Nextcloud's a
 Whatever user runs Nextcloud (`www-data` on Debian/Ubuntu, `nginx` or `apache` on RHEL-likes) needs to own the app directory:
 
 ```bash
-chown -R www-data:www-data /var/www/nextcloud/custom_apps/w3ds_login
+chown -R www-data:www-data /var/www/nextcloud/apps/w3ds_login
 ```
 
 ### 4. Enable the app
@@ -87,7 +86,7 @@ If you have Talk installed and a user has linked their W3DS identity from person
 Updates are git pull plus a migration run plus a cache flush:
 
 ```bash
-cd /var/www/nextcloud/custom_apps/w3ds_login
+cd /var/www/nextcloud/apps/w3ds_login
 sudo -u www-data git pull
 sudo -u www-data composer install --no-dev --optimize-autoloader
 sudo -u www-data php occ migrations:migrate w3ds_login
