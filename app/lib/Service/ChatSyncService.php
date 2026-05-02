@@ -823,37 +823,26 @@ class ChatSyncService {
 			]);
 		}
 
-		// 2. Messages — list, filter to messages whose chatId is in the accepted room set.
-		try {
-			$messageEnvelopes = $this->evaultClient->listMetaEnvelopesByOntology($w3id, self::MESSAGE_SCHEMA_ID, self::PULL_LIST_CACHE_TTL);
-			foreach ($messageEnvelopes as $env) {
-				try {
-					$globalId = (string)($env['id'] ?? '');
-					$parsed = $env['parsed'] ?? [];
-					if ($globalId === '' || !is_array($parsed) || empty($parsed)) {
-						continue;
-					}
-					$chatId = (string)($parsed['chatId'] ?? '');
-					if ($chatId === '' || !isset($acceptedChatGlobalIds[$chatId])) {
-						continue;
-					}
-					if ($this->idMappingMapper->getLocalId('message', $globalId) !== null) {
-						continue;
-					}
-					$this->handleInboundMessage($globalId, $w3id, $parsed);
-				} catch (\Throwable $e) {
-					$this->logger->warning('[W3DS Sync] pullSyncForUser: message envelope failed', [
-						'w3id' => $w3id,
-						'globalId' => $env['id'] ?? null,
-						'exception' => $e->getMessage(),
-					]);
-				}
+		// 2. Messages — fan out per accepted chat. Listing the message
+		// ontology on $w3id's own eVault only surfaces messages *they*
+		// authored; everyone else's messages live in their own eVaults
+		// and are only reachable via pollRoom, which iterates each Talk
+		// attendee's W3ID and pulls from there.
+		foreach (array_keys($acceptedChatGlobalIds) as $chatGlobalId) {
+			$roomToken = $this->idMappingMapper->getLocalId('chat', $chatGlobalId);
+			if ($roomToken === null) {
+				continue; // chat ingest failed above
 			}
-		} catch (\Throwable $e) {
-			$this->logger->warning('[W3DS Sync] pullSyncForUser: message list failed', [
-				'w3id' => $w3id,
-				'exception' => $e->getMessage(),
-			]);
+			try {
+				$this->pollRoom($roomToken);
+			} catch (\Throwable $e) {
+				$this->logger->warning('[W3DS Sync] pullSyncForUser: pollRoom failed', [
+					'w3id' => $w3id,
+					'chatGlobalId' => $chatGlobalId,
+					'roomToken' => $roomToken,
+					'exception' => $e->getMessage(),
+				]);
+			}
 		}
 	}
 

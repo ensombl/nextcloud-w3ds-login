@@ -15,7 +15,7 @@ Features:
 - Link/unlink W3DS identity from personal settings
 - Signature verification via the W3DS Registry
     ]]></description>
-    <version>0.6.1</version>
+    <version>0.6.2</version>
     <licence>AGPL-3.0-or-later</licence>
     <author>Patrick</author>
     <namespace>W3dsLogin</namespace>
