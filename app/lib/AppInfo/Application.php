@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace OCA\W3dsLogin\AppInfo;
 
 use OCA\W3dsLogin\BackgroundJob\PullSyncJob;
+use OCA\W3dsLogin\BackgroundJob\TentativeUserCleanupJob;
+use OCA\W3dsLogin\Listener\AttendeesAddedTentativeFlipListener;
 use OCA\W3dsLogin\Listener\AttendeesChangedListener;
 use OCA\W3dsLogin\Listener\BeforeTemplateRenderedListener;
 use OCA\W3dsLogin\Listener\MessageSentListener;
@@ -50,6 +52,10 @@ class Application extends App implements IBootstrap {
 		$context->registerEventListener(self::TALK_ATTENDEES_REMOVED_EVENT, AttendeesChangedListener::class);
 		$context->registerEventListener(self::TALK_ATTENDEE_REMOVED_EVENT, AttendeesChangedListener::class);
 
+		// On Talk's AttendeesAddedEvent, flip a tentative-provisioned W3DS
+		// user to permanent so the cleanup job stops considering them.
+		$context->registerEventListener(self::TALK_ATTENDEES_ADDED_EVENT, AttendeesAddedTentativeFlipListener::class);
+
 		// Inject the Talk room poller script on all logged-in pages
 		$context->registerEventListener(BeforeTemplateRenderedEvent::class, BeforeTemplateRenderedListener::class);
 	}
@@ -60,6 +66,9 @@ class Application extends App implements IBootstrap {
 		$jobList = $server->get(IJobList::class);
 		if (!$jobList->has(PullSyncJob::class, null)) {
 			$jobList->add(PullSyncJob::class);
+		}
+		if (!$jobList->has(TentativeUserCleanupJob::class, null)) {
+			$jobList->add(TentativeUserCleanupJob::class);
 		}
 	}
 }

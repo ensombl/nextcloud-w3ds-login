@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace OCA\W3dsLogin\Service;
 
 use OCA\W3dsLogin\AppInfo\Application;
+use OCA\W3dsLogin\Db\TentativeUserMapper;
 use OCA\W3dsLogin\Db\W3dsMapping;
 use OCA\W3dsLogin\Db\W3dsMappingMapper;
 use OCP\AppFramework\Db\DoesNotExistException;
@@ -21,14 +22,28 @@ class UserProvisioningService {
 		private ISecureRandom $secureRandom,
 		private EvaultClient $evaultClient,
 		private IConfig $config,
+		private TentativeUserMapper $tentativeUserMapper,
 		private LoggerInterface $logger,
 	) {
 	}
 
 	/**
 	 * Find an existing user by W3ID, or create a new Nextcloud user.
+	 *
+	 * When $tentative is true and a fresh account is created (collaborator
+	 * search flow), the new account is flagged tentative. The flag is
+	 * cleared by AttendeesAddedTentativeFlipListener when the user is
+	 * actually added to a Talk room, otherwise garbage-collected by
+	 * TentativeUserCleanupJob after expiry.
+	 *
+	 * If the caller already has the parsed profile fields (e.g. from a
+	 * by-ontology list response), pass them as $prefetchedProfile to skip
+	 * the secondary eVault fetches inside hydrateProfileFromEvault. This
+	 * matters during collaborator search where many w3ids resolve at once.
+	 *
+	 * @param array<string, mixed>|null $prefetchedProfile
 	 */
-	public function findOrCreateUser(string $w3id): ?IUser {
+	public function findOrCreateUser(string $w3id, bool $tentative = false, ?array $prefetchedProfile = null): ?IUser {
 		// Check for existing mapping
 		try {
 			$mapping = $this->mapper->findByW3id($w3id);
@@ -60,16 +75,43 @@ class UserProvisioningService {
 
 		$user->setDisplayName($w3id);
 
-		// Store the W3ID mapping
+		// Store the W3ID mapping. The unique index on w3id can throw if a
+		// concurrent picker request just inserted the same mapping (each
+		// keystroke runs the plugin and they race past findByW3id). In that
+		// case, delete our just-created orphan NC user and return the
+		// winner's user instead -- otherwise we leak a clone account.
 		$mapping = new W3dsMapping();
 		$mapping->setW3id($w3id);
 		$mapping->setNcUid($user->getUID());
 		$mapping->setCreatedAt(time());
-		$this->mapper->insert($mapping);
+		try {
+			$this->mapper->insert($mapping);
+		} catch (\Throwable $insertErr) {
+			try {
+				$existing = $this->mapper->findByW3id($w3id);
+				$existingUser = $this->userManager->get($existing->getNcUid());
+				if ($existingUser !== null) {
+					$this->logger->info('findOrCreateUser: lost race, deleting orphan NC user', [
+						'w3id' => $w3id,
+						'orphanUid' => $user->getUID(),
+						'winnerUid' => $existing->getNcUid(),
+					]);
+					try {
+						$user->delete();
+					} catch (\Throwable) {
+					}
+					return $existingUser;
+				}
+			} catch (DoesNotExistException) {
+				// the unique violation was for nc_uid (someone else made an account
+				// with the same derived username). Re-raise the original failure.
+			}
+			throw $insertErr;
+		}
 
 		// Best-effort: replace the W3ID-based display name and empty email
 		// with whatever the user's eVault profile has.
-		$this->hydrateProfileFromEvault($user, $w3id);
+		$this->hydrateProfileFromEvault($user, $w3id, $prefetchedProfile);
 
 		// The random password above is a throwaway -- force the user to set
 		// a real one on first login so WebDAV / desktop clients / mobile
@@ -81,9 +123,21 @@ class UserProvisioningService {
 			'1',
 		);
 
+		if ($tentative) {
+			try {
+				$this->tentativeUserMapper->markTentative($user->getUID(), time() + 1800);
+			} catch (\Throwable $e) {
+				$this->logger->warning('Failed to mark user tentative on creation', [
+					'uid' => $user->getUID(),
+					'exception' => $e->getMessage(),
+				]);
+			}
+		}
+
 		$this->logger->info('Provisioned new user from W3DS', [
 			'w3id' => $w3id,
 			'uid' => $user->getUID(),
+			'tentative' => $tentative,
 		]);
 
 		return $user;
@@ -93,16 +147,24 @@ class UserProvisioningService {
 	 * Copy the user's displayName and email from their eVault User profile
 	 * onto the freshly-created NC account. Never throws: a broken eVault
 	 * must not prevent login.
+	 *
+	 * If $prefetchedParsed is provided, skips the two eVault round-trips
+	 * (getProfileEnvelopeId + fetchMetaEnvelopeById) and uses the supplied
+	 * parsed fields directly.
+	 *
+	 * @param array<string, mixed>|null $prefetchedParsed
 	 */
-	private function hydrateProfileFromEvault(IUser $user, string $w3id): void {
+	private function hydrateProfileFromEvault(IUser $user, string $w3id, ?array $prefetchedParsed = null): void {
 		try {
-			$profileId = $this->evaultClient->getProfileEnvelopeId($w3id);
-			if ($profileId === null) {
-				return;
+			$parsed = $prefetchedParsed;
+			if ($parsed === null) {
+				$profileId = $this->evaultClient->getProfileEnvelopeId($w3id);
+				if ($profileId === null) {
+					return;
+				}
+				$envelope = $this->evaultClient->fetchMetaEnvelopeById($w3id, $profileId);
+				$parsed = $envelope['parsed'] ?? null;
 			}
-
-			$envelope = $this->evaultClient->fetchMetaEnvelopeById($w3id, $profileId);
-			$parsed = $envelope['parsed'] ?? null;
 			if (!is_array($parsed)) {
 				return;
 			}

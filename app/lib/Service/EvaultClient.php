@@ -21,6 +21,7 @@ class EvaultClient {
 	private const PROFILE_ID_CACHE_PREFIX = 'w3ds_profile_id_';
 	private const PROFILE_ID_W3ID_CACHE_PREFIX = 'w3ds_profile_w3id_';
 	private const PROFILE_ID_CACHE_TTL = 3600; // 1 hour
+	private const ONTOLOGY_LIST_CACHE_PREFIX = 'w3ds_ontology_list_';
 	private const PLATFORM_TOKEN_CACHE_KEY = 'w3ds_platform_token';
 	private const PLATFORM_TOKEN_CACHE_TTL = 86400; // 24 hours (tokens last ~1 year, but refresh daily)
 	private const HTTP_TIMEOUT = 15;
@@ -310,9 +311,23 @@ class EvaultClient {
 	 * Each row is shaped roughly like:
 	 *   { id, ontology, acl, eName, envelopes, parsed }
 	 *
+	 * Optional $cacheTtl > 0 memoises the response in distributed cache
+	 * keyed by (w3id, ontology). Use it for hot paths like collaborator
+	 * search where the same list is queried per keystroke; leave as 0 for
+	 * chat polling where staleness matters.
+	 *
 	 * @return list<array<string, mixed>>
 	 */
-	public function listMetaEnvelopesByOntology(string $w3id, string $ontology): array {
+	public function listMetaEnvelopesByOntology(string $w3id, string $ontology, int $cacheTtl = 0): array {
+		$cacheKey = $cacheTtl > 0
+			? self::ONTOLOGY_LIST_CACHE_PREFIX . md5($w3id . '|' . $ontology)
+			: null;
+		if ($cacheKey !== null) {
+			$cached = $this->cache->get($cacheKey);
+			if (is_array($cached)) {
+				return $cached;
+			}
+		}
 		$evaultUrl = $this->resolveEvaultUrl($w3id);
 		if ($evaultUrl === null) {
 			$this->logger->warning('listMetaEnvelopesByOntology: cannot resolve eVault', ['w3id' => $w3id]);
@@ -337,7 +352,11 @@ class EvaultClient {
 			]);
 			$body = json_decode($response->getBody(), true);
 			$envelopes = $body['metaEnvelopes'] ?? [];
-			return is_array($envelopes) ? $envelopes : [];
+			$envelopes = is_array($envelopes) ? $envelopes : [];
+			if ($cacheKey !== null) {
+				$this->cache->set($cacheKey, $envelopes, $cacheTtl);
+			}
+			return $envelopes;
 		} catch (\Throwable $e) {
 			$this->logger->warning('listMetaEnvelopesByOntology failed', [
 				'w3id' => $w3id,
@@ -381,6 +400,18 @@ class EvaultClient {
 	/**
 	 * Resolve a W3ID to the MetaEnvelope ID of their User profile envelope.
 	 * This is the ID other platforms expect in participantIds / senderId fields.
+	 *
+	 * eVaults can hold multiple User envelopes for the same eName (legacy
+	 * replicas + a canonical primary). We must pick the canonical one,
+	 * otherwise other platforms won't recognise the participant. The
+	 * canonical envelope is the one whose `parsed.ename` matches the eName;
+	 * legacy duplicates don't carry that field. We list all envelopes via
+	 * the by-ontology REST endpoint and filter client side, since GraphQL
+	 * `metaEnvelopes(first: 1)` just returns whatever the eVault returns
+	 * first which is non-deterministic across replicas.
+	 *
+	 * Side effect: primes the bidirectional cache for every visible User
+	 * envelope on the resolved eVault.
 	 */
 	public function getProfileEnvelopeId(string $w3id): ?string {
 		$cacheKey = self::PROFILE_ID_CACHE_PREFIX . $w3id;
@@ -390,23 +421,56 @@ class EvaultClient {
 		}
 
 		try {
-			$result = $this->fetchMetaEnvelopes($w3id, self::USER_SCHEMA_ID, 1, null);
-			$edges = $result['edges'] ?? [];
-			if (empty($edges)) {
-				$this->logger->warning('No User profile envelope found in eVault', ['w3id' => $w3id]);
+			$envelopes = $this->listMetaEnvelopesByOntology($w3id, self::USER_SCHEMA_ID);
+			if (empty($envelopes)) {
+				$this->logger->warning('No User profile envelopes returned from eVault', ['w3id' => $w3id]);
 				return null;
 			}
 
-			$profileId = $edges[0]['node']['id'] ?? null;
-			if ($profileId !== null) {
-				$this->cache->set($cacheKey, $profileId, self::PROFILE_ID_CACHE_TTL);
-				$this->cache->set(
-					self::PROFILE_ID_W3ID_CACHE_PREFIX . $profileId,
-					$w3id,
-					self::PROFILE_ID_CACHE_TTL,
-				);
+			$canonical = null;
+			$fallback = null;
+			foreach ($envelopes as $env) {
+				$eName = is_string($env['eName'] ?? null) ? $env['eName'] : '';
+				$envId = is_string($env['id'] ?? null) ? $env['id'] : '';
+				if ($eName === '' || $envId === '') {
+					continue;
+				}
+
+				// Prime caches for everyone we can see on this eVault.
+				$this->cache->set(self::PROFILE_ID_CACHE_PREFIX . $eName, $envId, self::PROFILE_ID_CACHE_TTL);
+				$this->cache->set(self::PROFILE_ID_W3ID_CACHE_PREFIX . $envId, $eName, self::PROFILE_ID_CACHE_TTL);
+
+				if ($eName !== $w3id) {
+					continue;
+				}
+
+				$parsed = is_array($env['parsed'] ?? null) ? $env['parsed'] : [];
+				$parsedEname = is_string($parsed['ename'] ?? null) ? $parsed['ename'] : '';
+
+				if ($parsedEname === $w3id) {
+					$canonical = $envId;
+					break; // primary copy, stop searching
+				}
+				if ($fallback === null) {
+					$fallback = $envId;
+				}
 			}
-			return $profileId;
+
+			$found = $canonical ?? $fallback;
+			if ($found === null) {
+				$this->logger->warning('No User envelope matching W3ID on resolved eVault', ['w3id' => $w3id]);
+			} elseif ($canonical === null) {
+				$this->logger->info('Falling back to non-canonical User envelope (no parsed.ename match)', [
+					'w3id' => $w3id,
+					'envelopeId' => $found,
+				]);
+			}
+
+			// Re-prime the canonical mapping under the cache key we'll read on next call.
+			if ($found !== null) {
+				$this->cache->set($cacheKey, $found, self::PROFILE_ID_CACHE_TTL);
+			}
+			return $found;
 		} catch (\Throwable $e) {
 			$this->logger->error('Failed to fetch User profile envelope', [
 				'w3id' => $w3id,
