@@ -79,7 +79,7 @@ class DedupeMappingsCommand extends Command {
 				$scored[$uid] = $score;
 			}
 			arsort($scored);
-			$winner = (string)array_key_first($scored);
+			$winner = array_key_first($scored);
 
 			$output->writeln(sprintf(
 				'<info>%s</info> winner=<comment>%s</comment> (score=%d)',

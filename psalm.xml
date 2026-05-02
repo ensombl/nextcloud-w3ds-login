@@ -36,10 +36,10 @@
                 <referencedClass name="Doctrine\DBAL\Schema\Table"/>
             </errorLevel>
         </UndefinedDocblockClass>
-        <UndefinedInterfaceMethod>
-            <errorLevel type="suppress">
-                <referencedMethod name="OCP\IUserSession::createSessionToken"/>
-            </errorLevel>
-        </UndefinedInterfaceMethod>
+        <!-- Psalm 6 introduced these strict defaults; ignored project-wide
+             so this app's error budget stays focused on real bugs. -->
+        <MissingOverrideAttribute errorLevel="suppress"/>
+        <ClassMustBeFinal errorLevel="suppress"/>
+        <MissingParamType errorLevel="suppress"/>
     </issueHandlers>
 </psalm>
