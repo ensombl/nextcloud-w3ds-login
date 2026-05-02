@@ -2,8 +2,17 @@
     'use strict';
 
     var POLL_INTERVAL = 15000;
+    // Chat-list (room discovery) polling runs less often than per-room
+    // message polling -- new chats are rarer than new messages, and
+    // pullSyncForUser lists the entire chat ontology so it's heavier.
+    var CHAT_POLL_INTERVAL = 30000;
     var timer = null;
+    var chatTimer = null;
     var currentToken = null;
+    // Only run the chat-list poll on Talk pages. Anywhere else (Files,
+    // Settings, etc.) doesn't need it -- saves a request every 30s on
+    // every tab the user has open.
+    var TALK_PATH_RE = /(?:^|\/)(?:apps\/spreed|call|conversation)(?:\/|$)/;
 
     function getOcBase() {
         if (typeof OC !== 'undefined' && typeof OC.generateUrl === 'function') {
@@ -37,23 +46,33 @@
         return null;
     }
 
-    function pollOnce() {
-        if (!currentToken) {
-            return;
-        }
-        var url = getOcBase() + '/api/rooms/' + encodeURIComponent(currentToken) + '/poll';
+    function postBestEffort(url) {
         var xhr = new XMLHttpRequest();
         xhr.open('POST', url, true);
         xhr.setRequestHeader('Accept', 'application/json');
         xhr.setRequestHeader('requesttoken', getRequestToken());
         xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
-        xhr.onload = function () {
-            // best-effort: we don't need to do anything with the response.
-            // Talk's own long-poll will pick up new messages shortly after
-            // we've inserted them into the local DB.
-        };
+        xhr.onload = function () { /* best-effort */ };
         xhr.onerror = function () { /* ignore */ };
         xhr.send();
+    }
+
+    function pollOnce() {
+        if (!currentToken) {
+            return;
+        }
+        postBestEffort(getOcBase() + '/api/rooms/' + encodeURIComponent(currentToken) + '/poll');
+    }
+
+    function pollUserChats() {
+        // Skip on non-Talk pages so other tabs don't burn requests on
+        // server-side eVault listings they'll never use.
+        var path = window.location.pathname || '';
+        var hash = window.location.hash || '';
+        if (!TALK_PATH_RE.test(path) && !TALK_PATH_RE.test(hash)) {
+            return;
+        }
+        postBestEffort(getOcBase() + '/api/chats/poll');
     }
 
     function tick() {
@@ -72,6 +91,11 @@
         }
         tick();
         timer = setInterval(tick, POLL_INTERVAL);
+        // Kick off chat-list discovery immediately, then on its own
+        // slower cadence. Independent of per-room polling so it runs
+        // even when not currently inside a room.
+        pollUserChats();
+        chatTimer = setInterval(pollUserChats, CHAT_POLL_INTERVAL);
         window.addEventListener('hashchange', tick);
         window.addEventListener('popstate', tick);
     }
