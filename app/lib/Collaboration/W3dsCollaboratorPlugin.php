@@ -117,7 +117,14 @@ class W3dsCollaboratorPlugin implements ISearchPlugin {
 					continue;
 				}
 
-				$matches[$uid] = [
+				// Key by w3id, not uid. If two NC accounts ended up mapped
+				// to the same identity (legacy provisioning race), the
+				// resolveOrProvisionUid path already picks the canonical
+				// row, but other code paths can have created a parallel
+				// account before the unique index was added. Last write
+				// wins here — we just need one entry per identity in the
+				// dropdown.
+				$matches[$w3id] = [
 					'label' => $displayName,
 					'value' => [
 						'shareType' => IShare::TYPE_USER,

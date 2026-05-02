@@ -436,9 +436,7 @@ class EvaultClient {
 					continue;
 				}
 
-				// Prime caches for everyone we can see on this eVault.
-				$this->cache->set(self::PROFILE_ID_CACHE_PREFIX . $eName, $envId, self::PROFILE_ID_CACHE_TTL);
-				$this->cache->set(self::PROFILE_ID_W3ID_CACHE_PREFIX . $envId, $eName, self::PROFILE_ID_CACHE_TTL);
+				$this->primeProfileCacheEntry($eName, $envId);
 
 				if ($eName !== $w3id) {
 					continue;
@@ -478,6 +476,37 @@ class EvaultClient {
 			]);
 			return null;
 		}
+	}
+
+	/**
+	 * Re-prime the bidirectional profile envelope cache for every peer
+	 * visible to the given viewer. Used by ChatSyncService when an inbound
+	 * chat references a participant whose User envelope hasn't been listed
+	 * on this eVault yet — refreshing the by-ontology listing once gets us
+	 * out of a cold-cache hole without paying for a per-w3id round-trip.
+	 */
+	public function primeProfileCache(string $viewerW3id): void {
+		try {
+			$envelopes = $this->listMetaEnvelopesByOntology($viewerW3id, self::USER_SCHEMA_ID);
+			foreach ($envelopes as $env) {
+				$eName = is_string($env['eName'] ?? null) ? $env['eName'] : '';
+				$envId = is_string($env['id'] ?? null) ? $env['id'] : '';
+				if ($eName === '' || $envId === '') {
+					continue;
+				}
+				$this->primeProfileCacheEntry($eName, $envId);
+			}
+		} catch (\Throwable $e) {
+			$this->logger->warning('primeProfileCache failed', [
+				'viewerW3id' => $viewerW3id,
+				'exception' => $e->getMessage(),
+			]);
+		}
+	}
+
+	private function primeProfileCacheEntry(string $eName, string $envId): void {
+		$this->cache->set(self::PROFILE_ID_CACHE_PREFIX . $eName, $envId, self::PROFILE_ID_CACHE_TTL);
+		$this->cache->set(self::PROFILE_ID_W3ID_CACHE_PREFIX . $envId, $eName, self::PROFILE_ID_CACHE_TTL);
 	}
 
 	/**
