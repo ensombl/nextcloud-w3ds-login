@@ -25,13 +25,13 @@ Features:
         <php min-version="8.1"/>
         <nextcloud min-version="28" max-version="33"/>
     </dependencies>
+    <commands>
+        <command>OCA\W3dsLogin\Command\DedupeMappingsCommand</command>
+    </commands>
     <settings>
         <personal>OCA\W3dsLogin\Settings\PersonalSettings</personal>
         <personal-section>security</personal-section>
     </settings>
-    <commands>
-        <command>OCA\W3dsLogin\Command\DedupeMappingsCommand</command>
-    </commands>
     <collaboration>
         <plugins>
             <plugin type="collaborator-search" share-type="SHARE_TYPE_USER">OCA\W3dsLogin\Collaboration\W3dsCollaboratorPlugin</plugin>
