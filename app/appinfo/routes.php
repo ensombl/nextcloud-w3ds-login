@@ -25,5 +25,9 @@ return [
 		// First-login password setup for W3DS-provisioned users
 		['name' => 'password_setup#show', 'url' => '/password-setup', 'verb' => 'GET'],
 		['name' => 'password_setup#submit', 'url' => '/password-setup', 'verb' => 'POST'],
+
+		// In-room "Add W3DS users" button
+		['name' => 'W3dsContacts#listProfiles', 'url' => '/api/contacts/list', 'verb' => 'GET'],
+		['name' => 'W3dsContacts#addToRoom', 'url' => '/api/contacts/add-to-room', 'verb' => 'POST'],
 	],
 ];
