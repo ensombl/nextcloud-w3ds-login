@@ -305,9 +305,12 @@ class EvaultClient {
 	 * List every MetaEnvelope of the given ontology hosted on the user's
 	 * eVault via the REST endpoint `GET /metaenvelopes/by-ontology/:ontology`.
 	 * Unlike fetchMetaEnvelopes (GraphQL with pagination + filters), this
-	 * returns the full set in one shot — caller is responsible for filtering.
+	 * returns the full set in one shot. Caller is responsible for filtering.
 	 *
-	 * @return array<int, array{id: string, ontology: string, parsed: array}>
+	 * Each row is shaped roughly like:
+	 *   { id, ontology, acl, eName, envelopes, parsed }
+	 *
+	 * @return list<array<string, mixed>>
 	 */
 	public function listMetaEnvelopesByOntology(string $w3id, string $ontology): array {
 		$evaultUrl = $this->resolveEvaultUrl($w3id);
