@@ -96,7 +96,10 @@ class UserProvisioningService {
 						'orphanUid' => $user->getUID(),
 						'winnerUid' => $existing->getNcUid(),
 					]);
-					try { $user->delete(); } catch (\Throwable) {}
+					try {
+						$user->delete();
+					} catch (\Throwable) {
+					}
 					return $existingUser;
 				}
 			} catch (DoesNotExistException) {
