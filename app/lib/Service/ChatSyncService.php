@@ -764,7 +764,9 @@ class ChatSyncService {
 			return;
 		}
 
-		// 1. Rooms — list, filter by membership, ingest.
+		// 1. Rooms — list, filter by membership (the user's profile envelope
+		// ID must appear in the chat's participantIds / admins / owner --
+		// same identifier we put there when *we* push chats), ingest.
 		$acceptedChatGlobalIds = [];
 		try {
 			$chatEnvelopes = $this->evaultClient->listMetaEnvelopesByOntology($w3id, self::CHAT_SCHEMA_ID, self::PULL_LIST_CACHE_TTL);
@@ -833,9 +835,9 @@ class ChatSyncService {
 	}
 
 	/**
-	 * True when the user's profile envelope ID appears in any of the
-	 * canonical user-array fields on a chat envelope (`owner`,
-	 * `participantIds`, `admins`).
+	 * True when the user's profile envelope ID appears in the chat's
+	 * `owner`, `participantIds`, or `admins` -- same identifier shape we
+	 * write when pushing chats outbound.
 	 */
 	private function userIsInRoom(array $parsed, string $myProfileId): bool {
 		if (($parsed['owner'] ?? null) === $myProfileId) {
