@@ -24,6 +24,7 @@ class ChatSyncService {
 	private const MESSAGE_SIG_CACHE_TTL = 86400; // 24h — enough to span a typical poll window
 	private const CHAT_PARTICIPANT_HWM_PREFIX = 'w3ds_chat_pmax_';
 	private const CHAT_PARTICIPANT_HWM_TTL = 604800; // 7d high-water mark guard against pushChat shrinkage
+	private const PULL_LIST_CACHE_TTL = 120; // 2 min for chat/message ontology lists during pull sync
 
 	private ICache $cache;
 
@@ -215,13 +216,25 @@ class ChatSyncService {
 			}
 		}
 
+		// Minimum-common payload across platforms (matches the field set used
+		// by blabsy etc.). Don't include `ename`, `owner`, or `type`: blabsy's
+		// chat adapter (`participants: "ename||user(participants[])"`) routes
+		// participant resolution through `ename` when set and crashes when
+		// the eName-derived participants come back as null entries.
 		$payload = [
-			'id' => $existingInnerId ?? $this->generateUuid(),
-			'type' => $this->mapRoomTypeToGlobal($roomType),
 			'participantIds' => $participantEnvelopeIds,
 			'admins' => $adminEnvelopeIds,
 			'createdAt' => $existingCreatedAt ?? $this->toIso8601($roomData['createdAt'] ?? time()),
+			'updatedAt' => $this->toIso8601(time()),
 		];
+
+		// Preserve the inner id across updates when existing envelopes carry
+		// one (some platforms store this). Don't generate a fresh one on
+		// create; the eVault assigns the outer envelope id which is the
+		// stable identity.
+		if ($existingInnerId !== null) {
+			$payload['id'] = $existingInnerId;
+		}
 
 		if (!empty($roomName)) {
 			$payload['name'] = $roomName;
@@ -266,7 +279,6 @@ class ChatSyncService {
 				return;
 			}
 
-			$payload['updatedAt'] = $this->toIso8601(time());
 			$this->evaultClient->updateMetaEnvelope($w3id, $existingGlobalId, self::CHAT_SCHEMA_ID, $payload, $acl);
 			$this->cache->set($hwmKey, max((int)$hwm, $newCount), self::CHAT_PARTICIPANT_HWM_TTL);
 			$this->logger->info('[W3DS Sync] Updated chat in eVault', [
@@ -431,13 +443,20 @@ class ChatSyncService {
 		// senderId in the Message schema is the sender's User profile envelope ID
 		$senderEnvelopeId = $this->getOrFallbackProfileId($w3id);
 
+		// Match the field set used by other platforms (>99% of message
+		// envelopes carry these). Inner `id` is omitted; the eVault assigns
+		// the outer envelope id which is the stable identity.
+		$now = $this->toIso8601(time());
 		$payload = [
-			'id' => $this->generateUuid(),
 			'chatId' => $chatGlobalId,
 			'senderId' => $senderEnvelopeId,
+			'senderEName' => $w3id,
 			'content' => (string)($messageData['message'] ?? ''),
 			'type' => $this->mapMessageVerbToGlobal($messageData['verb'] ?? 'comment'),
 			'createdAt' => $this->toIso8601($messageData['timestamp'] ?? time()),
+			'updatedAt' => $now,
+			'isArchived' => false,
+			'isSystemMessage' => false,
 		];
 
 		$acl = [$w3id]; // At minimum, sender can access
@@ -555,10 +574,15 @@ class ChatSyncService {
 			return;
 		}
 
-		// senderId may be a profile envelope ID OR a raw W3ID
-		$senderW3id = $this->resolveParticipantIdToW3id((string)($data['senderId'] ?? ''));
-		if ($senderW3id === null) {
+		// Prefer senderEName (other-platform canonical), fall back to senderId
+		// which we ourselves write as a profile envelope ID, or accept a raw W3ID.
+		$senderEName = is_string($data['senderEName'] ?? null) ? $data['senderEName'] : '';
+		$senderW3id = $senderEName !== ''
+			? $senderEName
+			: $this->resolveParticipantIdToW3id((string)($data['senderId'] ?? ''));
+		if ($senderW3id === null || $senderW3id === '') {
 			$this->logger->warning('[W3DS Sync] Cannot resolve sender ID to W3ID', [
+				'senderEName' => $senderEName,
 				'senderId' => $data['senderId'] ?? '',
 			]);
 			return;
@@ -743,7 +767,7 @@ class ChatSyncService {
 		// 1. Rooms — list, filter by membership, ingest.
 		$acceptedChatGlobalIds = [];
 		try {
-			$chatEnvelopes = $this->evaultClient->listMetaEnvelopesByOntology($w3id, self::CHAT_SCHEMA_ID);
+			$chatEnvelopes = $this->evaultClient->listMetaEnvelopesByOntology($w3id, self::CHAT_SCHEMA_ID, self::PULL_LIST_CACHE_TTL);
 			foreach ($chatEnvelopes as $env) {
 				try {
 					$globalId = (string)($env['id'] ?? '');
@@ -776,7 +800,7 @@ class ChatSyncService {
 
 		// 2. Messages — list, filter to messages whose chatId is in the accepted room set.
 		try {
-			$messageEnvelopes = $this->evaultClient->listMetaEnvelopesByOntology($w3id, self::MESSAGE_SCHEMA_ID);
+			$messageEnvelopes = $this->evaultClient->listMetaEnvelopesByOntology($w3id, self::MESSAGE_SCHEMA_ID, self::PULL_LIST_CACHE_TTL);
 			foreach ($messageEnvelopes as $env) {
 				try {
 					$globalId = (string)($env['id'] ?? '');

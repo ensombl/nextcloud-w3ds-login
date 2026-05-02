@@ -40,7 +40,6 @@ class BeforeTemplateRenderedListener implements IEventListener {
 		}
 
 		Util::addScript(Application::APP_ID, 'talk-poller');
-		Util::addScript(Application::APP_ID, 'add-w3ds-users');
 
 		$user = $this->userSession->getUser();
 		if ($user === null) {

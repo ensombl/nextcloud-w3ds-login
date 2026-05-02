@@ -43,18 +43,32 @@ class IdMappingMapper extends QBMapper {
 	}
 
 	public function getGlobalId(string $entityType, string $localId): ?string {
-		try {
-			return $this->findByLocalId($entityType, $localId)->getGlobalId();
-		} catch (DoesNotExistException) {
-			return null;
-		}
+		return $this->readInTx(fn () => $this->findByLocalId($entityType, $localId)->getGlobalId());
 	}
 
 	public function getLocalId(string $entityType, string $globalId): ?string {
+		return $this->readInTx(fn () => $this->findByGlobalId($entityType, $globalId)->getLocalId());
+	}
+
+	/**
+	 * NC33 throws "dirty table reads" if we SELECT from w3ds_id_mappings after
+	 * any earlier write to it in the same request (Talk room/message listeners
+	 * fire storeMapping during the same HTTP request that pollRoom runs in).
+	 * Wrapping the read in a transaction makes the prior writes visible and
+	 * silences the guard.
+	 */
+	private function readInTx(callable $read): ?string {
+		$this->db->beginTransaction();
 		try {
-			return $this->findByGlobalId($entityType, $globalId)->getLocalId();
+			$result = $read();
+			$this->db->commit();
+			return $result;
 		} catch (DoesNotExistException) {
+			$this->db->commit();
 			return null;
+		} catch (\Throwable $e) {
+			$this->db->rollBack();
+			throw $e;
 		}
 	}
 

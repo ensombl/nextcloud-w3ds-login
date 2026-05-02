@@ -15,7 +15,7 @@ Features:
 - Link/unlink W3DS identity from personal settings
 - Signature verification via the W3DS Registry
     ]]></description>
-    <version>0.5.1</version>
+    <version>0.6.0</version>
     <licence>AGPL-3.0-or-later</licence>
     <author>Patrick</author>
     <namespace>W3dsLogin</namespace>
@@ -29,4 +29,9 @@ Features:
         <personal>OCA\W3dsLogin\Settings\PersonalSettings</personal>
         <personal-section>security</personal-section>
     </settings>
+    <collaboration>
+        <plugins>
+            <plugin type="collaborator-search" share-type="SHARE_TYPE_USER">OCA\W3dsLogin\Collaboration\W3dsCollaboratorPlugin</plugin>
+        </plugins>
+    </collaboration>
 </info>
