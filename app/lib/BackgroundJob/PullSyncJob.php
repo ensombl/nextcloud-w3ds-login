@@ -23,8 +23,9 @@ class PullSyncJob extends TimedJob {
 	) {
 		parent::__construct($time);
 
-		// Run every 15 minutes
-		$this->setInterval(15 * 60);
+		// Run every minute (NC's TimedJob floor when system cron ticks @ 1m).
+		// Production must use system cron, not AJAX cron, for prompt sync.
+		$this->setInterval(60);
 		$this->setTimeSensitivity(self::TIME_INSENSITIVE);
 	}
 
