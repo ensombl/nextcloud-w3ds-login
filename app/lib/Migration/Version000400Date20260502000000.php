@@ -20,6 +20,7 @@ class Version000400Date20260502000000 extends SimpleMigrationStep {
 		$schema = $schemaClosure();
 
 		if ($schema->hasTable('w3ds_tentative_users')) {
+			/** @psalm-suppress UndefinedDocblockClass */
 			$schema->dropTable('w3ds_tentative_users');
 		}
 
