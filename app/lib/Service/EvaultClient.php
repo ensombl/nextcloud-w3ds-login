@@ -381,11 +381,6 @@ class EvaultClient {
 	/**
 	 * Resolve a W3ID to the MetaEnvelope ID of their User profile envelope.
 	 * This is the ID other platforms expect in participantIds / senderId fields.
-	 *
-	 * Uses the no-X-ENAME by-ontology REST call. Side effect: primes the
-	 * bidirectional (w3id <-> profileEnvelopeId) cache for *every* User
-	 * envelope visible from the resolved eVault, so subsequent reverse
-	 * lookups for other participants on the same eVault hit cache.
 	 */
 	public function getProfileEnvelopeId(string $w3id): ?string {
 		$cacheKey = self::PROFILE_ID_CACHE_PREFIX . $w3id;
@@ -395,32 +390,23 @@ class EvaultClient {
 		}
 
 		try {
-			$envelopes = $this->listMetaEnvelopesByOntology($w3id, self::USER_SCHEMA_ID);
-			if (empty($envelopes)) {
-				$this->logger->warning('No User profile envelopes returned from eVault', ['w3id' => $w3id]);
+			$result = $this->fetchMetaEnvelopes($w3id, self::USER_SCHEMA_ID, 1, null);
+			$edges = $result['edges'] ?? [];
+			if (empty($edges)) {
+				$this->logger->warning('No User profile envelope found in eVault', ['w3id' => $w3id]);
 				return null;
 			}
 
-			$found = null;
-			foreach ($envelopes as $env) {
-				$eName = is_string($env['eName'] ?? null) ? $env['eName'] : '';
-				$envId = is_string($env['id'] ?? null) ? $env['id'] : '';
-				if ($eName === '' || $envId === '') {
-					continue;
-				}
-
-				$this->cache->set(self::PROFILE_ID_CACHE_PREFIX . $eName, $envId, self::PROFILE_ID_CACHE_TTL);
-				$this->cache->set(self::PROFILE_ID_W3ID_CACHE_PREFIX . $envId, $eName, self::PROFILE_ID_CACHE_TTL);
-
-				if ($eName === $w3id) {
-					$found = $envId;
-				}
+			$profileId = $edges[0]['node']['id'] ?? null;
+			if ($profileId !== null) {
+				$this->cache->set($cacheKey, $profileId, self::PROFILE_ID_CACHE_TTL);
+				$this->cache->set(
+					self::PROFILE_ID_W3ID_CACHE_PREFIX . $profileId,
+					$w3id,
+					self::PROFILE_ID_CACHE_TTL,
+				);
 			}
-
-			if ($found === null) {
-				$this->logger->warning('No User envelope matching W3ID on the resolved eVault', ['w3id' => $w3id]);
-			}
-			return $found;
+			return $profileId;
 		} catch (\Throwable $e) {
 			$this->logger->error('Failed to fetch User profile envelope', [
 				'w3id' => $w3id,
