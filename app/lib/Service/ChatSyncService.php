@@ -37,6 +37,16 @@ class ChatSyncService {
 	private array $pendingChatPushes = [];
 	private bool $shutdownRegistered = false;
 
+	/**
+	 * Set of viewer W3IDs for whom we've already re-primed the profile cache
+	 * during the current request. Bounds the cost of cold-cache participant
+	 * resolution: at most one extra by-ontology list call per viewer per
+	 * request, regardless of how many envelopes reference unknown peers.
+	 *
+	 * @var array<string, true>
+	 */
+	private array $primedViewers = [];
+
 	public function __construct(
 		private EvaultClient $evaultClient,
 		private IdMappingMapper $idMappingMapper,
@@ -153,6 +163,16 @@ class ChatSyncService {
 		// Anti-ping-pong: skip if this entity was just created from an inbound webhook
 		if ($this->isSyncLocked('chat', $localId)) {
 			$this->logger->info('[W3DS Sync] pushChat skip: sync lock active', ['localId' => $localId]);
+			return;
+		}
+
+		// Long-lived inbound-mirror gate. The 10s sync lock above only covers
+		// the request that ingested the envelope; subsequent listener fires
+		// (e.g. when the first replicated message lands and Talk re-touches
+		// the room) would otherwise push the inbound chat back to its peer.
+		// The `origin` column on the mapping survives request boundaries.
+		if ($this->idMappingMapper->getOrigin('chat', $localId) === 'inbound') {
+			$this->logger->info('[W3DS Sync] pushChat skip: inbound mirror', ['localId' => $localId]);
 			return;
 		}
 
@@ -506,7 +526,7 @@ class ChatSyncService {
 		$participantIds = $data['participantIds'] ?? [];
 		$participantUids = [];
 		foreach ($participantIds as $pid) {
-			$w3id = $this->resolveParticipantIdToW3id($pid);
+			$w3id = $this->resolveParticipantIdToW3id((string)$pid, $ownerW3id);
 			if ($w3id === null) {
 				continue;
 			}
@@ -532,10 +552,13 @@ class ChatSyncService {
 				return;
 			}
 
-			// Set the sync lock to prevent outbound re-push
+			// Set the sync lock to prevent outbound re-push (covers listeners
+			// that fire synchronously inside createTalkRoom). The `inbound`
+			// origin on the mapping below is the durable, cross-request
+			// version of the same guard.
 			$this->setSyncLock('chat', $roomToken);
 
-			$this->idMappingMapper->storeMapping('chat', $roomToken, $globalId, $ownerW3id);
+			$this->idMappingMapper->storeMapping('chat', $roomToken, $globalId, $ownerW3id, 'inbound');
 			$this->logger->info('Created local chat from inbound webhook', [
 				'globalId' => $globalId,
 				'roomToken' => $roomToken,
@@ -579,7 +602,7 @@ class ChatSyncService {
 		$senderEName = is_string($data['senderEName'] ?? null) ? $data['senderEName'] : '';
 		$senderW3id = $senderEName !== ''
 			? $senderEName
-			: $this->resolveParticipantIdToW3id((string)($data['senderId'] ?? ''));
+			: $this->resolveParticipantIdToW3id((string)($data['senderId'] ?? ''), $ownerW3id);
 		if ($senderW3id === null || $senderW3id === '') {
 			$this->logger->warning('[W3DS Sync] Cannot resolve sender ID to W3ID', [
 				'senderEName' => $senderEName,
@@ -1000,14 +1023,29 @@ class ChatSyncService {
 	 * envelope UUID) back to a W3ID. Raw W3IDs start with '@'.
 	 * Envelope IDs require a cached reverse lookup — we accept only ones
 	 * we've seen before via {@see EvaultClient::getProfileEnvelopeId()}.
+	 *
+	 * On a cache miss for an envelope-shaped id, refresh the User-ontology
+	 * listing on the *viewer's* eVault (the one we're reading the chat from)
+	 * once per request — that primes the bidirectional cache for every peer
+	 * visible to that viewer, which is enough to recover newly-replicated
+	 * profiles that hadn't been listed at the time of the first call.
 	 */
-	private function resolveParticipantIdToW3id(string $id): ?string {
+	private function resolveParticipantIdToW3id(string $id, string $viewerW3id = ''): ?string {
 		if ($id === '') {
 			return null;
 		}
 		if (str_starts_with($id, '@')) {
 			return $id;
 		}
+		$resolved = $this->evaultClient->resolveW3idFromProfileEnvelopeId($id);
+		if ($resolved !== null) {
+			return $resolved;
+		}
+		if ($viewerW3id === '' || isset($this->primedViewers[$viewerW3id])) {
+			return null;
+		}
+		$this->primedViewers[$viewerW3id] = true;
+		$this->evaultClient->primeProfileCache($viewerW3id);
 		return $this->evaultClient->resolveW3idFromProfileEnvelopeId($id);
 	}
 

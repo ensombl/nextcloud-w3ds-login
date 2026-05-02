@@ -19,6 +19,8 @@ use OCP\AppFramework\Db\Entity;
  * @method void setCreatedAt(int $createdAt)
  * @method int getUpdatedAt()
  * @method void setUpdatedAt(int $updatedAt)
+ * @method string getOrigin()
+ * @method void setOrigin(string $origin)
  */
 class IdMapping extends Entity {
 	protected string $entityType = '';
@@ -27,6 +29,7 @@ class IdMapping extends Entity {
 	protected string $ownerW3id = '';
 	protected int $createdAt = 0;
 	protected int $updatedAt = 0;
+	protected string $origin = 'local';
 
 	public function __construct() {
 		$this->addType('entityType', 'string');
@@ -35,5 +38,6 @@ class IdMapping extends Entity {
 		$this->addType('ownerW3id', 'string');
 		$this->addType('createdAt', 'integer');
 		$this->addType('updatedAt', 'integer');
+		$this->addType('origin', 'string');
 	}
 }

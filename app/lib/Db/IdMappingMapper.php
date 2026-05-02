@@ -72,7 +72,7 @@ class IdMappingMapper extends QBMapper {
 		}
 	}
 
-	public function storeMapping(string $entityType, string $localId, string $globalId, string $ownerW3id): IdMapping {
+	public function storeMapping(string $entityType, string $localId, string $globalId, string $ownerW3id, string $origin = 'local'): IdMapping {
 		$now = time();
 		$mapping = new IdMapping();
 		$mapping->setEntityType($entityType);
@@ -81,8 +81,18 @@ class IdMappingMapper extends QBMapper {
 		$mapping->setOwnerW3id($ownerW3id);
 		$mapping->setCreatedAt($now);
 		$mapping->setUpdatedAt($now);
+		$mapping->setOrigin($origin);
 
 		return $this->insert($mapping);
+	}
+
+	/**
+	 * Read the `origin` column for a mapping. Returns null if no row matches.
+	 * Used by ChatSyncService::pushChat to short-circuit loopback when a
+	 * locally-created room turns out to be a mirror of an inbound MetaEnvelope.
+	 */
+	public function getOrigin(string $entityType, string $localId): ?string {
+		return $this->readInTx(fn () => $this->findByLocalId($entityType, $localId)->getOrigin());
 	}
 
 	/**
