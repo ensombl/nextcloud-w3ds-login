@@ -6,7 +6,6 @@ namespace OCA\W3dsLogin\Service;
 
 use OCA\W3dsLogin\AppInfo\Application;
 use OCA\W3dsLogin\Db\IdMappingMapper;
-use OCA\W3dsLogin\Db\SyncCursorMapper;
 use OCA\W3dsLogin\Db\W3dsMappingMapper;
 use OCP\AppFramework\Db\DoesNotExistException;
 use OCP\ICache;
@@ -26,9 +25,6 @@ class ChatSyncService {
 	private const CHAT_PARTICIPANT_HWM_PREFIX = 'w3ds_chat_pmax_';
 	private const CHAT_PARTICIPANT_HWM_TTL = 604800; // 7d high-water mark guard against pushChat shrinkage
 
-	private const PULL_PAGE_SIZE = 50;
-	private const PULL_MAX_PAGES = 5;
-
 	private ICache $cache;
 
 	/**
@@ -43,7 +39,6 @@ class ChatSyncService {
 	public function __construct(
 		private EvaultClient $evaultClient,
 		private IdMappingMapper $idMappingMapper,
-		private SyncCursorMapper $syncCursorMapper,
 		private UserProvisioningService $userProvisioning,
 		private W3dsMappingMapper $w3dsMappingMapper,
 		ICacheFactory $cacheFactory,
@@ -730,54 +725,105 @@ class ChatSyncService {
 	}
 
 	/**
-	 * Pull sync all chats and messages for a given user from their eVault.
+	 * Pull sync all chats and messages for a given user from their own eVault.
+	 *
+	 * Uses the REST `/metaenvelopes/by-ontology/:ontology` endpoint to list
+	 * everything of a given ontology and filters client-side by membership:
+	 *   - rooms where the user's profile envelope ID appears in
+	 *     `participantIds`, `admins`, or `owner`
+	 *   - messages whose `chatId` resolves to one of those accepted rooms
 	 */
 	public function pullSyncForUser(string $w3id): void {
-		$this->pullEnvelopes($w3id, self::CHAT_SCHEMA_ID, 'chat');
-		$this->pullEnvelopes($w3id, self::MESSAGE_SCHEMA_ID, 'message');
-	}
-
-	private function pullEnvelopes(string $w3id, string $schemaId, string $entityType): void {
-		$cursor = $this->syncCursorMapper->getCursor($w3id, $schemaId);
-
-		for ($page = 0; $page < self::PULL_MAX_PAGES; $page++) {
-			$result = $this->evaultClient->fetchMetaEnvelopes($w3id, $schemaId, self::PULL_PAGE_SIZE, $cursor);
-
-			$edges = $result['edges'] ?? [];
-			if (empty($edges)) {
-				break;
-			}
-
-			foreach ($edges as $edge) {
-				$node = $edge['node'] ?? [];
-				$globalId = $node['id'] ?? '';
-				$data = $node['parsed'] ?? [];
-
-				if (empty($globalId) || empty($data)) {
-					continue;
-				}
-
-				// Skip if we already have this entity
-				if ($this->idMappingMapper->getLocalId($entityType, $globalId) !== null) {
-					continue;
-				}
-
-				if ($entityType === 'chat') {
-					$this->handleInboundChat($globalId, $w3id, $data);
-				} else {
-					$this->handleInboundMessage($globalId, $w3id, $data);
-				}
-			}
-
-			$pageInfo = $result['pageInfo'] ?? [];
-			$cursor = $pageInfo['endCursor'] ?? null;
-
-			if (!($pageInfo['hasNextPage'] ?? false)) {
-				break;
-			}
+		$myProfileId = $this->evaultClient->getProfileEnvelopeId($w3id);
+		if ($myProfileId === null) {
+			$this->logger->info('[W3DS Sync] pullSyncForUser skip: no profile envelope yet', ['w3id' => $w3id]);
+			return;
 		}
 
-		$this->syncCursorMapper->upsertCursor($w3id, $schemaId, $cursor);
+		// 1. Rooms — list, filter by membership, ingest.
+		$acceptedChatGlobalIds = [];
+		try {
+			$chatEnvelopes = $this->evaultClient->listMetaEnvelopesByOntology($w3id, self::CHAT_SCHEMA_ID);
+			foreach ($chatEnvelopes as $env) {
+				try {
+					$globalId = (string)($env['id'] ?? '');
+					$parsed = $env['parsed'] ?? [];
+					if ($globalId === '' || !is_array($parsed) || empty($parsed)) {
+						continue;
+					}
+					if (!$this->userIsInRoom($parsed, $myProfileId)) {
+						continue;
+					}
+					$acceptedChatGlobalIds[$globalId] = true;
+					if ($this->idMappingMapper->getLocalId('chat', $globalId) !== null) {
+						continue;
+					}
+					$this->handleInboundChat($globalId, $w3id, $parsed);
+				} catch (\Throwable $e) {
+					$this->logger->warning('[W3DS Sync] pullSyncForUser: chat envelope failed', [
+						'w3id' => $w3id,
+						'globalId' => $env['id'] ?? null,
+						'exception' => $e->getMessage(),
+					]);
+				}
+			}
+		} catch (\Throwable $e) {
+			$this->logger->warning('[W3DS Sync] pullSyncForUser: chat list failed', [
+				'w3id' => $w3id,
+				'exception' => $e->getMessage(),
+			]);
+		}
+
+		// 2. Messages — list, filter to messages whose chatId is in the accepted room set.
+		try {
+			$messageEnvelopes = $this->evaultClient->listMetaEnvelopesByOntology($w3id, self::MESSAGE_SCHEMA_ID);
+			foreach ($messageEnvelopes as $env) {
+				try {
+					$globalId = (string)($env['id'] ?? '');
+					$parsed = $env['parsed'] ?? [];
+					if ($globalId === '' || !is_array($parsed) || empty($parsed)) {
+						continue;
+					}
+					$chatId = (string)($parsed['chatId'] ?? '');
+					if ($chatId === '' || !isset($acceptedChatGlobalIds[$chatId])) {
+						continue;
+					}
+					if ($this->idMappingMapper->getLocalId('message', $globalId) !== null) {
+						continue;
+					}
+					$this->handleInboundMessage($globalId, $w3id, $parsed);
+				} catch (\Throwable $e) {
+					$this->logger->warning('[W3DS Sync] pullSyncForUser: message envelope failed', [
+						'w3id' => $w3id,
+						'globalId' => $env['id'] ?? null,
+						'exception' => $e->getMessage(),
+					]);
+				}
+			}
+		} catch (\Throwable $e) {
+			$this->logger->warning('[W3DS Sync] pullSyncForUser: message list failed', [
+				'w3id' => $w3id,
+				'exception' => $e->getMessage(),
+			]);
+		}
+	}
+
+	/**
+	 * True when the user's profile envelope ID appears in any of the
+	 * canonical user-array fields on a chat envelope (`owner`,
+	 * `participantIds`, `admins`).
+	 */
+	private function userIsInRoom(array $parsed, string $myProfileId): bool {
+		if (($parsed['owner'] ?? null) === $myProfileId) {
+			return true;
+		}
+		foreach (['participantIds', 'admins'] as $key) {
+			$arr = $parsed[$key] ?? null;
+			if (is_array($arr) && in_array($myProfileId, $arr, true)) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	// ---------------------------------------------------------------

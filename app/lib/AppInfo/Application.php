@@ -55,7 +55,6 @@ class Application extends App implements IBootstrap {
 	}
 
 	public function boot(IBootContext $context): void {
-		// Register the pull sync timed job (registerTimedJob not available on this NC version)
 		$server = $context->getServerContainer();
 		/** @var IJobList $jobList */
 		$jobList = $server->get(IJobList::class);

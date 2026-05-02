@@ -302,6 +302,53 @@ class EvaultClient {
 	}
 
 	/**
+	 * List every MetaEnvelope of the given ontology hosted on the user's
+	 * eVault via the REST endpoint `GET /metaenvelopes/by-ontology/:ontology`.
+	 * Unlike fetchMetaEnvelopes (GraphQL with pagination + filters), this
+	 * returns the full set in one shot. Caller is responsible for filtering.
+	 *
+	 * Each row is shaped roughly like:
+	 *   { id, ontology, acl, eName, envelopes, parsed }
+	 *
+	 * @return list<array<string, mixed>>
+	 */
+	public function listMetaEnvelopesByOntology(string $w3id, string $ontology): array {
+		$evaultUrl = $this->resolveEvaultUrl($w3id);
+		if ($evaultUrl === null) {
+			$this->logger->warning('listMetaEnvelopesByOntology: cannot resolve eVault', ['w3id' => $w3id]);
+			return [];
+		}
+
+		$url = rtrim($evaultUrl, '/') . '/metaenvelopes/by-ontology/' . rawurlencode($ontology);
+
+		$headers = [
+			'Accept' => 'application/json',
+		];
+		$platformToken = $this->getPlatformToken();
+		if ($platformToken !== null) {
+			$headers['Authorization'] = 'Bearer ' . $platformToken;
+		}
+
+		try {
+			$client = $this->clientService->newClient();
+			$response = $client->get($url, [
+				'timeout' => self::HTTP_TIMEOUT,
+				'headers' => $headers,
+			]);
+			$body = json_decode($response->getBody(), true);
+			$envelopes = $body['metaEnvelopes'] ?? [];
+			return is_array($envelopes) ? $envelopes : [];
+		} catch (\Throwable $e) {
+			$this->logger->warning('listMetaEnvelopesByOntology failed', [
+				'w3id' => $w3id,
+				'ontology' => $ontology,
+				'exception' => $e->getMessage(),
+			]);
+			return [];
+		}
+	}
+
+	/**
 	 * Fetch a single MetaEnvelope by ID. Used for read-back verification.
 	 *
 	 * @return array<string, mixed>|null Decoded envelope (id, ontology, parsed) or null
