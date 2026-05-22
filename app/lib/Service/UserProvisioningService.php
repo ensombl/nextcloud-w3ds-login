@@ -44,7 +44,20 @@ class UserProvisioningService {
 	 * @param array<string, mixed>|null $prefetchedProfile
 	 */
 	public function findOrCreateUser(string $w3id, bool $tentative = false, ?array $prefetchedProfile = null): ?IUser {
-		// Check for existing mapping
+		// Fast path: already mapped.
+		$existing = $this->findMappedUser($w3id);
+		if ($existing !== null) {
+			return $existing;
+		}
+
+		return $this->createMappedUser($w3id, $tentative, $prefetchedProfile);
+	}
+
+	/**
+	 * Return the NC user already mapped to this W3ID, or null. If a mapping
+	 * exists but its NC account was deleted, the stale mapping is removed.
+	 */
+	private function findMappedUser(string $w3id): ?IUser {
 		try {
 			$mapping = $this->mapper->findByW3id($w3id);
 			$user = $this->userManager->get($mapping->getNcUid());
@@ -57,14 +70,38 @@ class UserProvisioningService {
 		} catch (DoesNotExistException) {
 			// No mapping yet
 		}
+		return null;
+	}
 
-		// Derive a username from the W3ID (strip the leading @, replace dots)
+	/**
+	 * @param array<string, mixed>|null $prefetchedProfile
+	 */
+	private function createMappedUser(string $w3id, bool $tentative, ?array $prefetchedProfile): ?IUser {
+		// deriveUsername() is deterministic per w3id, so concurrent picker
+		// requests for the same identity all derive the SAME username.
 		$username = $this->deriveUsername($w3id);
 
 		// Generate a random password (user will never need it; they auth via W3DS)
 		$password = $this->secureRandom->generate(32, ISecureRandom::CHAR_ALPHANUMERIC);
 
-		$user = $this->userManager->createUser($username, $password);
+		try {
+			$user = $this->userManager->createUser($username, $password);
+		} catch (\Throwable $createErr) {
+			// The username is taken. Because deriveUsername() is deterministic
+			// this almost always means a concurrent request is provisioning the
+			// SAME w3id right now (Talk fires the picker once per keystroke).
+			// Resolve to that winner instead of leaking a second account.
+			$winner = $this->resolveProvisioningRaceWinner($w3id);
+			if ($winner !== null) {
+				return $winner;
+			}
+			$this->logger->error('Failed to create Nextcloud user (username taken, no mapping resolved)', [
+				'w3id' => $w3id,
+				'username' => $username,
+				'exception' => $createErr->getMessage(),
+			]);
+			return null;
+		}
 		if ($user === null) {
 			$this->logger->error('Failed to create Nextcloud user', [
 				'w3id' => $w3id,
@@ -141,6 +178,22 @@ class UserProvisioningService {
 		]);
 
 		return $user;
+	}
+
+	/**
+	 * Resolve the winner of a concurrent first-time provisioning race. The
+	 * winner's createUser() has succeeded but its mapping insert may still
+	 * be in flight, so we retry findMappedUser a few times before giving up.
+	 */
+	private function resolveProvisioningRaceWinner(string $w3id): ?IUser {
+		for ($i = 0; $i < 6; $i++) {
+			$winner = $this->findMappedUser($w3id);
+			if ($winner !== null) {
+				return $winner;
+			}
+			usleep(50000); // 50ms; ~300ms total before giving up
+		}
+		return null;
 	}
 
 	/**
@@ -253,25 +306,27 @@ class UserProvisioningService {
 
 	/**
 	 * Derive a Nextcloud username from a W3ID.
-	 * Example: "@alice.w3id" becomes "alice_w3id"
+	 * Example: "@alice.w3id" becomes "alice_w3id_1a2b3c4d".
+	 *
+	 * The result is DETERMINISTIC: the same w3id always yields the same
+	 * username. This is what keeps concurrent provisioning safe -- racing
+	 * createUser() calls for the same identity collide on the username, so
+	 * at most one account can ever be created per w3id and no orphan clones
+	 * leak. The trailing hash also makes a collision with an unrelated,
+	 * human-chosen username effectively impossible, which is why there is
+	 * no uniqueness loop here.
 	 */
 	private function deriveUsername(string $w3id): string {
 		$name = ltrim($w3id, '@');
 		$name = preg_replace('/[^a-zA-Z0-9_\-]/', '_', $name);
-		$name = trim($name, '_');
+		$name = trim($name ?? '', '_');
 
-		if (empty($name)) {
+		if ($name === '') {
 			$name = 'w3ds_user';
 		}
 
-		// Ensure uniqueness
-		$candidate = $name;
-		$suffix = 1;
-		while ($this->userManager->userExists($candidate)) {
-			$candidate = $name . '_' . $suffix;
-			$suffix++;
-		}
-
-		return $candidate;
+		// nc_uid column is 64 chars; keep room for "_" + 8 hex.
+		$suffix = substr(hash('sha256', $w3id), 0, 8);
+		return substr($name, 0, 55) . '_' . $suffix;
 	}
 }
