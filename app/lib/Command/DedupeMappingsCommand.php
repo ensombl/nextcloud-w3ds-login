@@ -26,8 +26,8 @@ use Symfony\Component\Console\Output\OutputInterface;
  * real history — that's the whole point of the scoring).
  *
  * It also sweeps *orphan* accounts: NC users that were provisioned by this
- * app (they carry the must_set_password preference) but have no mapping row
- * at all. Those are the residue of a provisioning race — the mapping insert
+ * app (they carry the `provisioned` preference) but have no mapping row at
+ * all. Those are the residue of a provisioning race - the mapping insert
  * lost the unique-index contest and the orphan NC account was never cleaned
  * up. The per-w3id dedupe above can't see them because they aren't in
  * w3ds_login_mappings; the orphan sweep handles them by preference instead.
@@ -142,7 +142,7 @@ class DedupeMappingsCommand extends Command {
 
 	/**
 	 * Delete orphan accounts: app-provisioned NC users (carrying the
-	 * must_set_password preference) with no row in w3ds_login_mappings.
+	 * `provisioned` preference) with no row in w3ds_login_mappings.
 	 *
 	 * @return array{0: int, 1: int} [found, deleted]
 	 */
@@ -154,7 +154,7 @@ class DedupeMappingsCommand extends Command {
 			->from('preferences', 'p')
 			->leftJoin('p', 'w3ds_login_mappings', 'm', $qb->expr()->eq('p.userid', 'm.nc_uid'))
 			->where($qb->expr()->eq('p.appid', $qb->createNamedParameter('w3ds_login')))
-			->andWhere($qb->expr()->eq('p.configkey', $qb->createNamedParameter('must_set_password')))
+			->andWhere($qb->expr()->eq('p.configkey', $qb->createNamedParameter('provisioned')))
 			->andWhere($qb->expr()->isNull('m.nc_uid'));
 		$result = $qb->executeQuery();
 

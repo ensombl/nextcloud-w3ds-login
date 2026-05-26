@@ -150,13 +150,15 @@ class UserProvisioningService {
 		// with whatever the user's eVault profile has.
 		$this->hydrateProfileFromEvault($user, $w3id, $prefetchedProfile);
 
-		// The random password above is a throwaway -- force the user to set
-		// a real one on first login so WebDAV / desktop clients / mobile
-		// apps can still authenticate.
+		// Tag the account so the dedupe command can identify W3DS-provisioned
+		// race-loser orphans (NC user exists, mapping insert lost the unique
+		// index contest). The random password from above stays in place; the
+		// session token scope set in AuthController::completeLogin suppresses
+		// the sudo-mode prompts that would otherwise demand it.
 		$this->config->setUserValue(
 			$user->getUID(),
 			Application::APP_ID,
-			'must_set_password',
+			'provisioned',
 			'1',
 		);
 

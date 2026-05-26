@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace OCA\W3dsLogin\Controller;
 
+use OC\Authentication\Token\IProvider;
 use OCA\W3dsLogin\AppInfo\Application;
 use OCA\W3dsLogin\BackgroundJob\InitialSyncJob;
 use OCA\W3dsLogin\Service\QrCodeService;
@@ -14,11 +15,16 @@ use OCP\AppFramework\Http;
 use OCP\AppFramework\Http\JSONResponse;
 use OCP\AppFramework\Http\RedirectResponse;
 use OCP\AppFramework\Http\TemplateResponse;
+use OCP\Authentication\Exceptions\InvalidTokenException;
+use OCP\Authentication\Exceptions\WipeTokenException;
+use OCP\Authentication\Token\IToken;
 use OCP\BackgroundJob\IJobList;
 use OCP\IRequest;
+use OCP\ISession;
 use OCP\IURLGenerator;
 use OCP\IUserManager;
 use OCP\IUserSession;
+use OCP\Session\Exceptions\SessionNotAvailableException;
 use Psr\Log\LoggerInterface;
 
 class AuthController extends Controller {
@@ -30,6 +36,8 @@ class AuthController extends Controller {
 		private IURLGenerator $urlGenerator,
 		private IUserManager $userManager,
 		private IUserSession $userSession,
+		private ISession $session,
+		private IProvider $tokenProvider,
 		private IJobList $jobList,
 		private LoggerInterface $logger,
 	) {
@@ -300,6 +308,27 @@ class AuthController extends Controller {
 			$this->userSession->setLoginName($userId);
 		}
 		$this->userSession->createSessionToken($this->request, $userId, $userId);
+
+		// Mark this session as one that cannot confirm a password. The W3DS
+		// account has a random unguessable secret the user does not know, so
+		// Nextcloud's sudo-mode prompts (Personal → Security, etc.) would be
+		// unanswerable. This scope tells PasswordConfirmationMiddleware to
+		// skip the check and JSConfigHelper to suppress the client-side
+		// modal -- the same mechanism core uses for SSO logins via
+		// loginWithApache(). SCOPE_FILESYSTEM is paired with it so the
+		// session retains filesystem access without a password to derive
+		// encryption keys from.
+		try {
+			$sessionToken = $this->tokenProvider->getToken($this->session->getId());
+			$sessionToken->setScope([
+				IToken::SCOPE_SKIP_PASSWORD_VALIDATION => true,
+				IToken::SCOPE_FILESYSTEM => true,
+			]);
+			$this->tokenProvider->updateToken($sessionToken);
+		} catch (InvalidTokenException|WipeTokenException|SessionNotAvailableException) {
+			// best-effort: if the session token is missing, the user simply
+			// gets the default behaviour (modal will appear). Not fatal.
+		}
 
 		// Queue initial sync of user's Talk chats to/from their eVault
 		$this->jobList->add(InitialSyncJob::class, ['ncUid' => $userId]);

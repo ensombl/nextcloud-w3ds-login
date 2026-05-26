@@ -25,9 +25,5 @@ return [
 		// Pull-sync the current user's eVault for newly-replicated chats
 		// (authenticated; client-driven from the Talk room-list view).
 		['name' => 'poll#pollUserChats', 'url' => '/api/chats/poll', 'verb' => 'POST'],
-
-		// First-login password setup for W3DS-provisioned users
-		['name' => 'password_setup#show', 'url' => '/password-setup', 'verb' => 'GET'],
-		['name' => 'password_setup#submit', 'url' => '/password-setup', 'verb' => 'POST'],
 	],
 ];
