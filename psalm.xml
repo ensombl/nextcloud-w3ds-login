@@ -27,6 +27,7 @@
             <errorLevel type="suppress">
                 <referencedClass name="OC"/>
                 <referencedClass name="OC_App"/>
+                <referencedClass name="OC\Authentication\Token\IProvider"/>
                 <referencedClass name="OCA\Talk\*"/>
             </errorLevel>
         </UndefinedClass>
