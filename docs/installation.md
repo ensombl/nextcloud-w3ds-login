@@ -41,7 +41,7 @@ The repo layout has the actual Nextcloud app under `app/`, so the app directory 
 
 ### 2. Install PHP dependencies
 
-The plugin vendors its dependencies via Composer. The repo ships a `vendor/` directory but if you cloned without it, install:
+The plugin depends on Composer packages that are **not** committed to the repo, so a fresh clone has no `vendor/` directory. You have to create it:
 
 ```bash
 composer install --no-dev --optimize-autoloader
@@ -212,7 +212,15 @@ The defaults in `.env.example` work fine. If you already have something on port 
 make dev
 ```
 
-This builds the custom Nextcloud image (the only addition is `gmp` and `xdebug`) and starts both containers. First-run Nextcloud setup runs automatically, so when the container reports it's ready, the admin user is `admin` / `admin`.
+This runs three things in order:
+
+1. A one-shot `composer` container that populates `./vendor` (the repo doesn't commit it, and the app container mounts it in — without this step the app can't autoload its dependencies).
+2. MariaDB.
+3. The custom Nextcloud image (the only additions are `gmp` and `xdebug`).
+
+First-run Nextcloud setup runs automatically, so when the container reports it's ready, the admin user is `admin` / `admin`. You do not need a local PHP or Composer install — the bootstrap container has both.
+
+Images are referenced fully qualified (`docker.io/library/...`) because some container runtimes — podman with `short-name-mode=enforcing`, for instance — refuse to resolve short aliases like `nextcloud:stable`. If your setup prefers short names, either leave these as-is (they work everywhere) or [configure a default unqualified-search registry](https://unix.stackexchange.com/a/701785).
 
 Open `http://localhost:8580` and sign in.
 
