@@ -206,6 +206,8 @@ cp .env.example .env
 
 The defaults in `.env.example` work fine. If you already have something on port 8580, change `NEXTCLOUD_PORT`.
 
+`NEXTCLOUD_IMAGE_TAG` is pinned to `33` rather than `stable`. The `stable` tag now points at Nextcloud 34, and the app declares `max-version="33"` in `app/appinfo/info.xml`, so `occ app:enable w3ds_login` refuses to install on it. Raise both together when the app is tested against a newer release (tracked in #24).
+
 ### 2. Start the stack
 
 ```bash
