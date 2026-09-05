@@ -57,6 +57,7 @@ class ChatSyncService {
 		private W3dsMappingMapper $w3dsMappingMapper,
 		ICacheFactory $cacheFactory,
 		private LoggerInterface $logger,
+		private MentionTranslator $mentionTranslator,
 	) {
 		$this->cache = $cacheFactory->createDistributed(Application::APP_ID);
 	}
@@ -493,7 +494,7 @@ class ChatSyncService {
 			// eName, for consumers that prefer the stable identifier.
 			'senderId' => $senderId,
 			'senderEName' => $w3id,
-			'content' => (string)($messageData['message'] ?? ''),
+			'content' => $this->mentionTranslator->toWire((string)($messageData['message'] ?? '')),
 			'type' => $this->mapMessageVerbToGlobal($messageData['verb'] ?? 'comment'),
 			'createdAt' => $this->toIso8601($messageData['timestamp'] ?? time()),
 			'updatedAt' => $now,
@@ -677,7 +678,16 @@ class ChatSyncService {
 			return;
 		}
 
-		$content = $data['content'] ?? '';
+		// Translate eName mentions back into Talk's `@"uid"` tokens. Talk
+		// derives both the rendered highlight and the mention *notification*
+		// from these tokens, so an untranslated eName means the mentioned
+		// user is never notified.
+		//
+		// Dedup below uses the raw wire content, not this rewritten form:
+		// each participant's replica must produce the same signature, and the
+		// local translation result depends on who is known to this instance.
+		$rawContent = (string)($data['content'] ?? '');
+		$content = $this->mentionTranslator->toTalk($rawContent);
 		$messageType = $data['type'] ?? 'text';
 
 		// Cross-replica dedup: the same logical message lives in every
@@ -694,7 +704,7 @@ class ChatSyncService {
 		// "+1", a re-sent link. Replicas of one logical message can carry
 		// different createdAt values (each platform stamps on replication), so
 		// this trades a rarer duplicate for no longer losing real messages.
-		$signature = $this->messageIdentitySignature($senderUid, $chatGlobalId, $data, $content);
+		$signature = $this->messageIdentitySignature($senderUid, $chatGlobalId, $data, $rawContent);
 		$sigKey = self::MESSAGE_SIG_CACHE_PREFIX . $signature;
 		$existingLocal = $this->cache->get($sigKey);
 		if (is_string($existingLocal) && $existingLocal !== '') {
