@@ -77,6 +77,9 @@ class MessageSentListener implements IEventListener {
 				'message' => $message,
 				'verb' => $verb,
 				'timestamp' => $comment->getCreationDateTime()->getTimestamp(),
+				// A file share carries its payload here, not in the message
+				// text, which is only the literal `{file}` placeholder.
+				'messageParameters' => $this->decodeMessageParameters($comment),
 			], $roomToken);
 		} catch (\Throwable $e) {
 			$this->logger->error('[W3DS Sync] MessageSentListener error', [
@@ -84,5 +87,32 @@ class MessageSentListener implements IEventListener {
 				'eventClass' => $eventClass,
 			]);
 		}
+	}
+
+	/**
+	 * Talk stores a file share's payload in the comment's message
+	 * parameters, JSON-encoded, while the message text is only `{file}`.
+	 *
+	 * @return array<string, mixed>
+	 */
+	private function decodeMessageParameters(object $comment): array {
+		if (!method_exists($comment, 'getMessage')) {
+			return [];
+		}
+
+		// Newer Talk exposes parsed parameters directly; older versions keep
+		// them JSON-encoded on the comment.
+		if (method_exists($comment, 'getMessageParameters')) {
+			$params = $comment->getMessageParameters();
+			if (is_array($params)) {
+				return $params;
+			}
+			if (is_string($params) && $params !== '') {
+				$decoded = json_decode($params, true);
+				return is_array($decoded) ? $decoded : [];
+			}
+		}
+
+		return [];
 	}
 }

@@ -58,6 +58,7 @@ class ChatSyncService {
 		ICacheFactory $cacheFactory,
 		private LoggerInterface $logger,
 		private MentionTranslator $mentionTranslator,
+		private AttachmentSyncService $attachmentSync,
 	) {
 		$this->cache = $cacheFactory->createDistributed(Application::APP_ID);
 	}
@@ -519,6 +520,32 @@ class ChatSyncService {
 			$acl = $participantW3ids;
 		}
 
+		// A file share carries no user text -- the comment message is a JSON
+		// share reference and the bytes live in Nextcloud. Upload the blob
+		// and reference it by `w3ds://file` URI, which is what the Message
+		// schema's `mediaUrl` expects.
+		if (($messageData['verb'] ?? '') === AttachmentSyncService::TALK_SHARE_VERB) {
+			$attachment = $this->attachmentSync->pushAttachment(
+				$ncUid,
+				$w3id,
+				(string)($messageData['message'] ?? ''),
+				$acl,
+			);
+
+			if ($attachment !== null) {
+				$payload['mediaUrl'] = $attachment['mediaUrl'];
+				$payload['type'] = $attachment['type'];
+				// The raw JSON share reference is meaningless off-platform;
+				// the filename at least renders as something sensible.
+				$payload['content'] = $attachment['filename'];
+			} else {
+				// Upload failed. Send the message as text rather than
+				// dropping it, so the conversation stays intact.
+				$payload['type'] = 'text';
+				$payload['content'] = '[attachment could not be synced]';
+			}
+		}
+
 		$existingGlobalId = $this->idMappingMapper->getGlobalId('message', $localId);
 
 		if ($existingGlobalId !== null) {
@@ -719,6 +746,31 @@ class ChatSyncService {
 		// before we know the resulting local ID.
 		$this->beginInboundPost($senderUid, $roomToken);
 		try {
+			// An attachment message materialises as a real Talk file share
+			// rather than text: download the blob, drop it in the recipient's
+			// Files, and share it into the room. Talk generates its own
+			// comment for the share, so there's nothing further to post.
+			$mediaUrl = $data['mediaUrl'] ?? null;
+			if (in_array($messageType, ['file', 'image'], true) && is_string($mediaUrl) && $mediaUrl !== '') {
+				$share = $this->attachmentSync->pullAttachment($mediaUrl, $senderUid, $roomToken);
+				if ($share !== null) {
+					// Map the envelope to the share so the same attachment is
+					// not re-materialised on the next poll.
+					$this->idMappingMapper->storeMapping(
+						'message',
+						'share:' . $share->getId(),
+						$globalId,
+						$ownerW3id,
+					);
+					$this->cache->set($sigKey, 'share:' . $share->getId(), self::MESSAGE_SIG_CACHE_TTL);
+					return;
+				}
+
+				// Fall through to a text message so the conversation still
+				// shows that something was sent.
+				$content = $content !== '' ? $content : '[attachment]';
+			}
+
 			$localMessageId = $this->postTalkMessage(
 				$roomToken,
 				$senderUid,
@@ -1377,6 +1429,10 @@ class ChatSyncService {
 	private function mapMessageVerbToGlobal(string $verb): string {
 		return match ($verb) {
 			'system' => 'system',
+			// Talk's file-share verb. `object` was never emitted for shares,
+			// so the previous mapping could not fire; the concrete type
+			// (image vs file) is refined by the attachment payload.
+			'object_shared' => 'file',
 			'object' => 'file',
 			default => 'text',
 		};

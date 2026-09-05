@@ -39,6 +39,10 @@
         </UndefinedDocblockClass>
         <!-- Psalm 6 introduced these strict defaults; ignored project-wide
              so this app's error budget stays focused on real bugs. -->
+        <!-- OCP\Files\IRootFolder extends the internal OC\Hooks\Emitter,
+             which is not part of the published OCP stubs, so Psalm cannot
+             resolve the parent. The interface itself is public API. -->
+        <MissingDependency errorLevel="suppress"/>
         <MissingOverrideAttribute errorLevel="suppress"/>
         <ClassMustBeFinal errorLevel="suppress"/>
         <MissingParamType errorLevel="suppress"/>
