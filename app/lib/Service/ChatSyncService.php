@@ -25,6 +25,8 @@ class ChatSyncService {
 	private const CHAT_PARTICIPANT_HWM_PREFIX = 'w3ds_chat_pmax_';
 	private const CHAT_PARTICIPANT_HWM_TTL = 604800; // 7d high-water mark guard against pushChat shrinkage
 	private const PULL_LIST_CACHE_TTL = 120; // 2 min for chat/message ontology lists during pull sync
+	private const POLL_PAGE_SIZE = 50; // per-page size when walking a chat's messages
+	private const POLL_MAX_PAGES = 20; // per-participant page budget for one poll (~1000 messages)
 
 	private ICache $cache;
 
@@ -475,10 +477,15 @@ class ChatSyncService {
 		$senderId = $this->evaultClient->getProfileEnvelopeId($w3id) ?? $w3id;
 
 		// Match the field set used by other platforms (>99% of message
-		// envelopes carry these). Inner `id` is omitted; the eVault assigns
-		// the outer envelope id which is the stable identity.
+		// envelopes carry these). The inner `id` is a stable per-message
+		// identity derived from (chat, sender, local comment id): the outer
+		// envelope id differs in every participant's replica, so consumers
+		// deduplicating across replicas need something that does not. It is
+		// derived rather than random so a re-push of the same comment keeps
+		// the same value.
 		$now = $this->toIso8601(time());
 		$payload = [
+			'id' => $this->deriveMessageInnerId($chatGlobalId, $w3id, $localId),
 			'chatId' => $chatGlobalId,
 			// senderId is the User profile envelope ID, the reference peer
 			// platforms dereference; senderEName is the same person as an
@@ -673,12 +680,20 @@ class ChatSyncService {
 		$messageType = $data['type'] ?? 'text';
 
 		// Cross-replica dedup: the same logical message lives in every
-		// participant's eVault under a *different* global_id AND a
-		// *different* createdAt timestamp (each platform stamps on
-		// replication). Only sender + chat + content are stable, so that's
-		// the signature — sufficient because Talk treats identical
-		// messages in the same chat as one.
-		$signature = md5($senderUid . '|' . $chatGlobalId . '|' . $content);
+		// participant's eVault under a *different* global_id, so the outer
+		// envelope ID cannot identify it. We need something stable across
+		// replicas.
+		//
+		// Prefer the sender-assigned inner `id` when the envelope carries one;
+		// that is a genuine per-message identity and replicates unchanged.
+		// Otherwise fall back to a content signature — but include createdAt,
+		// which the previous content-only signature omitted. Without it, any
+		// repeat of an identical string by the same sender in the same room
+		// within the cache TTL was dropped and never posted: "ok", "yes",
+		// "+1", a re-sent link. Replicas of one logical message can carry
+		// different createdAt values (each platform stamps on replication), so
+		// this trades a rarer duplicate for no longer losing real messages.
+		$signature = $this->messageIdentitySignature($senderUid, $chatGlobalId, $data, $content);
 		$sigKey = self::MESSAGE_SIG_CACHE_PREFIX . $signature;
 		$existingLocal = $this->cache->get($sigKey);
 		if (is_string($existingLocal) && $existingLocal !== '') {
@@ -712,6 +727,50 @@ class ChatSyncService {
 		} finally {
 			$this->endInboundPost($senderUid, $roomToken);
 		}
+	}
+
+	/**
+	 * Derive a deterministic UUIDv5-shaped inner `id` for a message from
+	 * (chat, sender, local comment id). Deterministic so re-pushing the same
+	 * Talk comment produces the same identity rather than a fresh one.
+	 */
+	private function deriveMessageInnerId(string $chatGlobalId, string $senderW3id, string $localId): string {
+		$hash = md5($chatGlobalId . '|' . $senderW3id . '|' . $localId);
+
+		return sprintf(
+			'%s-%s-5%s-%04x-%s',
+			substr($hash, 0, 8),
+			substr($hash, 8, 4),
+			substr($hash, 13, 3),
+			(hexdec(substr($hash, 16, 4)) & 0x3fff) | 0x8000,
+			substr($hash, 20, 12),
+		);
+	}
+
+	/**
+	 * Build the cross-replica identity key for an inbound message.
+	 *
+	 * The outer envelope ID differs per replica, so it cannot be used. Prefer
+	 * the sender-assigned inner `id` when present — that is a real per-message
+	 * identity that survives replication. Fall back to
+	 * (sender, chat, content, createdAt), which distinguishes a legitimately
+	 * repeated message from a replica of the same one.
+	 */
+	private function messageIdentitySignature(
+		string $senderUid,
+		string $chatGlobalId,
+		array $data,
+		string $content,
+	): string {
+		$innerId = $data['id'] ?? null;
+		if (is_string($innerId) && $innerId !== '') {
+			return md5('id|' . $chatGlobalId . '|' . $innerId);
+		}
+
+		$createdAt = $data['createdAt'] ?? '';
+		$createdAt = is_string($createdAt) ? $createdAt : '';
+
+		return md5($senderUid . '|' . $chatGlobalId . '|' . $content . '|' . $createdAt);
 	}
 
 	// ---------------------------------------------------------------
@@ -770,38 +829,68 @@ class ChatSyncService {
 		$newCount = 0;
 		foreach ($participantW3ids as $w3id) {
 			try {
-				// Fetch recent Message envelopes from this participant's eVault.
-				// Server-side search filters by chatId so we don't paginate
-				// the entire message history.
-				$result = $this->evaultClient->fetchMetaEnvelopes(
-					$w3id,
-					self::MESSAGE_SCHEMA_ID,
-					50,
-					null,
-					[
-						'term' => $chatGlobalId,
-						'fields' => ['chatId'],
-						'mode' => 'EXACT',
-					],
-				);
+				// Fetch Message envelopes for this chat from the participant's
+				// eVault, following the cursor to the end.
+				//
+				// This used to request a single fixed page of 50 with no
+				// cursor and no ordering. The eVault does not promise
+				// newest-first, so in any room with more than a page of
+				// messages per participant the newest ones could sit beyond
+				// the first page and never be seen — messages sent today
+				// missing while older ones synced fine. Walking the pages
+				// removes the dependency on result ordering entirely.
+				$after = null;
+				$pages = 0;
 
-				foreach (($result['edges'] ?? []) as $edge) {
-					$node = $edge['node'] ?? [];
-					$globalId = $node['id'] ?? '';
-					$data = $node['parsed'] ?? [];
-					if ($globalId === '' || empty($data)) {
-						continue;
+				do {
+					$result = $this->evaultClient->fetchMetaEnvelopes(
+						$w3id,
+						self::MESSAGE_SCHEMA_ID,
+						self::POLL_PAGE_SIZE,
+						$after,
+						[
+							'term' => $chatGlobalId,
+							'fields' => ['chatId'],
+							'mode' => 'EXACT',
+						],
+					);
+
+					foreach (($result['edges'] ?? []) as $edge) {
+						$node = $edge['node'] ?? [];
+						$globalId = $node['id'] ?? '';
+						$data = $node['parsed'] ?? [];
+						if ($globalId === '' || empty($data)) {
+							continue;
+						}
+						if ($this->idMappingMapper->getLocalId('message', $globalId) !== null) {
+							continue; // already synced
+						}
+						$this->handleInboundMessage($globalId, $w3id, $data);
+						// Only count as synced if the mapping now exists —
+						// handleInboundMessage returns void and may skip silently.
+						if ($this->idMappingMapper->getLocalId('message', $globalId) !== null) {
+							$newCount++;
+						}
 					}
-					if ($this->idMappingMapper->getLocalId('message', $globalId) !== null) {
-						continue; // already synced
+
+					$pageInfo = $result['pageInfo'] ?? [];
+					$after = ($pageInfo['hasNextPage'] ?? false) === true
+						? ($pageInfo['endCursor'] ?? null)
+						: null;
+					$pages++;
+
+					// Bound the work per poll so one very deep room cannot
+					// monopolise a cron run. The next poll resumes from the
+					// start and skips already-mapped messages cheaply.
+					if ($pages >= self::POLL_MAX_PAGES && $after !== null) {
+						$this->logger->info('[W3DS Sync] pollRoom: page budget reached, deferring rest', [
+							'roomToken' => $roomToken,
+							'w3id' => $w3id,
+							'pages' => $pages,
+						]);
+						break;
 					}
-					$this->handleInboundMessage($globalId, $w3id, $data);
-					// Only count as synced if the mapping now exists —
-					// handleInboundMessage returns void and may skip silently.
-					if ($this->idMappingMapper->getLocalId('message', $globalId) !== null) {
-						$newCount++;
-					}
-				}
+				} while ($after !== null);
 			} catch (\Throwable $e) {
 				$this->logger->warning('[W3DS Sync] pollRoom: fetch failed for participant', [
 					'roomToken' => $roomToken,
