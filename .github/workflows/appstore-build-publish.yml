@@ -62,7 +62,17 @@ jobs:
       - name: Create tarball
         run: |
           cd build
-          tar -czf "${{ env.APP_NAME }}-${{ steps.version.outputs.version }}.tar.gz" "${{ env.APP_NAME }}"
+          # COPYFILE_DISABLE/--no-xattrs keep macOS from emitting AppleDouble
+          # `._*` members. Nextcloud's attribute-route scanner tries to load
+          # every `._Foo.php` as a class and the app 500s on every route.
+          # Harmless on the Linux runner; matters when cutting a release locally.
+          COPYFILE_DISABLE=1 tar --no-xattrs \
+            -czf "${{ env.APP_NAME }}-${{ steps.version.outputs.version }}.tar.gz" \
+            "${{ env.APP_NAME }}"
+          if tar tzf "${{ env.APP_NAME }}-${{ steps.version.outputs.version }}.tar.gz" | grep -q '/\._'; then
+            echo "::error::Package contains AppleDouble (._*) entries"
+            exit 1
+          fi
 
       - name: Upload tarball to release
         uses: svenstaro/upload-release-action@v2
