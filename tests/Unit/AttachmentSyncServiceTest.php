@@ -57,6 +57,46 @@ class AttachmentSyncServiceTest extends TestCase {
 		));
 	}
 
+	// -------- w3ds://file URI parsing --------
+	//
+	// Must agree with the reference parser in
+	// infrastructure/web3-adapter/src/w3ds/uri.ts: split on the FIRST slash,
+	// both segments non-empty, and an eName longer than a bare '@'.
+
+	private function parseUri(string $uri): ?array {
+		$client = (new \ReflectionClass(\OCA\W3dsLogin\Service\EvaultClient::class))
+			->newInstanceWithoutConstructor();
+		$m = new \ReflectionMethod(\OCA\W3dsLogin\Service\EvaultClient::class, 'parseFileUri');
+		$m->setAccessible(true);
+
+		return $m->invoke($client, $uri);
+	}
+
+	public function testParsesAValidFileUri(): void {
+		$this->assertSame(
+			['ename' => '@alice', 'metaEnvelopeId' => 'env-123'],
+			$this->parseUri('w3ds://file?id=@alice/env-123'),
+		);
+	}
+
+	public function testKeepsLaterSlashesInTheEnvelopeId(): void {
+		// Split on the first slash only, as the reference parser does.
+		$this->assertSame(
+			['ename' => '@alice', 'metaEnvelopeId' => 'env/with/slashes'],
+			$this->parseUri('w3ds://file?id=@alice/env/with/slashes'),
+		);
+	}
+
+	public function testRejectsUrisTheReferenceParserRejects(): void {
+		$this->assertNull($this->parseUri('w3ds://file?id=@alice'), 'no slash');
+		$this->assertNull($this->parseUri('w3ds://file?id=@alice/'), 'empty envelope id');
+		$this->assertNull($this->parseUri('w3ds://file?id=@/env'), 'bare @ is not an eName');
+		$this->assertNull($this->parseUri('w3ds://file?id=alice/env'), 'missing @ prefix');
+		$this->assertNull($this->parseUri('https://example.org/x'), 'wrong scheme');
+		$this->assertNull($this->parseUri('w3ds://file'), 'no query');
+		$this->assertNull($this->parseUri(''), 'empty');
+	}
+
 	// -------- filenames from a remote platform --------
 
 	public function testStripsPathTraversalFromFilename(): void {

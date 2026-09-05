@@ -610,15 +610,24 @@ class EvaultClient {
 			return null;
 		}
 
-		// `@ename/envelopeId` -- the ename itself may not contain a slash.
+		// `@ename/envelopeId` -- split on the first slash, matching the
+		// reference parser. Both segments must be non-empty, and an eName is
+		// more than a bare '@'.
 		$slash = strpos($id, '/');
-		if ($slash === false || $slash === strlen($id) - 1) {
+		if ($slash === false) {
+			return null;
+		}
+
+		$ename = substr($id, 0, $slash);
+		$metaEnvelopeId = substr($id, $slash + 1);
+
+		if (strlen($ename) <= 1 || $metaEnvelopeId === '') {
 			return null;
 		}
 
 		return [
-			'ename' => substr($id, 0, $slash),
-			'metaEnvelopeId' => substr($id, $slash + 1),
+			'ename' => $ename,
+			'metaEnvelopeId' => $metaEnvelopeId,
 		];
 	}
 
