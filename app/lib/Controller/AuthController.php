@@ -213,6 +213,11 @@ class AuthController extends Controller {
 			);
 		}
 
+		// Pick up a profile picture changed on another platform. Throttled
+		// and failure-silent inside the service; provisioning only hydrates
+		// once, so without this an updated avatar would never propagate.
+		$this->provisioningService->refreshAvatarIfStale($user, $w3id);
+
 		$this->authService->markSessionComplete($sessionId, $user->getUID());
 
 		return $this->corsResponse(['status' => 'ok']);
