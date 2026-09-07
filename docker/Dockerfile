@@ -1,5 +1,7 @@
 ARG NEXTCLOUD_IMAGE_TAG=stable
-FROM nextcloud:${NEXTCLOUD_IMAGE_TAG}
+# Fully qualified so hosts that disable short-name aliases (podman with
+# `short-name-mode=enforcing`, some containers.conf setups) can still resolve it.
+FROM docker.io/library/nextcloud:${NEXTCLOUD_IMAGE_TAG}
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends libgmp-dev \

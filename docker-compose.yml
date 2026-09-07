@@ -1,6 +1,17 @@
 services:
+  # One-shot: populate ./vendor before Nextcloud starts. The repo does not
+  # commit vendor/, and the app volume mounts it into the container, so
+  # without this the app fails to autoload its dependencies.
+  composer:
+    image: docker.io/library/composer:2
+    working_dir: /app
+    volumes:
+      - .:/app
+    command: >-
+      install --no-interaction --no-progress --ignore-platform-reqs
+
   db:
-    image: mariadb:10.11
+    image: docker.io/library/mariadb:10.11
     restart: unless-stopped
     command: >-
       --transaction-isolation=READ-COMMITTED
@@ -24,7 +35,10 @@ services:
     ports:
       - "${NEXTCLOUD_PORT:-8080}:80"
     depends_on:
-      - db
+      db:
+        condition: service_started
+      composer:
+        condition: service_completed_successfully
     volumes:
       - nextcloud_data:/var/www/html
       - ./app:/var/www/html/custom_apps/w3ds_login
