@@ -203,22 +203,20 @@ class ChatSyncService {
 			return;
 		}
 
-		// Resolve each participant/admin NC UID → W3ID → profile envelope ID.
-		[$participantEnvelopeIds, $participantW3ids] = $this->resolveParticipantProfileIds($participantUids);
-		[$adminEnvelopeIds, ] = $this->resolveParticipantProfileIds($adminUids);
+		// Resolve each participant/admin NC UID → W3ID. eNames are the
+		// identity we track internally: stable, self-describing, and
+		// resolvable without a profile envelope.
+		$participantW3ids = $this->resolveParticipantW3ids($participantUids);
+		$adminW3ids = $this->resolveParticipantW3ids($adminUids);
 
 		// Always include the owner themselves in both participant lists and
 		// (if they're not already there) in admins -- the creator of a
 		// Talk room is its OWNER level.
-		$ownerProfileId = $this->getOrFallbackProfileId($w3id);
-		if (!in_array($ownerProfileId, $participantEnvelopeIds, true)) {
-			$participantEnvelopeIds[] = $ownerProfileId;
-		}
 		if (!in_array($w3id, $participantW3ids, true)) {
 			$participantW3ids[] = $w3id;
 		}
-		if (!in_array($ownerProfileId, $adminEnvelopeIds, true)) {
-			$adminEnvelopeIds[] = $ownerProfileId;
+		if (!in_array($w3id, $adminW3ids, true)) {
+			$adminW3ids[] = $w3id;
 		}
 
 		// On UPDATE, reuse the inner `id` from the existing envelope. Regenerating
@@ -236,14 +234,21 @@ class ChatSyncService {
 			}
 		}
 
+		// Entity references: the User profile envelope ID where we can get
+		// one, the eName otherwise. Both shapes are readable by eVault's
+		// membership resolution and by consumers going through the
+		// web3-adapter, so nobody is dropped for want of a profile envelope.
+		$participantRefs = $this->resolveParticipantReferences($participantW3ids);
+		$adminRefs = $this->resolveParticipantReferences($adminW3ids);
+
 		// Minimum-common payload across platforms (matches the field set used
 		// by blabsy etc.). Don't include `ename`, `owner`, or `type`: blabsy's
 		// chat adapter (`participants: "ename||user(participants[])"`) routes
 		// participant resolution through `ename` when set and crashes when
 		// the eName-derived participants come back as null entries.
 		$payload = [
-			'participantIds' => $participantEnvelopeIds,
-			'admins' => $adminEnvelopeIds,
+			'participantIds' => $participantRefs,
+			'admins' => $adminRefs,
 			'createdAt' => $existingCreatedAt ?? $this->toIso8601($roomData['createdAt'] ?? time()),
 			'updatedAt' => $this->toIso8601(time()),
 		];
@@ -268,15 +273,19 @@ class ChatSyncService {
 		// ACL by W3ID (eVault access is keyed on W3IDs, not envelope IDs)
 		$acl = !empty($participantW3ids) ? $participantW3ids : ['*'];
 
-		$newCount = count($participantEnvelopeIds);
+		$newCount = count($participantW3ids);
 
 		$this->logger->info('[W3DS Sync] pushChat payload prepared', [
 			'localId' => $localId,
 			'localUidCount' => count($participantUids),
 			'localUids' => $participantUids,
 			'resolvedW3ids' => $participantW3ids,
-			'envelopeIdCount' => $newCount,
-			'envelopeIds' => $participantEnvelopeIds,
+			'participantIdCount' => count($participantRefs),
+			'participantIds' => $participantRefs,
+			'referencedByENameCount' => count(array_filter(
+				$participantRefs,
+				static fn (string $ref): bool => str_starts_with($ref, '@'),
+			)),
 			'ownerW3id' => $w3id,
 			'aclCount' => count($acl),
 			'acl' => $acl,
@@ -305,7 +314,7 @@ class ChatSyncService {
 				'localId' => $localId,
 				'globalId' => $existingGlobalId,
 				'participantCount' => $newCount,
-				'adminCount' => count($adminEnvelopeIds),
+				'adminCount' => count($adminW3ids),
 			]);
 
 			$readback = $this->evaultClient->fetchMetaEnvelopeById($w3id, $existingGlobalId);
@@ -333,7 +342,7 @@ class ChatSyncService {
 					'localId' => $localId,
 					'globalId' => $globalId,
 					'participantCount' => $newCount,
-					'adminCount' => count($adminEnvelopeIds),
+					'adminCount' => count($adminW3ids),
 				]);
 			} else {
 				$this->logger->error('[W3DS Sync] Failed to create chat MetaEnvelope', ['localId' => $localId]);
@@ -460,8 +469,10 @@ class ChatSyncService {
 			return;
 		}
 
-		// senderId in the Message schema is the sender's User profile envelope ID
-		$senderEnvelopeId = $this->getOrFallbackProfileId($w3id);
+		// Prefer the sender's profile envelope ID, falling back to the eName:
+		// senderId is a scalar, so omitting it would leave the message
+		// unattributed entirely, and senderEName carries the same value.
+		$senderId = $this->evaultClient->getProfileEnvelopeId($w3id) ?? $w3id;
 
 		// Match the field set used by other platforms (>99% of message
 		// envelopes carry these). Inner `id` is omitted; the eVault assigns
@@ -469,7 +480,10 @@ class ChatSyncService {
 		$now = $this->toIso8601(time());
 		$payload = [
 			'chatId' => $chatGlobalId,
-			'senderId' => $senderEnvelopeId,
+			// senderId is the User profile envelope ID, the reference peer
+			// platforms dereference; senderEName is the same person as an
+			// eName, for consumers that prefer the stable identifier.
+			'senderId' => $senderId,
 			'senderEName' => $w3id,
 			'content' => (string)($messageData['message'] ?? ''),
 			'type' => $this->mapMessageVerbToGlobal($messageData['verb'] ?? 'comment'),
@@ -520,25 +534,62 @@ class ChatSyncService {
 			return;
 		}
 
-		// participantIds may be User profile envelope IDs OR raw W3IDs (legacy).
-		// For envelope IDs we can't reverse-lookup without a registry query, so
-		// we best-effort resolve only the ones we recognize.
+		// Participants are named either by User profile envelope ID or by
+		// eName; resolveParticipantIdToW3id() handles both shapes.
+		//
+		// Peers we cannot resolve are simply not represented locally; that must
+		// not sink the whole room. A group chat whose members mostly live on
+		// other platforms is still a room this user belongs to, so the viewer
+		// (the eVault owner we are reading from) is always a participant.
 		$participantIds = $data['participantIds'] ?? [];
+		$references = is_array($participantIds) ? $participantIds : [];
 		$participantUids = [];
-		foreach ($participantIds as $pid) {
+		$seenW3ids = [];
+		$unresolved = 0;
+		foreach ($references as $pid) {
 			$w3id = $this->resolveParticipantIdToW3id((string)$pid, $ownerW3id);
 			if ($w3id === null) {
+				$unresolved++;
 				continue;
 			}
+			// The same person can be named by both shapes; count them once.
+			if (isset($seenW3ids[$w3id])) {
+				continue;
+			}
+			$seenW3ids[$w3id] = true;
 			$uid = $this->resolveW3idToNcUid($w3id);
 			if ($uid !== null) {
 				$participantUids[] = $uid;
+			} else {
+				$unresolved++;
 			}
 		}
 
+		// Guarantee the viewer's own membership. Without this, a room whose
+		// participantIds carry only unresolvable off-platform peers is dropped
+		// entirely and the user never sees the conversation.
+		$viewerUid = $this->resolveW3idToNcUid($ownerW3id);
+		if ($viewerUid !== null && !in_array($viewerUid, $participantUids, true)) {
+			$participantUids[] = $viewerUid;
+		}
+
+		$participantUids = array_values(array_unique($participantUids));
+
 		if (empty($participantUids)) {
-			$this->logger->warning('No resolvable participants for inbound chat', ['globalId' => $globalId]);
+			$this->logger->warning('[W3DS Sync] No resolvable participants for inbound chat', [
+				'globalId' => $globalId,
+				'ownerW3id' => $ownerW3id,
+				'participantIdCount' => count($references),
+			]);
 			return;
+		}
+
+		if ($unresolved > 0) {
+			$this->logger->info('[W3DS Sync] Inbound chat has participants not resolvable locally', [
+				'globalId' => $globalId,
+				'resolvedCount' => count($participantUids),
+				'unresolvedCount' => $unresolved,
+			]);
 		}
 
 		// Create the Talk room
@@ -597,8 +648,8 @@ class ChatSyncService {
 			return;
 		}
 
-		// Prefer senderEName (other-platform canonical), fall back to senderId
-		// which we ourselves write as a profile envelope ID, or accept a raw W3ID.
+		// Prefer senderEName, fall back to senderId, which we now write as an
+		// eName but which may be a profile envelope ID in older envelopes.
 		$senderEName = is_string($data['senderEName'] ?? null) ? $data['senderEName'] : '';
 		$senderW3id = $senderEName !== ''
 			? $senderEName
@@ -776,20 +827,24 @@ class ChatSyncService {
 	 *
 	 * Uses the REST `/metaenvelopes/by-ontology/:ontology` endpoint to list
 	 * everything of a given ontology and filters client-side by membership:
-	 *   - rooms where the user's profile envelope ID appears in
+	 *   - rooms where the user's profile envelope ID or eName appears in
 	 *     `participantIds`, `admins`, or `owner`
 	 *   - messages whose `chatId` resolves to one of those accepted rooms
 	 */
 	public function pullSyncForUser(string $w3id): void {
+		// A missing profile envelope is not fatal. We also write eNames, so
+		// chats involving this user are identifiable by eName alone; bailing
+		// out here would deny pull sync to every user without a profile
+		// envelope, which is precisely the bootstrap population.
 		$myProfileId = $this->evaultClient->getProfileEnvelopeId($w3id);
 		if ($myProfileId === null) {
-			$this->logger->info('[W3DS Sync] pullSyncForUser skip: no profile envelope yet', ['w3id' => $w3id]);
-			return;
+			$this->logger->info('[W3DS Sync] pullSyncForUser: no profile envelope yet, matching on eName only', ['w3id' => $w3id]);
+			$myProfileId = $w3id;
 		}
 
 		// 1. Rooms — list, filter by membership (the user's profile envelope
-		// ID must appear in the chat's participantIds / admins / owner --
-		// same identifier we put there when *we* push chats), ingest.
+		// ID or eName must appear in the chat's participant / admin / owner
+		// fields), ingest.
 		$acceptedChatGlobalIds = [];
 		try {
 			$chatEnvelopes = $this->evaultClient->listMetaEnvelopesByOntology($w3id, self::CHAT_SCHEMA_ID, self::PULL_LIST_CACHE_TTL);
@@ -800,7 +855,7 @@ class ChatSyncService {
 					if ($globalId === '' || !is_array($parsed) || empty($parsed)) {
 						continue;
 					}
-					if (!$this->userIsInRoom($parsed, $myProfileId)) {
+					if (!$this->userIsInRoom($parsed, $myProfileId, $w3id)) {
 						continue;
 					}
 					$acceptedChatGlobalIds[$globalId] = true;
@@ -847,20 +902,40 @@ class ChatSyncService {
 	}
 
 	/**
-	 * True when the user's profile envelope ID appears in the chat's
-	 * `owner`, `participantIds`, or `admins` -- same identifier shape we
-	 * write when pushing chats outbound.
+	 * True when the viewer appears in the chat's `owner`, `participantIds`,
+	 * or `admins`.
+	 *
+	 * Those fields name a person either by User profile envelope ID or by
+	 * eName, and we write both shapes ourselves depending on what resolves.
+	 * Matching on a single shape drops rooms silently — the envelope
+	 * replicates fine and is then filtered out here — so accept either.
 	 */
-	private function userIsInRoom(array $parsed, string $myProfileId): bool {
-		if (($parsed['owner'] ?? null) === $myProfileId) {
+	private function userIsInRoom(array $parsed, string $myProfileId, string $myW3id = ''): bool {
+		$identities = [$myProfileId];
+		if ($myW3id !== '' && $myW3id !== $myProfileId) {
+			$identities[] = $myW3id;
+		}
+
+		$owner = $parsed['owner'] ?? null;
+		if (is_string($owner) && in_array($owner, $identities, true)) {
 			return true;
 		}
+
 		foreach (['participantIds', 'admins'] as $key) {
 			$arr = $parsed[$key] ?? null;
-			if (is_array($arr) && in_array($myProfileId, $arr, true)) {
-				return true;
+			if (!is_array($arr)) {
+				continue;
+			}
+			foreach ($arr as $entry) {
+				if (!is_string($entry)) {
+					continue;
+				}
+				if (in_array($entry, $identities, true)) {
+					return true;
+				}
 			}
 		}
+
 		return false;
 	}
 
@@ -971,40 +1046,57 @@ class ChatSyncService {
 	}
 
 	/**
-	 * Look up the profile envelope ID for a W3ID. If the user has not yet
-	 * published a User profile envelope to their eVault, fall back to the
-	 * raw W3ID -- this keeps sync functional during bootstrap, and other
-	 * platforms can still attribute the data to the correct owner.
-	 */
-	private function getOrFallbackProfileId(string $w3id): string {
-		$profileId = $this->evaultClient->getProfileEnvelopeId($w3id);
-		if ($profileId !== null) {
-			return $profileId;
-		}
-		$this->logger->warning('[W3DS Sync] No User profile envelope found, falling back to W3ID', [
-			'w3id' => $w3id,
-		]);
-		return $w3id;
-	}
-
-	/**
-	 * Resolve an array of NC UIDs to their User profile envelope IDs.
-	 * Returns [$envelopeIds, $w3ids] -- parallel lists for the linked participants.
+	 * Resolve an array of NC UIDs to the eNames of their linked W3IDs.
+	 * Unlinked users are skipped.
 	 *
-	 * @return array{0: string[], 1: string[]}
+	 * @return string[]
 	 */
-	private function resolveParticipantProfileIds(array $ncUids): array {
-		$envelopeIds = [];
+	private function resolveParticipantW3ids(array $ncUids): array {
 		$w3ids = [];
 		foreach ($ncUids as $uid) {
 			$w3id = $this->userProvisioning->getLinkedW3id($uid);
-			if ($w3id === null) {
+			if ($w3id === null || in_array($w3id, $w3ids, true)) {
 				continue;
 			}
-			$envelopeIds[] = $this->getOrFallbackProfileId($w3id);
 			$w3ids[] = $w3id;
 		}
-		return [$envelopeIds, $w3ids];
+		return $w3ids;
+	}
+
+	/**
+	 * Map eNames to the references that go into `participantIds` / `admins`.
+	 *
+	 * Prefer the User profile envelope ID: that is what consumers resolve
+	 * through the web3-adapter, which looks each entry up in its own id
+	 * mapping and hands the platform a `users(<localId>)` reference.
+	 *
+	 * Where no envelope resolves, fall back to the eName rather than dropping
+	 * the participant. eVault's own membership resolution
+	 * (GroupMembershipService) reads either shape out of these fields, so an
+	 * eName here still grants group-derived access, whereas an omitted
+	 * participant loses it. Consumers that cannot resolve the reference
+	 * degrade the same way they already do for any unmapped id.
+	 *
+	 * @param string[] $w3ids
+	 * @return string[] Envelope IDs where resolvable, eNames otherwise.
+	 */
+	private function resolveParticipantReferences(array $w3ids): array {
+		$refs = [];
+		foreach ($w3ids as $w3id) {
+			$envelopeId = $this->evaultClient->getProfileEnvelopeId($w3id);
+
+			if ($envelopeId === null) {
+				$this->logger->info('[W3DS Sync] No profile envelope for participant; referencing by eName', [
+					'w3id' => $w3id,
+				]);
+			}
+
+			$ref = $envelopeId ?? $w3id;
+			if (!in_array($ref, $refs, true)) {
+				$refs[] = $ref;
+			}
+		}
+		return $refs;
 	}
 
 	/**
