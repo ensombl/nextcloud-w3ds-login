@@ -25,8 +25,24 @@ class EvaultClient {
 	private const PLATFORM_TOKEN_CACHE_KEY = 'w3ds_platform_token';
 	private const PLATFORM_TOKEN_CACHE_TTL = 86400; // 24 hours (tokens last ~1 year, but refresh daily)
 	private const HTTP_TIMEOUT = 15;
-	/** Longest server-requested back-off we will sit through inside a request. */
-	private const RATE_LIMIT_MAX_WAIT = 30;
+	/**
+	 * The by-ontology listing returns every envelope of an ontology on the
+	 * eVault in one unpaginated response, which routinely runs to tens of
+	 * megabytes. At the ordinary request timeout the transfer is cut off
+	 * mid-body, the decode fails, and the caller sees an empty list that is
+	 * indistinguishable from "this user has no chats" -- so chats and
+	 * messages silently never appear. Give the bulk endpoint room to finish.
+	 */
+	private const LIST_HTTP_TIMEOUT = 120;
+	/**
+	 * Longest server-requested back-off we will sit through inside a request.
+	 *
+	 * The eVault's own rate limiter asks for up to ~32s on the shared
+	 * by-ontology endpoint. A ceiling below what the server actually asks
+	 * for means every 429 is abandoned instead of retried, and the caller
+	 * reads the resulting empty list as "no chats". Sit through the wait.
+	 */
+	private const RATE_LIMIT_MAX_WAIT = 60;
 	private const RATE_LIMIT_MAX_RETRIES = 2;
 
 	private ICache $cache;
@@ -474,7 +490,7 @@ class EvaultClient {
 			$client = $this->clientService->newClient();
 			$response = $this->requestWithRateLimitRetry(
 				fn (): \OCP\Http\Client\IResponse => $client->get($url, [
-					'timeout' => self::HTTP_TIMEOUT,
+					'timeout' => self::LIST_HTTP_TIMEOUT,
 					'headers' => $headers,
 				]),
 				$w3id,
