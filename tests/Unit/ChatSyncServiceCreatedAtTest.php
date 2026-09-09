@@ -67,4 +67,23 @@ class ChatSyncServiceCreatedAtTest extends TestCase {
 			5,
 		);
 	}
+
+	public function testKeepsStampsWithinTheClockSkewTolerance(): void {
+		// A peer whose clock runs a couple of minutes fast is ordinary, not
+		// garbage: keep its send time rather than rewriting it to now.
+		$slightlyAhead = (new \DateTime('+2 minutes'))->getTimestamp();
+
+		$this->assertSame(
+			$slightlyAhead,
+			$this->parse(date('c', $slightlyAhead))->getTimestamp(),
+		);
+	}
+
+	public function testClampsStampsBeyondTheClockSkewTolerance(): void {
+		$this->assertEqualsWithDelta(
+			time(),
+			$this->parse((new \DateTime('+10 minutes'))->format('c'))->getTimestamp(),
+			5,
+		);
+	}
 }
