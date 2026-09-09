@@ -41,15 +41,29 @@ class AvatarSyncService {
 	private const REQUEST_TIMEOUT = 10;
 
 	/**
-	 * Nextcloud's avatar storage accepts PNG and JPEG only -- `IAvatar::set()`
-	 * throws "Unknown filetype" for GIF and WebP (verified against Nextcloud
-	 * 33). Accepting them here would mean fetching bytes we can never store,
-	 * so the allowlist matches what Nextcloud will actually take.
+	 * Image types we are willing to fetch and hand on.
+	 *
+	 * Nextcloud's avatar storage itself only stores PNG and JPEG --
+	 * `IAvatar::set()` throws "Unknown filetype" for GIF and WebP (verified
+	 * against Nextcloud 33). The wider set is still accepted here because
+	 * every one of them is normalised to PNG by normaliseForStorage() before
+	 * storage, so restricting the allowlist to Nextcloud's two types would
+	 * discard pictures we can in fact display, purely over container format.
 	 *
 	 * SVG is deliberately excluded regardless: it is script-bearing markup,
 	 * and storing a remote one as a user avatar is a stored-XSS vector.
 	 */
 	private const ALLOWED_MIME = [
+		'image/png',
+		'image/jpeg',
+		'image/gif',
+		'image/webp',
+		'image/bmp',
+		'image/x-ms-bmp',
+	];
+
+	/** Types Nextcloud stores directly; anything else must be re-encoded. */
+	private const NATIVE_MIME = [
 		'image/png',
 		'image/jpeg',
 	];
@@ -78,6 +92,8 @@ class AvatarSyncService {
 			if ($bytes === null) {
 				return false;
 			}
+
+			$bytes = $this->normaliseForStorage($bytes) ?? $bytes;
 
 			return $this->writeAvatar($uid, $bytes);
 		} catch (\Throwable $e) {
@@ -196,10 +212,118 @@ class AvatarSyncService {
 	}
 
 	/**
-	 * Hand the bytes to Nextcloud. `IAvatar::set()` validates and crops the
-	 * image itself, and throws for anything it can't decode -- a bare
-	 * `Exception` with "Unknown filetype" rather than a typed one -- so this
-	 * catches broadly and reports failure instead of propagating.
+	 * Put an image into a shape and format Nextcloud will actually store.
+	 *
+	 * Nextcloud's avatar storage is strict in two independent ways: it stores
+	 * PNG and JPEG only, and it rejects any image that is not square
+	 * ("Avatar image is not square") rather than adapting it. Real profile
+	 * pictures routinely violate one or both, so without this step they are
+	 * fetched and then silently discarded, leaving the generated initials
+	 * avatar. Both conditions are handled here, in one decode/encode pass.
+	 *
+	 * Squaring pads with transparency rather than cropping. This is only a
+	 * local rendering concession to Nextcloud's shape requirement, not an
+	 * edit of the person's picture: the eVault copy is authoritative and is
+	 * never written back to, and cropping would silently decide which part of
+	 * someone's face to discard. Padding keeps every pixel they published.
+	 *
+	 * Returns null when nothing needs changing or the image cannot be
+	 * processed, meaning the caller keeps the original bytes and lets
+	 * Nextcloud make the final decision.
+	 */
+	private function normaliseForStorage(string $bytes): ?string {
+		// GD is optional in a PHP build. Without it we pass the original
+		// bytes through rather than failing the sync outright.
+		if (!function_exists('imagecreatefromstring') || !function_exists('imagecreatetruecolor')) {
+			return null;
+		}
+
+		$image = @imagecreatefromstring($bytes);
+		if ($image === false) {
+			return null;
+		}
+
+		try {
+			$width = imagesx($image);
+			$height = imagesy($image);
+			if ($width < 1 || $height < 1) {
+				return null;
+			}
+
+			// Already square and already a type Nextcloud stores: leave the
+			// original bytes alone rather than re-encoding for no reason.
+			if ($width === $height && $this->isNativelyStorable($bytes)) {
+				return null;
+			}
+
+			$side = max($width, $height);
+			$canvas = @imagecreatetruecolor($side, $side);
+			if ($canvas === false) {
+				return null;
+			}
+
+			try {
+				// Fill with transparency and keep it through encoding,
+				// otherwise the padding renders as black bars.
+				imagealphablending($canvas, false);
+				imagesavealpha($canvas, true);
+				$transparent = imagecolorallocatealpha($canvas, 0, 0, 0, 127);
+				if ($transparent === false) {
+					return null;
+				}
+				imagefilledrectangle($canvas, 0, 0, $side - 1, $side - 1, $transparent);
+
+				// Centre the original inside the square.
+				$dstX = intdiv($side - $width, 2);
+				$dstY = intdiv($side - $height, 2);
+				if (!imagecopy($canvas, $image, $dstX, $dstY, 0, 0, $width, $height)) {
+					return null;
+				}
+
+				// PNG regardless of the source type: it is lossless, so a JPEG
+				// is not put through a second round of lossy compression, and
+				// it is the only type Nextcloud stores that carries alpha.
+				ob_start();
+				$ok = imagepng($canvas);
+				$normalised = (string)ob_get_clean();
+
+				return ($ok && $normalised !== '') ? $normalised : null;
+			} finally {
+				imagedestroy($canvas);
+			}
+		} catch (\Throwable $e) {
+			$this->logger->info('[W3DS Avatar] Could not normalise the avatar, using original', [
+				'exception' => $e->getMessage(),
+			]);
+			return null;
+		} finally {
+			imagedestroy($image);
+		}
+	}
+
+	/**
+	 * True when these bytes are already one of the types Nextcloud stores
+	 * directly. Detected from the content itself, since the declared type
+	 * comes from a remote host and a data URI label is caller-controlled.
+	 */
+	private function isNativelyStorable(string $bytes): bool {
+		if (!function_exists('getimagesizefromstring')) {
+			return false;
+		}
+
+		$info = @getimagesizefromstring($bytes);
+		$mime = is_array($info) ? ($info['mime'] ?? null) : null;
+
+		return is_string($mime) && in_array(strtolower($mime), self::NATIVE_MIME, true);
+	}
+
+	/**
+	 * Hand the bytes to Nextcloud. `IAvatar::set()` validates the image and
+	 * throws for anything it can't accept -- a bare `Exception` with e.g.
+	 * "Unknown filetype" or "Avatar image is not square" rather than a typed
+	 * one -- so this catches broadly and reports failure instead of
+	 * propagating. Note that it validates squareness but does not crop;
+	 * normaliseForStorage() upstream is what makes a real-world picture storable.
 	 */
 	private function writeAvatar(string $uid, string $bytes): bool {
 		try {

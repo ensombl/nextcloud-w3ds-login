@@ -93,14 +93,26 @@ class AvatarSyncServiceTest extends TestCase {
 		]));
 	}
 
-	public function testRejectsImageTypesNextcloudCannotStore(): void {
-		// IAvatar::set() throws "Unknown filetype" for these, so accepting
-		// them would mean fetching bytes we can never store.
-		$this->assertNull($this->invoke('decodeDataUri', [
+	public function testAcceptsTypesGdCanConvertForUs(): void {
+		// Nextcloud stores only PNG/JPEG, but normaliseForStorage() re-encodes
+		// to PNG, so rejecting these outright would discard pictures we can in
+		// fact display purely over container format.
+		$this->assertSame('GIF89a', $this->invoke('decodeDataUri', [
 			'data:image/gif;base64,' . base64_encode('GIF89a'),
 		]));
-		$this->assertNull($this->invoke('decodeDataUri', [
+		$this->assertSame('RIFF....WEBP', $this->invoke('decodeDataUri', [
 			'data:image/webp;base64,' . base64_encode('RIFF....WEBP'),
+		]));
+	}
+
+	public function testStillRejectsScriptBearingAndNonImageTypes(): void {
+		// SVG is markup, so storing a remote one is a stored-XSS vector, and
+		// it stays excluded no matter what GD could decode.
+		$this->assertNull($this->invoke('decodeDataUri', [
+			'data:image/svg+xml;base64,' . base64_encode('<svg onload="alert(1)"/>'),
+		]));
+		$this->assertNull($this->invoke('decodeDataUri', [
+			'data:text/html;base64,' . base64_encode('<h1>hi</h1>'),
 		]));
 	}
 
@@ -151,5 +163,72 @@ class AvatarSyncServiceTest extends TestCase {
 			$png,
 			$this->invoke('resolveBytes', ['data:image/jpeg;base64,' . base64_encode($png)]),
 		);
+	}
+
+	// -------- normalising for storage --------
+
+	/** Real encoded bytes, since normaliseForStorage actually decodes. */
+	private function imageBytes(int $width, int $height, string $type = 'png'): string {
+		$image = imagecreatetruecolor($width, $height);
+		ob_start();
+		('image' . $type)($image);
+		$bytes = (string)ob_get_clean();
+		imagedestroy($image);
+
+		return $bytes;
+	}
+
+	/** @return array{0:int,1:int,2:string} width, height, mime */
+	private function describe(string $bytes): array {
+		$info = getimagesizefromstring($bytes);
+
+		return [$info[0], $info[1], $info['mime']];
+	}
+
+	public function testPadsLandscapeImageToASquare(): void {
+		// Nextcloud rejects a non-square avatar outright rather than adapting
+		// it, so a landscape picture must be squared or it is silently
+		// discarded after being fetched.
+		$out = $this->invoke('normaliseForStorage', [$this->imageBytes(200, 100)]);
+
+		$this->assertNotNull($out);
+		$this->assertSame([200, 200, 'image/png'], $this->describe($out));
+	}
+
+	public function testPadsPortraitImageToASquare(): void {
+		$out = $this->invoke('normaliseForStorage', [$this->imageBytes(80, 240)]);
+
+		$this->assertNotNull($out);
+		$this->assertSame([240, 240, 'image/png'], $this->describe($out));
+	}
+
+	public function testPadsRatherThanCropsSoNoPixelsAreLost(): void {
+		// The padded canvas takes the LONGER side, which is what distinguishes
+		// padding from cropping: a crop would come back at the shorter side
+		// and would have thrown away part of the person's picture.
+		$out = $this->invoke('normaliseForStorage', [$this->imageBytes(300, 100)]);
+
+		[$width] = $this->describe($out);
+		$this->assertSame(300, $width, 'padding must keep the full width, not crop to 100');
+	}
+
+	public function testConvertsTypesNextcloudCannotStore(): void {
+		// Square already, but a GIF: still needs re-encoding to PNG.
+		$out = $this->invoke('normaliseForStorage', [$this->imageBytes(100, 100, 'gif')]);
+
+		$this->assertNotNull($out);
+		$this->assertSame([100, 100, 'image/png'], $this->describe($out));
+	}
+
+	public function testLeavesAnAlreadyStorableImageUntouched(): void {
+		// Square and already PNG: null means "keep the original bytes",
+		// avoiding a pointless re-encode.
+		$this->assertNull($this->invoke('normaliseForStorage', [$this->imageBytes(120, 120)]));
+		$this->assertNull($this->invoke('normaliseForStorage', [$this->imageBytes(64, 64, 'jpeg')]));
+	}
+
+	public function testUndecodableBytesFallBackToTheOriginal(): void {
+		$this->assertNull($this->invoke('normaliseForStorage', ['not-an-image']));
+		$this->assertNull($this->invoke('normaliseForStorage', ['']));
 	}
 }
