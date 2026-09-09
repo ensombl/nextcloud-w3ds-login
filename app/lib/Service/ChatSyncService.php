@@ -624,7 +624,11 @@ class ChatSyncService {
 			: 2; // GROUP
 
 		try {
-			$roomToken = $this->createTalkRoom($roomType, $data['name'] ?? '', $participantUids);
+			$roomToken = $this->createTalkRoom(
+				$roomType,
+				$this->sanitiseInboundRoomName($data['name'] ?? null),
+				$participantUids,
+			);
 			if ($roomToken === null) {
 				return;
 			}
@@ -1062,6 +1066,50 @@ class ChatSyncService {
 		return false;
 	}
 
+	/**
+	 * Decide what an inbound chat's `name` should become as a Talk room title.
+	 *
+	 * Chats are named by many platforms and the field is not always a title.
+	 * Some send a bare eName, some a JSON array of raw account IDs, some
+	 * nothing at all. Storing those verbatim is worse than storing nothing:
+	 * given an empty name Talk derives one from the participants' display
+	 * names, while a junk name is shown as-is forever.
+	 *
+	 * Only applies to group rooms. A one-to-one room's name is not a title at
+	 * all -- Talk stores the two user IDs as JSON there and reads them back to
+	 * render the other participant -- so those are left to Talk entirely.
+	 *
+	 * Return the name only when it reads like one a human chose.
+	 */
+	private function sanitiseInboundRoomName(mixed $name): string {
+		if (!is_string($name)) {
+			return '';
+		}
+
+		$name = trim($name);
+		if ($name === '') {
+			return '';
+		}
+
+		// A bare eName ("@16894677-...") is an identifier, not a title.
+		if (str_starts_with($name, '@')) {
+			return '';
+		}
+
+		// Serialised participant lists: '["alice_nc","bob_nc"]'.
+		if (str_starts_with($name, '[') || str_starts_with($name, '{')) {
+			return '';
+		}
+
+		// A raw account id, either the eName without its '@' or one of our
+		// derived UIDs ("<uuid>_<hash>").
+		if (preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(_[0-9a-f]+)?$/i', $name)) {
+			return '';
+		}
+
+		return $name;
+	}
+
 	// ---------------------------------------------------------------
 	// Talk interaction helpers
 	// ---------------------------------------------------------------
@@ -1079,13 +1127,24 @@ class ChatSyncService {
 
 			$room = $manager->createRoom($type, $name);
 			$participantService = \OCP\Server::get(\OCA\Talk\Service\ParticipantService::class);
+			$userManager = \OCP\Server::get(\OCP\IUserManager::class);
 
 			foreach ($participantUids as $uid) {
 				try {
-					$participantService->addUsers($room, [[
+					// Pass the display name explicitly. Talk stores it on the
+					// attendee row and renders unnamed rooms from those rows,
+					// so omitting it leaves the raw UID (a bare eName) showing
+					// as the other person's name.
+					$user = $userManager->get($uid);
+					$attendee = [
 						'actorType' => 'users',
 						'actorId' => $uid,
-					]]);
+					];
+					if ($user !== null) {
+						$attendee['displayName'] = $user->getDisplayName();
+					}
+
+					$participantService->addUsers($room, [$attendee]);
 				} catch (\Throwable $e) {
 					$this->logger->warning('Failed to add participant to room', [
 						'uid' => $uid,
@@ -1150,8 +1209,12 @@ class ChatSyncService {
 			$manager = \OCP\Server::get(\OCA\Talk\Manager::class);
 			$room = $manager->getRoomByToken($roomToken);
 
-			if (!empty($data['name']) && $room->getName() !== $data['name']) {
-				$room->setName($data['name']);
+			// Same filtering as on create: an identifier arriving in `name`
+			// must not overwrite a room that is currently rendering itself
+			// from its participants.
+			$name = $this->sanitiseInboundRoomName($data['name'] ?? null);
+			if ($name !== '' && $room->getName() !== $name) {
+				$room->setName($name);
 			}
 		} catch (\Throwable $e) {
 			$this->logger->warning('Failed to update local chat', [
