@@ -618,17 +618,22 @@ class ChatSyncService {
 			]);
 		}
 
-		// Create the Talk room
-		$roomType = ($data['type'] ?? 'group') === 'direct'
-			? 1  // ONE_TO_ONE
-			: 2; // GROUP
+		// Create the Talk room. A chat between exactly two people is a
+		// one-to-one conversation even when the sending platform didn't label
+		// it `direct`: most of them have no such concept, and Talk renders a
+		// one-to-one room as the *other participant* rather than needing a
+		// title. Treating those as groups is what left rooms displaying a raw
+		// eName in the conversation list.
+		$isDirect = ($data['type'] ?? null) === 'direct' || count($participantUids) === 2;
 
 		try {
-			$roomToken = $this->createTalkRoom(
-				$roomType,
-				$this->sanitiseInboundRoomName($data['name'] ?? null),
-				$participantUids,
-			);
+			$roomToken = $isDirect
+				? $this->createOneToOneTalkRoom($participantUids)
+				: $this->createTalkRoom(
+					\OCA\Talk\Room::TYPE_GROUP,
+					$this->sanitiseInboundRoomName($data['name'] ?? null),
+					$participantUids,
+				);
 			if ($roomToken === null) {
 				return;
 			}
@@ -1116,6 +1121,42 @@ class ChatSyncService {
 
 	private function isTalkAvailable(): bool {
 		return class_exists(\OCA\Talk\Manager::class);
+	}
+
+	/**
+	 * Create (or reuse) Talk's own one-to-one conversation between two users.
+	 *
+	 * Talk gives one-to-one rooms their own type and stores the two user IDs
+	 * in `name`, reading them back to show each side the other person. Going
+	 * through RoomService is what establishes that, so it is not something we
+	 * can imitate by creating a group and naming it ourselves.
+	 *
+	 * Returns null when the pair can't be resolved, so the caller falls back
+	 * rather than silently losing the conversation.
+	 *
+	 * @param string[] $participantUids Exactly two local UIDs.
+	 */
+	private function createOneToOneTalkRoom(array $participantUids): ?string {
+		try {
+			$userManager = \OCP\Server::get(\OCP\IUserManager::class);
+			$actor = $userManager->get($participantUids[0] ?? '');
+			$target = $userManager->get($participantUids[1] ?? '');
+			if ($actor === null || $target === null) {
+				return null;
+			}
+
+			$roomService = \OCP\Server::get(\OCA\Talk\Service\RoomService::class);
+
+			return $roomService->createOneToOneConversation($actor, $target)->getToken();
+		} catch (\Throwable $e) {
+			$this->logger->warning('[W3DS Sync] Could not create one-to-one room, falling back to a group', [
+				'participants' => $participantUids,
+				'exception' => $e->getMessage(),
+			]);
+
+			// A group of the same two people still shows the conversation.
+			return $this->createTalkRoom(\OCA\Talk\Room::TYPE_GROUP, '', $participantUids);
+		}
 	}
 
 	/**
