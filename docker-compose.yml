@@ -30,7 +30,12 @@ services:
     build:
       context: ./docker
       args:
-        NEXTCLOUD_IMAGE_TAG: ${NEXTCLOUD_IMAGE_TAG:-stable}
+        # Pinned to 33, not `stable`. `stable` now points at Nextcloud 34,
+        # which the app declares itself incompatible with (max-version="33"
+        # in app/appinfo/info.xml), so `occ app:enable` refuses to install.
+        # Matches the default in .env.example; raise both together with the
+        # info.xml max-version.
+        NEXTCLOUD_IMAGE_TAG: ${NEXTCLOUD_IMAGE_TAG:-33}
     restart: unless-stopped
     ports:
       - "${NEXTCLOUD_PORT:-8080}:80"
