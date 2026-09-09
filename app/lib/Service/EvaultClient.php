@@ -25,6 +25,9 @@ class EvaultClient {
 	private const PLATFORM_TOKEN_CACHE_KEY = 'w3ds_platform_token';
 	private const PLATFORM_TOKEN_CACHE_TTL = 86400; // 24 hours (tokens last ~1 year, but refresh daily)
 	private const HTTP_TIMEOUT = 15;
+	/** Longest server-requested back-off we will sit through inside a request. */
+	private const RATE_LIMIT_MAX_WAIT = 30;
+	private const RATE_LIMIT_MAX_RETRIES = 2;
 
 	private ICache $cache;
 
@@ -134,11 +137,14 @@ class EvaultClient {
 		}
 
 		$client = $this->clientService->newClient();
-		$response = $client->post($url, [
-			'timeout' => self::HTTP_TIMEOUT,
-			'headers' => $headers,
-			'body' => json_encode($payload),
-		]);
+		$response = $this->requestWithRateLimitRetry(
+			fn (): \OCP\Http\Client\IResponse => $client->post($url, [
+				'timeout' => self::HTTP_TIMEOUT,
+				'headers' => $headers,
+				'body' => json_encode($payload),
+			]),
+			$w3id,
+		);
 
 		$body = json_decode($response->getBody(), true);
 		if (!is_array($body)) {
@@ -151,6 +157,126 @@ class EvaultClient {
 		}
 
 		return $body['data'] ?? [];
+	}
+
+	/**
+	 * Run an eVault request, honouring the server's own back-off when it
+	 * answers 429.
+	 *
+	 * The eVault rate-limits per platform, and a Nextcloud instance resolving
+	 * a room full of identities trips that limit routinely. The response says
+	 * how long to wait (`retryAfterSeconds`), which is short -- roughly 20s --
+	 * so waiting is the difference between showing real names and showing raw
+	 * eNames until something else happens to refresh them.
+	 *
+	 * Only genuinely short waits are honoured; anything longer is treated as
+	 * a failure rather than blocking a web request behind it.
+	 *
+	 * @param callable(): \OCP\Http\Client\IResponse $send
+	 * @throws \Throwable the final failure when retries are exhausted
+	 */
+	private function requestWithRateLimitRetry(callable $send, string $w3id): \OCP\Http\Client\IResponse {
+		$attempt = 0;
+		while (true) {
+			try {
+				return $send();
+			} catch (\Throwable $e) {
+				$wait = $this->rateLimitRetryDelay($e);
+				if ($wait === null || $attempt >= self::RATE_LIMIT_MAX_RETRIES) {
+					throw $e;
+				}
+
+				$attempt++;
+				$this->logger->info('eVault rate-limited; waiting before retry', [
+					'w3id' => $w3id,
+					'waitSeconds' => $wait,
+					'attempt' => $attempt,
+				]);
+				sleep($wait);
+			}
+		}
+	}
+
+	/**
+	 * Seconds to wait for a rate-limited request, or null when the failure is
+	 * not a 429 we should wait out.
+	 */
+	private function rateLimitRetryDelay(\Throwable $e): ?int {
+		// The HTTP client is Guzzle underneath, but that is an implementation
+		// detail of the server rather than a dependency this app declares, so
+		// the exception is inspected structurally instead of by class.
+		if (!method_exists($e, 'getResponse')) {
+			return null;
+		}
+
+		$response = $e->getResponse();
+		if ($response === null || $response->getStatusCode() !== 429) {
+			return null;
+		}
+
+		$body = json_decode((string)$response->getBody(), true);
+		$retryAfter = is_array($body) ? ($body['retryAfterSeconds'] ?? null) : null;
+		if (!is_numeric($retryAfter)) {
+			return null;
+		}
+
+		$seconds = (int)ceil((float)$retryAfter);
+		if ($seconds < 1 || $seconds > self::RATE_LIMIT_MAX_WAIT) {
+			return null;
+		}
+
+		// The window is measured server side; land just after it closes.
+		return $seconds + 1;
+	}
+
+	/**
+	 * Place a pointer to someone else's MetaEnvelope in a participant's own
+	 * eVault.
+	 *
+	 * The protocol expects every participant of a shared entity to hold a
+	 * copy in their own vault. Granting ACL access to the owner's envelope is
+	 * not enough on its own: platforms discover entities by listing the
+	 * ontology on *their own user's* vault, so an envelope that lives only in
+	 * the owner's vault is invisible to everyone else. A `reference` envelope
+	 * is the lightweight stand-in the reference implementation writes for the
+	 * other participants -- it names the owning vault and envelope rather
+	 * than duplicating the content.
+	 *
+	 * `$reference` is "<ownerEName>/<globalId>", matching web3-adapter.
+	 *
+	 * Best effort by design: one unreachable participant vault must not fail
+	 * the push that already succeeded for the owner.
+	 */
+	public function storeReference(string $reference, string $targetW3id): bool {
+		$query = <<<'GRAPHQL'
+        mutation StoreMetaEnvelope($input: MetaEnvelopeInput!) {
+            storeMetaEnvelope(input: $input) {
+                metaEnvelope {
+                    id
+                }
+            }
+        }
+        GRAPHQL;
+
+		try {
+			$this->graphql($targetW3id, $query, [
+				'input' => [
+					'ontology' => 'reference',
+					'payload' => ['_by_reference' => $reference],
+					'acl' => ['*'],
+				],
+			]);
+
+			return true;
+		} catch (\Throwable $e) {
+			$this->logger->warning('Failed to store reference on participant eVault', [
+				'reference' => $reference,
+				'targetW3id' => $targetW3id,
+				'exception' => $e->getMessage(),
+			]);
+
+			return false;
+		}
 	}
 
 	/**
@@ -346,10 +472,13 @@ class EvaultClient {
 
 		try {
 			$client = $this->clientService->newClient();
-			$response = $client->get($url, [
-				'timeout' => self::HTTP_TIMEOUT,
-				'headers' => $headers,
-			]);
+			$response = $this->requestWithRateLimitRetry(
+				fn (): \OCP\Http\Client\IResponse => $client->get($url, [
+					'timeout' => self::HTTP_TIMEOUT,
+					'headers' => $headers,
+				]),
+				$w3id,
+			);
 			$body = json_decode($response->getBody(), true);
 			$envelopes = $body['metaEnvelopes'] ?? [];
 			$envelopes = is_array($envelopes) ? $envelopes : [];
@@ -424,7 +553,19 @@ class EvaultClient {
 			$envelopes = $this->listMetaEnvelopesByOntology($w3id, self::USER_SCHEMA_ID);
 			if (empty($envelopes)) {
 				$this->logger->warning('No User profile envelopes returned from eVault', ['w3id' => $w3id]);
-				return null;
+
+				// The by-ontology listing is a single shared, rate-limited
+				// endpoint: it returns every User envelope on the eVault, so
+				// it 429s exactly when several identities resolve at once.
+				// An empty list there does not mean the profile is missing,
+				// and treating it that way leaves the caller with no name to
+				// show. Ask GraphQL for this one identity instead.
+				$own = $this->findOwnProfileEnvelopeId($w3id);
+				if ($own !== null) {
+					$this->cache->set($cacheKey, $own, self::PROFILE_ID_CACHE_TTL);
+				}
+
+				return $own;
 			}
 
 			$canonical = null;
@@ -474,6 +615,59 @@ class EvaultClient {
 				'w3id' => $w3id,
 				'exception' => $e,
 			]);
+			return null;
+		}
+	}
+
+	/**
+	 * Resolve a W3ID's own User profile envelope without the shared
+	 * by-ontology listing.
+	 *
+	 * `graphql()` addresses the identity's own eVault and the filtered
+	 * `metaEnvelopes` query returns only their envelopes, so the eName
+	 * carried in `parsed.ename` identifies the canonical copy the same way
+	 * getProfileEnvelopeId() picks it out of the full listing. This costs a
+	 * request per identity, which is why it is the fallback rather than the
+	 * primary path.
+	 */
+	private function findOwnProfileEnvelopeId(string $w3id): ?string {
+		try {
+			$page = $this->fetchMetaEnvelopes($w3id, self::USER_SCHEMA_ID, 50);
+			$edges = is_array($page['edges'] ?? null) ? $page['edges'] : [];
+
+			$fallback = null;
+			foreach ($edges as $edge) {
+				$node = is_array($edge['node'] ?? null) ? $edge['node'] : [];
+				$envId = is_string($node['id'] ?? null) ? $node['id'] : '';
+				if ($envId === '') {
+					continue;
+				}
+
+				$parsed = is_array($node['parsed'] ?? null) ? $node['parsed'] : [];
+				if (($parsed['ename'] ?? null) === $w3id) {
+					$this->primeProfileCacheEntry($w3id, $envId);
+
+					return $envId;
+				}
+
+				$fallback ??= $envId;
+			}
+
+			if ($fallback !== null) {
+				$this->logger->info('Resolved profile envelope without a parsed.ename match', [
+					'w3id' => $w3id,
+					'envelopeId' => $fallback,
+				]);
+				$this->primeProfileCacheEntry($w3id, $fallback);
+			}
+
+			return $fallback;
+		} catch (\Throwable $e) {
+			$this->logger->warning('Per-identity profile envelope lookup failed', [
+				'w3id' => $w3id,
+				'exception' => $e->getMessage(),
+			]);
+
 			return null;
 		}
 	}

@@ -57,6 +57,7 @@ class ChatSyncService {
 		private W3dsMappingMapper $w3dsMappingMapper,
 		ICacheFactory $cacheFactory,
 		private LoggerInterface $logger,
+		private MentionTranslator $mentionTranslator,
 	) {
 		$this->cache = $cacheFactory->createDistributed(Application::APP_ID);
 	}
@@ -347,6 +348,8 @@ class ChatSyncService {
 					'participantCount' => $newCount,
 					'adminCount' => count($adminW3ids),
 				]);
+
+				$this->fanOutReference($globalId, $w3id, $participantW3ids);
 			} else {
 				$this->logger->error('[W3DS Sync] Failed to create chat MetaEnvelope', ['localId' => $localId]);
 			}
@@ -493,7 +496,7 @@ class ChatSyncService {
 			// eName, for consumers that prefer the stable identifier.
 			'senderId' => $senderId,
 			'senderEName' => $w3id,
-			'content' => (string)($messageData['message'] ?? ''),
+			'content' => $this->mentionTranslator->toWire((string)($messageData['message'] ?? '')),
 			'type' => $this->mapMessageVerbToGlobal($messageData['verb'] ?? 'comment'),
 			'createdAt' => $this->toIso8601($messageData['timestamp'] ?? time()),
 			'updatedAt' => $now,
@@ -502,6 +505,19 @@ class ChatSyncService {
 		];
 
 		$acl = [$w3id]; // At minimum, sender can access
+
+		// Everyone in the room needs to be able to read the message, and
+		// needs a pointer to it in their own vault. Resolved from the live
+		// room rather than the payload: the payload carries envelope IDs,
+		// and references are addressed by eName.
+		[$participantUids] = $this->readRoomState($roomToken, []);
+		$participantW3ids = $this->resolveParticipantW3ids($participantUids);
+		if (!in_array($w3id, $participantW3ids, true)) {
+			$participantW3ids[] = $w3id;
+		}
+		if (count($participantW3ids) > 1) {
+			$acl = $participantW3ids;
+		}
 
 		$existingGlobalId = $this->idMappingMapper->getGlobalId('message', $localId);
 
@@ -516,6 +532,8 @@ class ChatSyncService {
 					'localId' => $localId,
 					'globalId' => $globalId,
 				]);
+
+				$this->fanOutReference($globalId, $w3id, $participantW3ids);
 			} else {
 				$this->logger->error('[W3DS Sync] Failed to create message MetaEnvelope', ['localId' => $localId]);
 			}
@@ -600,13 +618,25 @@ class ChatSyncService {
 			]);
 		}
 
-		// Create the Talk room
-		$roomType = ($data['type'] ?? 'group') === 'direct'
-			? 1  // ONE_TO_ONE
-			: 2; // GROUP
+		// Create the Talk room.
+		//
+		// A two-person chat that carries no title of its own is a DM: most
+		// platforms have no `direct` flag, and a named group is exactly how
+		// they represent one. Talk renders a one-to-one room as the *other
+		// participant*, so routing these through the group path is what left
+		// conversations showing a raw eName.
+		//
+		// The title is the discriminator, not the headcount. A two-person
+		// group someone deliberately named is still a group, and turning it
+		// into a DM would silently discard that name.
+		$roomName = $this->sanitiseInboundRoomName($data['name'] ?? null);
+		$isDirect = ($data['type'] ?? null) === 'direct'
+			|| (count($participantUids) === 2 && $roomName === '');
 
 		try {
-			$roomToken = $this->createTalkRoom($roomType, $data['name'] ?? '', $participantUids);
+			$roomToken = $isDirect
+				? $this->createOneToOneTalkRoom($participantUids)
+				: $this->createTalkRoom(\OCA\Talk\Room::TYPE_GROUP, $roomName, $participantUids);
 			if ($roomToken === null) {
 				return;
 			}
@@ -677,7 +707,16 @@ class ChatSyncService {
 			return;
 		}
 
-		$content = $data['content'] ?? '';
+		// Translate eName mentions back into Talk's `@"uid"` tokens. Talk
+		// derives both the rendered highlight and the mention *notification*
+		// from these tokens, so an untranslated eName means the mentioned
+		// user is never notified.
+		//
+		// Dedup below uses the raw wire content, not this rewritten form:
+		// each participant's replica must produce the same signature, and the
+		// local translation result depends on who is known to this instance.
+		$rawContent = (string)($data['content'] ?? '');
+		$content = $this->mentionTranslator->toTalk($rawContent);
 		$messageType = $data['type'] ?? 'text';
 
 		// Cross-replica dedup: the same logical message lives in every
@@ -694,7 +733,7 @@ class ChatSyncService {
 		// "+1", a re-sent link. Replicas of one logical message can carry
 		// different createdAt values (each platform stamps on replication), so
 		// this trades a rarer duplicate for no longer losing real messages.
-		$signature = $this->messageIdentitySignature($senderUid, $chatGlobalId, $data, $content);
+		$signature = $this->messageIdentitySignature($senderUid, $chatGlobalId, $data, $rawContent);
 		$sigKey = self::MESSAGE_SIG_CACHE_PREFIX . $signature;
 		$existingLocal = $this->cache->get($sigKey);
 		if (is_string($existingLocal) && $existingLocal !== '') {
@@ -1035,12 +1074,92 @@ class ChatSyncService {
 		return false;
 	}
 
+	/**
+	 * Decide what an inbound chat's `name` should become as a Talk room title.
+	 *
+	 * Chats are named by many platforms and the field is not always a title.
+	 * Some send a bare eName, some a JSON array of raw account IDs, some
+	 * nothing at all. Storing those verbatim is worse than storing nothing:
+	 * given an empty name Talk derives one from the participants' display
+	 * names, while a junk name is shown as-is forever.
+	 *
+	 * Only applies to group rooms. A one-to-one room's name is not a title at
+	 * all -- Talk stores the two user IDs as JSON there and reads them back to
+	 * render the other participant -- so those are left to Talk entirely.
+	 *
+	 * Return the name only when it reads like one a human chose.
+	 */
+	private function sanitiseInboundRoomName(mixed $name): string {
+		if (!is_string($name)) {
+			return '';
+		}
+
+		$name = trim($name);
+		if ($name === '') {
+			return '';
+		}
+
+		// A bare eName ("@16894677-...") is an identifier, not a title.
+		if (str_starts_with($name, '@')) {
+			return '';
+		}
+
+		// Serialised participant lists: '["alice_nc","bob_nc"]'.
+		if (str_starts_with($name, '[') || str_starts_with($name, '{')) {
+			return '';
+		}
+
+		// A raw account id, either the eName without its '@' or one of our
+		// derived UIDs ("<uuid>_<hash>").
+		if (preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(_[0-9a-f]+)?$/i', $name)) {
+			return '';
+		}
+
+		return $name;
+	}
+
 	// ---------------------------------------------------------------
 	// Talk interaction helpers
 	// ---------------------------------------------------------------
 
 	private function isTalkAvailable(): bool {
 		return class_exists(\OCA\Talk\Manager::class);
+	}
+
+	/**
+	 * Create (or reuse) Talk's own one-to-one conversation between two users.
+	 *
+	 * Talk gives one-to-one rooms their own type and stores the two user IDs
+	 * in `name`, reading them back to show each side the other person. Going
+	 * through RoomService is what establishes that, so it is not something we
+	 * can imitate by creating a group and naming it ourselves.
+	 *
+	 * Returns null when the pair can't be resolved, so the caller falls back
+	 * rather than silently losing the conversation.
+	 *
+	 * @param string[] $participantUids Exactly two local UIDs.
+	 */
+	private function createOneToOneTalkRoom(array $participantUids): ?string {
+		try {
+			$userManager = \OCP\Server::get(\OCP\IUserManager::class);
+			$actor = $userManager->get($participantUids[0] ?? '');
+			$target = $userManager->get($participantUids[1] ?? '');
+			if ($actor === null || $target === null) {
+				return null;
+			}
+
+			$roomService = \OCP\Server::get(\OCA\Talk\Service\RoomService::class);
+
+			return $roomService->createOneToOneConversation($actor, $target)->getToken();
+		} catch (\Throwable $e) {
+			$this->logger->warning('[W3DS Sync] Could not create one-to-one room, falling back to a group', [
+				'participants' => $participantUids,
+				'exception' => $e->getMessage(),
+			]);
+
+			// A group of the same two people still shows the conversation.
+			return $this->createTalkRoom(\OCA\Talk\Room::TYPE_GROUP, '', $participantUids);
+		}
 	}
 
 	/**
@@ -1052,13 +1171,24 @@ class ChatSyncService {
 
 			$room = $manager->createRoom($type, $name);
 			$participantService = \OCP\Server::get(\OCA\Talk\Service\ParticipantService::class);
+			$userManager = \OCP\Server::get(\OCP\IUserManager::class);
 
 			foreach ($participantUids as $uid) {
 				try {
-					$participantService->addUsers($room, [[
+					// Pass the display name explicitly. Talk stores it on the
+					// attendee row and renders unnamed rooms from those rows,
+					// so omitting it leaves the raw UID (a bare eName) showing
+					// as the other person's name.
+					$user = $userManager->get($uid);
+					$attendee = [
 						'actorType' => 'users',
 						'actorId' => $uid,
-					]]);
+					];
+					if ($user !== null) {
+						$attendee['displayName'] = $user->getDisplayName();
+					}
+
+					$participantService->addUsers($room, [$attendee]);
 				} catch (\Throwable $e) {
 					$this->logger->warning('Failed to add participant to room', [
 						'uid' => $uid,
@@ -1123,8 +1253,12 @@ class ChatSyncService {
 			$manager = \OCP\Server::get(\OCA\Talk\Manager::class);
 			$room = $manager->getRoomByToken($roomToken);
 
-			if (!empty($data['name']) && $room->getName() !== $data['name']) {
-				$room->setName($data['name']);
+			// Same filtering as on create: an identifier arriving in `name`
+			// must not overwrite a room that is currently rendering itself
+			// from its participants.
+			$name = $this->sanitiseInboundRoomName($data['name'] ?? null);
+			if ($name !== '' && $room->getName() !== $name) {
+				$room->setName($name);
 			}
 		} catch (\Throwable $e) {
 			$this->logger->warning('Failed to update local chat', [
@@ -1149,6 +1283,48 @@ class ChatSyncService {
 			'object' => 'file',
 			default => 'text',
 		};
+	}
+
+	/**
+	 * Give every other participant a pointer to an envelope we just wrote to
+	 * the owner's eVault.
+	 *
+	 * An envelope lives in exactly one vault, but platforms discover entities
+	 * by listing an ontology on *their own user's* vault. Without a pointer
+	 * there, a chat or message created here is invisible to every other
+	 * participant's platform no matter how the ACL is set: they never ask the
+	 * owner's vault, because they have no reason to know it holds anything.
+	 * This mirrors what the reference web3-adapter does after a create.
+	 *
+	 * Best effort, and never fatal: the envelope itself is already stored, so
+	 * a participant whose vault is unreachable costs them visibility of this
+	 * one entity rather than failing the push for everyone.
+	 *
+	 * @param string[] $participantW3ids Every participant, owner included.
+	 */
+	private function fanOutReference(string $globalId, string $ownerW3id, array $participantW3ids): void {
+		$others = array_values(array_filter(
+			$participantW3ids,
+			static fn (string $w3id): bool => $w3id !== $ownerW3id,
+		));
+		if (empty($others)) {
+			return;
+		}
+
+		$reference = $ownerW3id . '/' . $globalId;
+		$delivered = 0;
+		foreach ($others as $target) {
+			if ($this->evaultClient->storeReference($reference, $target)) {
+				$delivered++;
+			}
+		}
+
+		$this->logger->info('[W3DS Sync] Fanned out envelope reference to participants', [
+			'globalId' => $globalId,
+			'ownerW3id' => $ownerW3id,
+			'delivered' => $delivered,
+			'targets' => count($others),
+		]);
 	}
 
 	/**

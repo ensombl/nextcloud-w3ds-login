@@ -12,6 +12,8 @@ use OCA\W3dsLogin\Listener\BeforeTemplateRenderedListener;
 use OCA\W3dsLogin\Listener\MessageSentListener;
 use OCA\W3dsLogin\Listener\RoomCreatedListener;
 use OCA\W3dsLogin\Provider\W3dsLoginProvider;
+use OCA\W3dsLogin\Service\IdentityResolver;
+use OCA\W3dsLogin\Service\IdentityResolverInterface;
 use OCP\AppFramework\App;
 use OCP\AppFramework\Bootstrap\IBootContext;
 use OCP\AppFramework\Bootstrap\IBootstrap;
@@ -40,6 +42,10 @@ class Application extends App implements IBootstrap {
 
 	public function register(IRegistrationContext $context): void {
 		$context->registerAlternativeLogin(W3dsLoginProvider::class);
+
+		// Mention translation depends only on a narrow UID <-> eName lookup,
+		// so it takes the interface rather than the database mapper.
+		$context->registerServiceAlias(IdentityResolverInterface::class, IdentityResolver::class);
 
 		// Register Talk event listeners -- Nextcloud resolves lazily,
 		// so these are safe even if Talk is not installed (events just never fire)

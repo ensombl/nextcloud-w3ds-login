@@ -47,10 +47,37 @@ class UserProvisioningService {
 		// Fast path: already mapped.
 		$existing = $this->findMappedUser($w3id);
 		if ($existing !== null) {
+			// The display name is only ever written at creation time, so an
+			// account created while the eVault was unreachable keeps showing
+			// the raw eName forever -- there is no other moment that would
+			// ever correct it. Retry the hydration now that the user is
+			// clearly reachable again.
+			$this->rehydrateIfPlaceholderName($existing, $w3id, $prefetchedProfile);
+
 			return $existing;
 		}
 
 		return $this->createMappedUser($w3id, $tentative, $prefetchedProfile);
+	}
+
+	/**
+	 * Re-run profile hydration for a user still carrying the eName as their
+	 * display name.
+	 *
+	 * Hydration is best-effort by design: a rate-limited or briefly
+	 * unreachable eVault must not block login. But the placeholder it leaves
+	 * behind is permanent, and an eName reads as a raw UUID, so the user (and
+	 * everyone mentioning them) sees `@16894677-6b61-...` instead of a name.
+	 * Cheap to retry, and a no-op once a real name is set.
+	 *
+	 * @param array<string, mixed>|null $prefetchedProfile
+	 */
+	private function rehydrateIfPlaceholderName(IUser $user, string $w3id, ?array $prefetchedProfile = null): void {
+		if ($user->getDisplayName() !== $w3id) {
+			return;
+		}
+
+		$this->hydrateProfileFromEvault($user, $w3id, $prefetchedProfile);
 	}
 
 	/**
@@ -95,6 +122,19 @@ class UserProvisioningService {
 			if ($winner !== null) {
 				return $winner;
 			}
+
+			// No mapping ever appeared, so this is not a race: the account
+			// exists from an earlier attempt whose mapping insert never
+			// landed. Because deriveUsername() is deterministic, that
+			// account belongs to this very w3id and nothing else can claim
+			// it. Adopt it instead of returning null, which would otherwise
+			// leave the identity permanently unusable -- unable to log in,
+			// unable to be mentioned, and stuck displaying its raw eName.
+			$adopted = $this->adoptUnmappedAccount($w3id, $username, $prefetchedProfile);
+			if ($adopted !== null) {
+				return $adopted;
+			}
+
 			$this->logger->error('Failed to create Nextcloud user (username taken, no mapping resolved)', [
 				'w3id' => $w3id,
 				'username' => $username,
@@ -199,6 +239,67 @@ class UserProvisioningService {
 	}
 
 	/**
+	 * Claim an existing NC account that was provisioned for this W3ID but
+	 * never got its mapping row.
+	 *
+	 * deriveUsername() is a pure function of the w3id, so an account holding
+	 * that exact username was created for this identity and no other. Writing
+	 * the missing mapping is therefore a repair, not a guess.
+	 *
+	 * Returns null if the account cannot be adopted, including when another
+	 * mapping already claims it, so a mismatch is never papered over.
+	 *
+	 * @param array<string, mixed>|null $prefetchedProfile
+	 */
+	private function adoptUnmappedAccount(string $w3id, string $username, ?array $prefetchedProfile): ?IUser {
+		$user = $this->userManager->get($username);
+		if ($user === null) {
+			return null;
+		}
+
+		try {
+			$this->mapper->findByNcUid($username);
+
+			// Already mapped, to a different w3id than the one we were asked
+			// for. Two identities deriving one username would be a hash
+			// collision; refuse rather than retarget someone's account.
+			$this->logger->error('Refusing to adopt an account mapped to another W3ID', [
+				'w3id' => $w3id,
+				'uid' => $username,
+			]);
+
+			return null;
+		} catch (DoesNotExistException) {
+			// Unmapped, as expected for the repair case.
+		}
+
+		$mapping = new W3dsMapping();
+		$mapping->setW3id($w3id);
+		$mapping->setNcUid($username);
+		$mapping->setCreatedAt(time());
+		try {
+			$this->mapper->insert($mapping);
+		} catch (\Throwable $e) {
+			$this->logger->error('Failed to adopt orphaned W3DS account', [
+				'w3id' => $w3id,
+				'uid' => $username,
+				'exception' => $e->getMessage(),
+			]);
+
+			return null;
+		}
+
+		$this->logger->info('Adopted orphaned W3DS account missing its mapping', [
+			'w3id' => $w3id,
+			'uid' => $username,
+		]);
+
+		$this->rehydrateIfPlaceholderName($user, $w3id, $prefetchedProfile);
+
+		return $user;
+	}
+
+	/**
 	 * Copy the user's displayName and email from their eVault User profile
 	 * onto the freshly-created NC account. Never throws: a broken eVault
 	 * must not prevent login.
@@ -243,19 +344,32 @@ class UserProvisioningService {
 	}
 
 	/**
+	 * Best display name a profile can offer, falling back to the eName.
+	 *
+	 * Profiles are written by several platforms and are not consistent about
+	 * name fields: some send `displayName`, some the schema.org
+	 * `givenName`/`familyName` pair, some plain `firstName`/`lastName`.
+	 * A profile that only carries the latter is a real person with a real
+	 * name, so ignoring that shape shows them a raw UUID for no reason.
+	 *
+	 * A `displayName` equal to the eName is a placeholder the profile itself
+	 * never filled in, so the name parts are preferred over it.
+	 *
 	 * @param array<string, mixed> $parsed
 	 */
 	private function pickDisplayName(array $parsed, string $w3id): string {
 		$candidate = $parsed['displayName'] ?? null;
-		if (is_string($candidate) && trim($candidate) !== '') {
+		if (is_string($candidate) && trim($candidate) !== '' && trim($candidate) !== $w3id) {
 			return trim($candidate);
 		}
 
-		$given = is_string($parsed['givenName'] ?? null) ? trim($parsed['givenName']) : '';
-		$family = is_string($parsed['familyName'] ?? null) ? trim($parsed['familyName']) : '';
-		$joined = trim($given . ' ' . $family);
-		if ($joined !== '') {
-			return $joined;
+		foreach ([['givenName', 'familyName'], ['firstName', 'lastName']] as [$first, $last]) {
+			$a = is_string($parsed[$first] ?? null) ? trim($parsed[$first]) : '';
+			$b = is_string($parsed[$last] ?? null) ? trim($parsed[$last]) : '';
+			$joined = trim($a . ' ' . $b);
+			if ($joined !== '') {
+				return $joined;
+			}
 		}
 
 		return $w3id;
