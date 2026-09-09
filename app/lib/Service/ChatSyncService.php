@@ -27,6 +27,7 @@ class ChatSyncService {
 	private const PULL_LIST_CACHE_TTL = 120; // 2 min for chat/message ontology lists during pull sync
 	private const POLL_PAGE_SIZE = 50; // per-page size when walking a chat's messages
 	private const POLL_MAX_PAGES = 20; // per-participant page budget for one poll (~1000 messages)
+	private const MAX_CLOCK_SKEW = 300; // 5 min tolerance for a future-dated inbound createdAt
 
 	private ICache $cache;
 
@@ -1287,9 +1288,11 @@ class ChatSyncService {
 	 * Returns the current time when the value is missing, unparseable, or not
 	 * plausibly a send time: an empty stamp must not push a message to the
 	 * epoch, where it would sort to the very top of the room forever. Future
-	 * stamps are clamped to now for the same reason, in the other direction.
-	 * Accepts ISO 8601 as written by pushMessage() and bare Unix seconds,
-	 * since other platforms write both.
+	 * stamps are clamped to now for the same reason, in the other direction,
+	 * but only past a tolerance: a peer whose clock runs a little fast is
+	 * ordinary, not garbage, so stamps within MAX_CLOCK_SKEW of now are kept
+	 * as sent. Accepts ISO 8601 as written by pushMessage() and bare Unix
+	 * seconds, since other platforms write both.
 	 */
 	private function parseCreatedAt(?string $createdAt): \DateTime {
 		$now = new \DateTime();
@@ -1308,7 +1311,7 @@ class ChatSyncService {
 		}
 
 		$timestamp = $parsed->getTimestamp();
-		if ($timestamp <= 0 || $timestamp > $now->getTimestamp()) {
+		if ($timestamp <= 0 || $timestamp > $now->getTimestamp() + self::MAX_CLOCK_SKEW) {
 			return $now;
 		}
 
