@@ -195,19 +195,27 @@ class W3dsCollaboratorPlugin implements ISearchPlugin {
 	}
 
 	/**
+	 * Best display name a profile can offer, falling back to the eName.
+	 * Mirrors UserProvisioningService::pickDisplayName so a user is labelled
+	 * the same in the picker as on their provisioned account.
+	 *
 	 * @param array<string, mixed> $parsed
 	 */
 	private function pickDisplayName(array $parsed, string $w3id): string {
 		$candidate = $parsed['displayName'] ?? null;
-		if (is_string($candidate) && trim($candidate) !== '') {
+		if (is_string($candidate) && trim($candidate) !== '' && trim($candidate) !== $w3id) {
 			return trim($candidate);
 		}
-		$given = is_string($parsed['givenName'] ?? null) ? trim($parsed['givenName']) : '';
-		$family = is_string($parsed['familyName'] ?? null) ? trim($parsed['familyName']) : '';
-		$joined = trim($given . ' ' . $family);
-		if ($joined !== '') {
-			return $joined;
+
+		foreach ([['givenName', 'familyName'], ['firstName', 'lastName']] as [$first, $last]) {
+			$a = is_string($parsed[$first] ?? null) ? trim($parsed[$first]) : '';
+			$b = is_string($parsed[$last] ?? null) ? trim($parsed[$last]) : '';
+			$joined = trim($a . ' ' . $b);
+			if ($joined !== '') {
+				return $joined;
+			}
 		}
+
 		return $w3id;
 	}
 
