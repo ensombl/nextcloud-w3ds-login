@@ -8,6 +8,7 @@ volumes/
 # PHP dependencies
 vendor/
 app/vendor/
+composer.phar
 app/vendor-bin/*/vendor/
 
 # Docker autoloader symlink (app/app -> . for container path resolution)
