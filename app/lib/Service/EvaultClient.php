@@ -230,6 +230,56 @@ class EvaultClient {
 	}
 
 	/**
+	 * Place a pointer to someone else's MetaEnvelope in a participant's own
+	 * eVault.
+	 *
+	 * The protocol expects every participant of a shared entity to hold a
+	 * copy in their own vault. Granting ACL access to the owner's envelope is
+	 * not enough on its own: platforms discover entities by listing the
+	 * ontology on *their own user's* vault, so an envelope that lives only in
+	 * the owner's vault is invisible to everyone else. A `reference` envelope
+	 * is the lightweight stand-in the reference implementation writes for the
+	 * other participants -- it names the owning vault and envelope rather
+	 * than duplicating the content.
+	 *
+	 * `$reference` is "<ownerEName>/<globalId>", matching web3-adapter.
+	 *
+	 * Best effort by design: one unreachable participant vault must not fail
+	 * the push that already succeeded for the owner.
+	 */
+	public function storeReference(string $reference, string $targetW3id): bool {
+		$query = <<<'GRAPHQL'
+        mutation StoreMetaEnvelope($input: MetaEnvelopeInput!) {
+            storeMetaEnvelope(input: $input) {
+                metaEnvelope {
+                    id
+                }
+            }
+        }
+        GRAPHQL;
+
+		try {
+			$this->graphql($targetW3id, $query, [
+				'input' => [
+					'ontology' => 'reference',
+					'payload' => ['_by_reference' => $reference],
+					'acl' => ['*'],
+				],
+			]);
+
+			return true;
+		} catch (\Throwable $e) {
+			$this->logger->warning('Failed to store reference on participant eVault', [
+				'reference' => $reference,
+				'targetW3id' => $targetW3id,
+				'exception' => $e->getMessage(),
+			]);
+
+			return false;
+		}
+	}
+
+	/**
 	 * Create a MetaEnvelope in a user's eVault.
 	 *
 	 * @return string|null The created MetaEnvelope ID, or null on failure

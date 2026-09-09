@@ -348,6 +348,8 @@ class ChatSyncService {
 					'participantCount' => $newCount,
 					'adminCount' => count($adminW3ids),
 				]);
+
+				$this->fanOutReference($globalId, $w3id, $participantW3ids);
 			} else {
 				$this->logger->error('[W3DS Sync] Failed to create chat MetaEnvelope', ['localId' => $localId]);
 			}
@@ -504,6 +506,19 @@ class ChatSyncService {
 
 		$acl = [$w3id]; // At minimum, sender can access
 
+		// Everyone in the room needs to be able to read the message, and
+		// needs a pointer to it in their own vault. Resolved from the live
+		// room rather than the payload: the payload carries envelope IDs,
+		// and references are addressed by eName.
+		[$participantUids] = $this->readRoomState($roomToken, []);
+		$participantW3ids = $this->resolveParticipantW3ids($participantUids);
+		if (!in_array($w3id, $participantW3ids, true)) {
+			$participantW3ids[] = $w3id;
+		}
+		if (count($participantW3ids) > 1) {
+			$acl = $participantW3ids;
+		}
+
 		$existingGlobalId = $this->idMappingMapper->getGlobalId('message', $localId);
 
 		if ($existingGlobalId !== null) {
@@ -517,6 +532,8 @@ class ChatSyncService {
 					'localId' => $localId,
 					'globalId' => $globalId,
 				]);
+
+				$this->fanOutReference($globalId, $w3id, $participantW3ids);
 			} else {
 				$this->logger->error('[W3DS Sync] Failed to create message MetaEnvelope', ['localId' => $localId]);
 			}
@@ -1159,6 +1176,48 @@ class ChatSyncService {
 			'object' => 'file',
 			default => 'text',
 		};
+	}
+
+	/**
+	 * Give every other participant a pointer to an envelope we just wrote to
+	 * the owner's eVault.
+	 *
+	 * An envelope lives in exactly one vault, but platforms discover entities
+	 * by listing an ontology on *their own user's* vault. Without a pointer
+	 * there, a chat or message created here is invisible to every other
+	 * participant's platform no matter how the ACL is set: they never ask the
+	 * owner's vault, because they have no reason to know it holds anything.
+	 * This mirrors what the reference web3-adapter does after a create.
+	 *
+	 * Best effort, and never fatal: the envelope itself is already stored, so
+	 * a participant whose vault is unreachable costs them visibility of this
+	 * one entity rather than failing the push for everyone.
+	 *
+	 * @param string[] $participantW3ids Every participant, owner included.
+	 */
+	private function fanOutReference(string $globalId, string $ownerW3id, array $participantW3ids): void {
+		$others = array_values(array_filter(
+			$participantW3ids,
+			static fn (string $w3id): bool => $w3id !== $ownerW3id,
+		));
+		if (empty($others)) {
+			return;
+		}
+
+		$reference = $ownerW3id . '/' . $globalId;
+		$delivered = 0;
+		foreach ($others as $target) {
+			if ($this->evaultClient->storeReference($reference, $target)) {
+				$delivered++;
+			}
+		}
+
+		$this->logger->info('[W3DS Sync] Fanned out envelope reference to participants', [
+			'globalId' => $globalId,
+			'ownerW3id' => $ownerW3id,
+			'delivered' => $delivered,
+			'targets' => count($others),
+		]);
 	}
 
 	/**
