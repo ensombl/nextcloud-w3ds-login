@@ -424,7 +424,19 @@ class EvaultClient {
 			$envelopes = $this->listMetaEnvelopesByOntology($w3id, self::USER_SCHEMA_ID);
 			if (empty($envelopes)) {
 				$this->logger->warning('No User profile envelopes returned from eVault', ['w3id' => $w3id]);
-				return null;
+
+				// The by-ontology listing is a single shared, rate-limited
+				// endpoint: it returns every User envelope on the eVault, so
+				// it 429s exactly when several identities resolve at once.
+				// An empty list there does not mean the profile is missing,
+				// and treating it that way leaves the caller with no name to
+				// show. Ask GraphQL for this one identity instead.
+				$own = $this->findOwnProfileEnvelopeId($w3id);
+				if ($own !== null) {
+					$this->cache->set($cacheKey, $own, self::PROFILE_ID_CACHE_TTL);
+				}
+
+				return $own;
 			}
 
 			$canonical = null;
@@ -474,6 +486,59 @@ class EvaultClient {
 				'w3id' => $w3id,
 				'exception' => $e,
 			]);
+			return null;
+		}
+	}
+
+	/**
+	 * Resolve a W3ID's own User profile envelope without the shared
+	 * by-ontology listing.
+	 *
+	 * `graphql()` addresses the identity's own eVault and the filtered
+	 * `metaEnvelopes` query returns only their envelopes, so the eName
+	 * carried in `parsed.ename` identifies the canonical copy the same way
+	 * getProfileEnvelopeId() picks it out of the full listing. This costs a
+	 * request per identity, which is why it is the fallback rather than the
+	 * primary path.
+	 */
+	private function findOwnProfileEnvelopeId(string $w3id): ?string {
+		try {
+			$page = $this->fetchMetaEnvelopes($w3id, self::USER_SCHEMA_ID, 50);
+			$edges = is_array($page['edges'] ?? null) ? $page['edges'] : [];
+
+			$fallback = null;
+			foreach ($edges as $edge) {
+				$node = is_array($edge['node'] ?? null) ? $edge['node'] : [];
+				$envId = is_string($node['id'] ?? null) ? $node['id'] : '';
+				if ($envId === '') {
+					continue;
+				}
+
+				$parsed = is_array($node['parsed'] ?? null) ? $node['parsed'] : [];
+				if (($parsed['ename'] ?? null) === $w3id) {
+					$this->primeProfileCacheEntry($w3id, $envId);
+
+					return $envId;
+				}
+
+				$fallback ??= $envId;
+			}
+
+			if ($fallback !== null) {
+				$this->logger->info('Resolved profile envelope without a parsed.ename match', [
+					'w3id' => $w3id,
+					'envelopeId' => $fallback,
+				]);
+				$this->primeProfileCacheEntry($w3id, $fallback);
+			}
+
+			return $fallback;
+		} catch (\Throwable $e) {
+			$this->logger->warning('Per-identity profile envelope lookup failed', [
+				'w3id' => $w3id,
+				'exception' => $e->getMessage(),
+			]);
+
 			return null;
 		}
 	}

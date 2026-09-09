@@ -47,10 +47,37 @@ class UserProvisioningService {
 		// Fast path: already mapped.
 		$existing = $this->findMappedUser($w3id);
 		if ($existing !== null) {
+			// The display name is only ever written at creation time, so an
+			// account created while the eVault was unreachable keeps showing
+			// the raw eName forever -- there is no other moment that would
+			// ever correct it. Retry the hydration now that the user is
+			// clearly reachable again.
+			$this->rehydrateIfPlaceholderName($existing, $w3id, $prefetchedProfile);
+
 			return $existing;
 		}
 
 		return $this->createMappedUser($w3id, $tentative, $prefetchedProfile);
+	}
+
+	/**
+	 * Re-run profile hydration for a user still carrying the eName as their
+	 * display name.
+	 *
+	 * Hydration is best-effort by design: a rate-limited or briefly
+	 * unreachable eVault must not block login. But the placeholder it leaves
+	 * behind is permanent, and an eName reads as a raw UUID, so the user (and
+	 * everyone mentioning them) sees `@16894677-6b61-...` instead of a name.
+	 * Cheap to retry, and a no-op once a real name is set.
+	 *
+	 * @param array<string, mixed>|null $prefetchedProfile
+	 */
+	private function rehydrateIfPlaceholderName(IUser $user, string $w3id, ?array $prefetchedProfile = null): void {
+		if ($user->getDisplayName() !== $w3id) {
+			return;
+		}
+
+		$this->hydrateProfileFromEvault($user, $w3id, $prefetchedProfile);
 	}
 
 	/**
