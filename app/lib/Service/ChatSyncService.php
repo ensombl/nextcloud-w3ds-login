@@ -711,7 +711,13 @@ class ChatSyncService {
 		// before we know the resulting local ID.
 		$this->beginInboundPost($senderUid, $roomToken);
 		try {
-			$localMessageId = $this->postTalkMessage($roomToken, $senderUid, $content, $messageType);
+			$localMessageId = $this->postTalkMessage(
+				$roomToken,
+				$senderUid,
+				$content,
+				$messageType,
+				is_string($data['createdAt'] ?? null) ? $data['createdAt'] : null,
+			);
 			if ($localMessageId === null) {
 				return;
 			}
@@ -1070,14 +1076,24 @@ class ChatSyncService {
 	/**
 	 * Post a message to a Talk room on behalf of a user. Returns the comment ID or null.
 	 */
-	private function postTalkMessage(string $roomToken, string $senderUid, string $content, string $messageType): ?string {
+	private function postTalkMessage(
+		string $roomToken,
+		string $senderUid,
+		string $content,
+		string $messageType,
+		?string $createdAt = null,
+	): ?string {
 		try {
 			$manager = \OCP\Server::get(\OCA\Talk\Manager::class);
 			$room = $manager->getRoomByToken($roomToken);
 
 			$chatManager = \OCP\Server::get(\OCA\Talk\Chat\ChatManager::class);
 
-			$creationDateTime = new \DateTime();
+			// Stamp the message with the time the sender actually sent it.
+			// Using "now" instead makes every backfilled message look like it
+			// arrived at ingest time, so a poll that catches up on yesterday's
+			// conversation renders the whole of it as today.
+			$creationDateTime = $this->parseCreatedAt($createdAt);
 			$comment = $chatManager->sendMessage(
 				$room,
 				null,
@@ -1264,6 +1280,40 @@ class ChatSyncService {
 	// ---------------------------------------------------------------
 	// Utility
 	// ---------------------------------------------------------------
+
+	/**
+	 * Interpret an envelope's `createdAt` as the message's send time.
+	 *
+	 * Returns the current time when the value is missing, unparseable, or not
+	 * plausibly a send time: an empty stamp must not push a message to the
+	 * epoch, where it would sort to the very top of the room forever. Future
+	 * stamps are clamped to now for the same reason, in the other direction.
+	 * Accepts ISO 8601 as written by pushMessage() and bare Unix seconds,
+	 * since other platforms write both.
+	 */
+	private function parseCreatedAt(?string $createdAt): \DateTime {
+		$now = new \DateTime();
+		if ($createdAt === null || trim($createdAt) === '') {
+			return $now;
+		}
+
+		$createdAt = trim($createdAt);
+
+		try {
+			$parsed = ctype_digit($createdAt)
+				? (new \DateTime())->setTimestamp((int)$createdAt)
+				: new \DateTime($createdAt);
+		} catch (\Throwable) {
+			return $now;
+		}
+
+		$timestamp = $parsed->getTimestamp();
+		if ($timestamp <= 0 || $timestamp > $now->getTimestamp()) {
+			return $now;
+		}
+
+		return $parsed;
+	}
 
 	private function toIso8601(int|string $timestamp): string {
 		if (is_string($timestamp)) {
