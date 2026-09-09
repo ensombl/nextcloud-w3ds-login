@@ -304,7 +304,16 @@ class UserProvisioningService {
 		}
 
 		try {
-			$this->mapper->findByNcUid($username);
+			$existingMapping = $this->mapper->findByNcUid($username);
+
+			// Mapped to the very w3id we were asked for. The lookup at the
+			// top of findOrCreateUser missed it because the mapping landed
+			// concurrently, so this is simply the winner of a race we lost:
+			// return it. Treating this as a conflict is what left a peer
+			// unprovisioned and therefore missing from their conversations.
+			if ($existingMapping->getW3id() === $w3id) {
+				return $user;
+			}
 
 			// Already mapped, to a different w3id than the one we were asked
 			// for. Two identities deriving one username would be a hash
@@ -312,6 +321,7 @@ class UserProvisioningService {
 			$this->logger->error('Refusing to adopt an account mapped to another W3ID', [
 				'w3id' => $w3id,
 				'uid' => $username,
+				'mappedW3id' => $existingMapping->getW3id(),
 			]);
 
 			return null;
