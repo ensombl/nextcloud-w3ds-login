@@ -1,4 +1,4 @@
-.PHONY: dev down logs occ shell enable restart clean test lint cs appstore
+.PHONY: dev down logs occ shell enable restart clean test test-mentions lint cs appstore
 
 dev:
 	docker compose up --build -d
@@ -26,6 +26,13 @@ clean:
 
 test:
 	composer run test
+
+# Show how @ mentions translate in both directions, without needing a running
+# Nextcloud, two linked accounts, or a poll cycle. Runs in a throwaway PHP
+# container when php isn't installed locally.
+test-mentions:
+	@php tests/mention-roundtrip.php 2>/dev/null \
+		|| docker run --rm -v "$$PWD":/w -w /w php:8.3-cli php tests/mention-roundtrip.php
 
 lint:
 	composer run lint
