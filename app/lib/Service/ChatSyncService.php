@@ -618,22 +618,25 @@ class ChatSyncService {
 			]);
 		}
 
-		// Create the Talk room. A chat between exactly two people is a
-		// one-to-one conversation even when the sending platform didn't label
-		// it `direct`: most of them have no such concept, and Talk renders a
-		// one-to-one room as the *other participant* rather than needing a
-		// title. Treating those as groups is what left rooms displaying a raw
-		// eName in the conversation list.
-		$isDirect = ($data['type'] ?? null) === 'direct' || count($participantUids) === 2;
+		// Create the Talk room.
+		//
+		// A two-person chat that carries no title of its own is a DM: most
+		// platforms have no `direct` flag, and a named group is exactly how
+		// they represent one. Talk renders a one-to-one room as the *other
+		// participant*, so routing these through the group path is what left
+		// conversations showing a raw eName.
+		//
+		// The title is the discriminator, not the headcount. A two-person
+		// group someone deliberately named is still a group, and turning it
+		// into a DM would silently discard that name.
+		$roomName = $this->sanitiseInboundRoomName($data['name'] ?? null);
+		$isDirect = ($data['type'] ?? null) === 'direct'
+			|| (count($participantUids) === 2 && $roomName === '');
 
 		try {
 			$roomToken = $isDirect
 				? $this->createOneToOneTalkRoom($participantUids)
-				: $this->createTalkRoom(
-					\OCA\Talk\Room::TYPE_GROUP,
-					$this->sanitiseInboundRoomName($data['name'] ?? null),
-					$participantUids,
-				);
+				: $this->createTalkRoom(\OCA\Talk\Room::TYPE_GROUP, $roomName, $participantUids);
 			if ($roomToken === null) {
 				return;
 			}
