@@ -126,6 +126,42 @@ class IdMappingMapper extends QBMapper {
 	}
 
 	/**
+	 * Atomically claim a key, returning false if someone already holds it.
+	 *
+	 * The unique index on (entity_type, global_id) is the arbiter: exactly
+	 * one concurrent inserter can win, and the loser sees the constraint
+	 * violation. Used to serialise ingest of a single inbound envelope
+	 * across simultaneous requests, which a cache-based lock cannot do
+	 * reliably because it degrades to per-request storage when no
+	 * distributed cache is configured.
+	 */
+	public function tryClaim(string $entityType, string $claimKey, string $ownerW3id): bool {
+		try {
+			$this->storeMapping($entityType, $claimKey, $claimKey, $ownerW3id, 'claim');
+
+			return true;
+		} catch (\Throwable) {
+			return false;
+		}
+	}
+
+	/**
+	 * Release a claim taken by tryClaim(), so a later retry can proceed.
+	 */
+	public function releaseClaim(string $entityType, string $claimKey): void {
+		try {
+			$qb = $this->db->getQueryBuilder();
+			$qb->delete($this->getTableName())
+				->where($qb->expr()->eq('entity_type', $qb->createNamedParameter($entityType)))
+				->andWhere($qb->expr()->eq('local_id', $qb->createNamedParameter($claimKey)));
+			$qb->executeStatement();
+		} catch (\Throwable) {
+			// A stranded claim only blocks re-processing of one envelope that
+			// already failed; never worth surfacing over the original error.
+		}
+	}
+
+	/**
 	 * @return IdMapping[]
 	 */
 	public function findAllByOwner(string $ownerW3id, string $entityType): array {

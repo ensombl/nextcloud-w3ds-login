@@ -27,6 +27,7 @@ Features:
     </dependencies>
     <commands>
         <command>OCA\W3dsLogin\Command\DedupeMappingsCommand</command>
+        <command>OCA\W3dsLogin\Command\PruneEchoedMessagesCommand</command>
     </commands>
     <settings>
         <personal>OCA\W3dsLogin\Settings\PersonalSettings</personal>

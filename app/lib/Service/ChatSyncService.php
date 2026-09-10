@@ -49,6 +49,11 @@ class ChatSyncService {
 	 * rows so counting occurrences never scans them.
 	 */
 	private const MESSAGE_OCC_ENTITY = 'message_occ';
+	/**
+	 * Entity type for the short-lived row that serialises ingest of a single
+	 * inbound envelope across concurrent requests.
+	 */
+	private const INGEST_CLAIM_ENTITY = 'ingest_claim';
 	private const CHAT_PARTICIPANT_HWM_PREFIX = 'w3ds_chat_pmax_';
 	private const CHAT_PARTICIPANT_HWM_TTL = 604800; // 7d high-water mark guard against pushChat shrinkage
 	private const PULL_LIST_CACHE_TTL = 120; // 2 min for chat/message ontology lists during pull sync
@@ -490,6 +495,41 @@ class ChatSyncService {
 			return;
 		}
 
+		// Serialise outbound push of this comment. Talk can deliver the same
+		// message event to more than one worker (and our own share-adoption
+		// path can race a poll), and the "already pushed?" check below is a
+		// read that several requests can pass at once -- each then creating
+		// its own envelope, which is how duplicates ended up written to the
+		// eVault. The unique index picks exactly one winner.
+		$pushClaimKey = 'push|' . $localId;
+		if (!$this->idMappingMapper->tryClaim(self::INGEST_CLAIM_ENTITY, $pushClaimKey, $w3id)) {
+			return;
+		}
+
+		try {
+			$this->pushMessageClaimed($ncUid, $w3id, $messageData, $roomToken, $localId);
+		} finally {
+			$this->idMappingMapper->releaseClaim(self::INGEST_CLAIM_ENTITY, $pushClaimKey);
+		}
+	}
+
+	/**
+	 * Push one Talk comment outbound. Callers must hold the push claim for
+	 * this comment; see pushMessage().
+	 */
+	private function pushMessageClaimed(
+		string $ncUid,
+		string $w3id,
+		array $messageData,
+		string $roomToken,
+		string $localId,
+	): void {
+		// Re-check under the claim: a request that finished between our first
+		// look and winning the claim has already pushed this comment.
+		if ($this->idMappingMapper->getGlobalId('message', $localId) !== null) {
+			return;
+		}
+
 		// If this message is being posted by handleInboundMessage right now,
 		// skip -- otherwise we'd ping-pong the message we just received.
 		if ($this->isInboundPostActive($ncUid, $roomToken)) {
@@ -742,6 +782,47 @@ class ChatSyncService {
 		$existingLocalId = $this->idMappingMapper->getLocalId('message', $globalId);
 		if ($existingLocalId !== null) {
 			return; // Already exists
+		}
+
+		// Serialise ingest of this envelope across concurrent requests.
+		//
+		// The duplicate check above only sees work that has already
+		// *finished*. Ingest is slow -- resolving the sender, downloading an
+		// attachment, posting into Talk -- and pollRoom() is driven by every
+		// open browser tab every 15s, alongside the cron PullSyncJob and the
+		// webhook. Several of those overlap constantly, so each one read "not
+		// yet ingested" for the same envelope and all of them went on to post
+		// it. That is why a message could arrive three or four times rather
+		// than merely twice.
+		//
+		// The claim is a row insert, so the database's unique index decides
+		// the winner. A cache-based lock cannot: without Redis configured
+		// `createDistributed()` is a per-request store, and every one of these
+		// requests is a different process.
+		$claimKey = 'ingest|' . $globalId;
+		if (!$this->idMappingMapper->tryClaim(self::INGEST_CLAIM_ENTITY, $claimKey, $ownerW3id)) {
+			return; // Another request is ingesting this envelope right now.
+		}
+
+		try {
+			$this->ingestInboundMessage($globalId, $ownerW3id, $data);
+		} finally {
+			// Released so a failed attempt can be retried on the next poll.
+			// The mapping written on success is what prevents re-ingest, not
+			// this claim.
+			$this->idMappingMapper->releaseClaim(self::INGEST_CLAIM_ENTITY, $claimKey);
+		}
+	}
+
+	/**
+	 * Ingest one inbound Message envelope. Callers must hold the ingest claim
+	 * for this envelope; see handleInboundMessage().
+	 */
+	private function ingestInboundMessage(string $globalId, string $ownerW3id, array $data): void {
+		// Re-check under the claim: a request that finished between our first
+		// look and winning the claim has already posted this.
+		if ($this->idMappingMapper->getLocalId('message', $globalId) !== null) {
+			return;
 		}
 
 		// Resolve the chat

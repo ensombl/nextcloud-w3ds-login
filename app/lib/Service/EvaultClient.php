@@ -818,6 +818,35 @@ class EvaultClient {
 	}
 
 	/**
+	 * Delete a MetaEnvelope from a user's eVault.
+	 *
+	 * Only used to retract envelopes this instance wrote in error, such as
+	 * the duplicate messages produced by the inbound-attachment loopback.
+	 * Deletion is permanent, so callers must be certain of the target.
+	 */
+	public function deleteMetaEnvelope(string $w3id, string $globalId): bool {
+		$query = <<<'GRAPHQL'
+        mutation DeleteMetaEnvelope($id: String!) {
+            deleteMetaEnvelope(id: $id)
+        }
+        GRAPHQL;
+
+		try {
+			$data = $this->graphql($w3id, $query, ['id' => $globalId]);
+
+			return ($data['deleteMetaEnvelope'] ?? false) === true;
+		} catch (\Throwable $e) {
+			$this->logger->warning('Failed to delete MetaEnvelope', [
+				'w3id' => $w3id,
+				'globalId' => $globalId,
+				'exception' => $e->getMessage(),
+			]);
+
+			return false;
+		}
+	}
+
+	/**
 	 * Fetch a single MetaEnvelope by ID. Used for read-back verification.
 	 *
 	 * @return array<string, mixed>|null Decoded envelope (id, ontology, parsed) or null
