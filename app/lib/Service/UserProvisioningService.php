@@ -100,8 +100,16 @@ class UserProvisioningService {
 	public function refreshAvatarIfStale(IUser $user, string $w3id): void {
 		try {
 			$uid = $user->getUID();
+
+			// An avatar Nextcloud cannot resize renders as initials in every
+			// place that asks for a size it has not already cached, and the
+			// throttle below would otherwise leave it that way for a day
+			// after the fix that would repair it. Bypass the throttle for
+			// that specific, self-diagnosing case.
+			$needsRepair = $this->avatarSync->storedAvatarNeedsRepair($uid);
+
 			$last = (int)$this->config->getUserValue($uid, Application::APP_ID, self::AVATAR_CHECKED_AT_KEY, '0');
-			if ($last > 0 && (time() - $last) < self::AVATAR_REFRESH_INTERVAL) {
+			if (!$needsRepair && $last > 0 && (time() - $last) < self::AVATAR_REFRESH_INTERVAL) {
 				return;
 			}
 

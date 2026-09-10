@@ -183,7 +183,7 @@ class PruneEchoedMessagesCommand extends Command {
 
 		try {
 			$qb = $this->db->getQueryBuilder();
-			$qb->select('msg', 'verb')
+			$qb->select('message', 'verb')
 				->from('comments')
 				->where($qb->expr()->eq('id', $qb->createNamedParameter($commentId)));
 			$result = $qb->executeQuery();
@@ -197,7 +197,7 @@ class PruneEchoedMessagesCommand extends Command {
 			return null;
 		}
 
-		return (string)($row['msg'] ?? '');
+		return (string)($row['message'] ?? '');
 	}
 
 	private function extractShareId(string $commentMessage): ?string {

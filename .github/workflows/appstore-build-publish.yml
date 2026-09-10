@@ -58,6 +58,10 @@ jobs:
           # Copy vendor (runtime deps like php-qrcode)
           rsync -a \
             "${{ env.APP_NAME }}/vendor/" "build/${{ env.APP_NAME }}/vendor/"
+          # The AGPL obliges us to convey the licence with the binary, and the
+          # rsync above only takes app/, so the repository-root LICENSE would
+          # otherwise never reach anyone installing from the app store.
+          cp "${{ env.APP_NAME }}/LICENSE" "build/${{ env.APP_NAME }}/LICENSE"
 
       - name: Create tarball
         run: |

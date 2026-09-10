@@ -38,6 +38,34 @@ class AvatarSyncService {
 	 * against a hostile or misconfigured host streaming us something huge. */
 	private const MAX_BYTES = 5 * 1024 * 1024;
 
+	/**
+	 * Longest edge we are willing to store, in pixels.
+	 *
+	 * Nextcloud never renders an avatar above 512, but it does resize the
+	 * stored original on demand, and that resize runs inside a web request.
+	 * A modern phone camera picture is several thousand pixels square, which
+	 * GD must decode uncompressed -- 3648x3648 needs ~110MB, comfortably over
+	 * the 128M memory_limit a default PHP-FPM pool ships with. The decode
+	 * then fails, the avatar endpoint 500s for that one size, and the user
+	 * silently falls back to their initials in exactly the places that ask
+	 * for the large variant, such as Talk's conversation list.
+	 *
+	 * Storing at the largest size anything actually displays removes that
+	 * failure mode regardless of how the admin has tuned PHP.
+	 */
+	private const MAX_DIMENSION = 512;
+
+	/**
+	 * Hard ceiling on the pixel count we are willing to decode at all.
+	 *
+	 * MAX_BYTES bounds the compressed size, which says nothing about the
+	 * decoded size: a highly compressible image can be a few hundred KB on
+	 * the wire and gigabytes in memory. The dimensions are read from the
+	 * header first, and anything beyond this is refused before GD allocates
+	 * anything.
+	 */
+	private const MAX_PIXELS = 50_000_000;
+
 	private const REQUEST_TIMEOUT = 10;
 
 	/**
@@ -104,6 +132,37 @@ class AvatarSyncService {
 				'exception' => $e->getMessage(),
 			]);
 			return false;
+		}
+	}
+
+	/**
+	 * True when the avatar already stored for this user is one Nextcloud
+	 * cannot reliably resize, and should therefore be re-synced now rather
+	 * than at the next scheduled refresh.
+	 *
+	 * Accounts synced before oversized pictures were downscaled still hold
+	 * the original, so they keep 500ing on the sizes that were never cached
+	 * and keep showing initials. Nothing here re-reads the image data: the
+	 * stored size is read from the file metadata, and a file above the size
+	 * we now produce is by definition one this service did not normalise.
+	 */
+	public function storedAvatarNeedsRepair(string $uid): bool {
+		try {
+			$avatar = $this->avatarManager->getAvatar($uid);
+			if (!$avatar->exists() || $avatar->isCustomAvatar() === false) {
+				return false;
+			}
+
+			// getFile() on the largest displayed size is exactly the call
+			// that fails for an unresizable original, so it is also the most
+			// honest test of whether this user is currently broken.
+			$avatar->getFile(self::MAX_DIMENSION);
+
+			return false;
+		} catch (\Throwable) {
+			// Includes the GenericFileException raised when the derivation
+			// runs out of memory, which is the case worth repairing.
+			return true;
 		}
 	}
 
@@ -212,14 +271,24 @@ class AvatarSyncService {
 	}
 
 	/**
-	 * Put an image into a shape and format Nextcloud will actually store.
+	 * Put an image into a shape, size and format Nextcloud will actually
+	 * store and can later resize without running out of memory.
 	 *
 	 * Nextcloud's avatar storage is strict in two independent ways: it stores
 	 * PNG and JPEG only, and it rejects any image that is not square
 	 * ("Avatar image is not square") rather than adapting it. Real profile
 	 * pictures routinely violate one or both, so without this step they are
 	 * fetched and then silently discarded, leaving the generated initials
-	 * avatar. Both conditions are handled here, in one decode/encode pass.
+	 * avatar.
+	 *
+	 * A third failure is subtler and does not show up here at all. Nextcloud
+	 * keeps the original and derives each requested size on demand, inside a
+	 * web request. A camera-resolution picture cannot be decoded within a
+	 * default 128M memory_limit, so that derivation throws, the avatar
+	 * endpoint returns 500 for the sizes not already cached, and the user
+	 * appears with initials wherever a large variant is requested -- while
+	 * looking fine anywhere a small cached one is used. Downscaling to
+	 * MAX_DIMENSION here, once, at sync time, is what prevents that.
 	 *
 	 * Squaring pads with transparency rather than cropping. This is only a
 	 * local rendering concession to Nextcloud's shape requirement, not an
@@ -238,6 +307,12 @@ class AvatarSyncService {
 			return null;
 		}
 
+		// Read the dimensions from the header before decoding, so a
+		// decompression bomb is refused instead of being handed to GD.
+		if (!$this->isDecodeSafe($bytes)) {
+			return null;
+		}
+
 		$image = @imagecreatefromstring($bytes);
 		if ($image === false) {
 			return null;
@@ -250,13 +325,24 @@ class AvatarSyncService {
 				return null;
 			}
 
-			// Already square and already a type Nextcloud stores: leave the
-			// original bytes alone rather than re-encoding for no reason.
-			if ($width === $height && $this->isNativelyStorable($bytes)) {
+			// Already square, already small enough, and already a type
+			// Nextcloud stores: leave the original bytes alone rather than
+			// re-encoding for no reason.
+			if ($width === $height
+				&& $width <= self::MAX_DIMENSION
+				&& $this->isNativelyStorable($bytes)) {
 				return null;
 			}
 
-			$side = max($width, $height);
+			// The square canvas is the longest edge, capped: one operation
+			// both pads a non-square image and downscales an oversized one.
+			$side = min(max($width, $height), self::MAX_DIMENSION);
+
+			// Preserve the aspect ratio inside that square.
+			$scale = (float)min($side / $width, $side / $height);
+			$drawWidth = max(1, (int)round((float)$width * $scale));
+			$drawHeight = max(1, (int)round((float)$height * $scale));
+
 			$canvas = @imagecreatetruecolor($side, $side);
 			if ($canvas === false) {
 				return null;
@@ -273,10 +359,23 @@ class AvatarSyncService {
 				}
 				imagefilledrectangle($canvas, 0, 0, $side - 1, $side - 1, $transparent);
 
-				// Centre the original inside the square.
-				$dstX = intdiv($side - $width, 2);
-				$dstY = intdiv($side - $height, 2);
-				if (!imagecopy($canvas, $image, $dstX, $dstY, 0, 0, $width, $height)) {
+				// Centre the original inside the square. Resampled, not
+				// copied: imagecopy() would crop rather than scale, and
+				// nearest-neighbour scaling of a photo looks broken.
+				$dstX = intdiv($side - $drawWidth, 2);
+				$dstY = intdiv($side - $drawHeight, 2);
+				if (!imagecopyresampled(
+					$canvas,
+					$image,
+					$dstX,
+					$dstY,
+					0,
+					0,
+					$drawWidth,
+					$drawHeight,
+					$width,
+					$height,
+				)) {
 					return null;
 				}
 
@@ -299,6 +398,37 @@ class AvatarSyncService {
 		} finally {
 			imagedestroy($image);
 		}
+	}
+
+	/**
+	 * True when the image's declared dimensions are small enough to decode.
+	 *
+	 * Checked from the header, before any decode: the compressed size says
+	 * nothing about the memory a decode needs, and refusing afterwards would
+	 * be refusing after the damage is done.
+	 */
+	private function isDecodeSafe(string $bytes): bool {
+		if (!function_exists('getimagesizefromstring')) {
+			// Cannot tell; let GD try. It fails safely, and the caller
+			// treats a failure as "keep the original bytes".
+			return true;
+		}
+
+		$info = @getimagesizefromstring($bytes);
+		if (!is_array($info)) {
+			return true;
+		}
+
+		$pixels = ($info[0] ?? 0) * ($info[1] ?? 0);
+		if ($pixels > self::MAX_PIXELS) {
+			$this->logger->info('[W3DS Avatar] Avatar dimensions exceed the decode limit, ignoring', [
+				'width' => $info[0] ?? null,
+				'height' => $info[1] ?? null,
+			]);
+			return false;
+		}
+
+		return true;
 	}
 
 	/**
