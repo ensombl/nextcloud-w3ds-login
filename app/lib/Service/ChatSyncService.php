@@ -900,6 +900,13 @@ class ChatSyncService {
 		$content = $this->mentionTranslator->toTalk($rawContent);
 		$messageType = $data['type'] ?? 'text';
 
+		// A forward carries no content of its own: the text and any
+		// attachment live in the message it points at. Resolve that original
+		// and merge it in, so the forward shows what was forwarded instead of
+		// an empty bubble.
+		[$data, $rawContent, $content, $messageType, $forwardedFrom]
+			= $this->resolveForwardedMessage($data, $rawContent, $content, $messageType);
+
 		// Cross-replica dedup. See messageIdentitySignature() for why the
 		// outer envelope ID cannot be used directly and how a genuine repeat
 		// ("ok" twice) is kept distinct from a replica of one message.
@@ -961,6 +968,11 @@ class ChatSyncService {
 			// elsewhere from appearing. A `system` message is excluded: those
 			// are membership notices, never user content.
 			if ($mediaUrl !== null && $messageType !== 'system') {
+				// Talk has no forward concept, so the attribution has to ride
+				// along in the caption. Without it a forwarded image is
+				// indistinguishable from one the forwarder took themselves.
+				$attributed = $this->attributeForward($content, $forwardedFrom, $ownerW3id);
+
 				// `content` on an attachment envelope is the sender's caption
 				// when they wrote one, and the bare filename otherwise.
 				// pullAttachment() drops it when it merely repeats the
@@ -969,7 +981,7 @@ class ChatSyncService {
 					$mediaUrl,
 					$senderUid,
 					$roomToken,
-					$content !== '' ? $content : null,
+					$attributed !== '' ? $attributed : null,
 				);
 				if ($share !== null) {
 					// Map the envelope to the share so the same attachment is
@@ -989,6 +1001,9 @@ class ChatSyncService {
 				// shows that something was sent.
 				$content = $content !== '' ? $content : '[attachment]';
 			}
+
+			// Same attribution for the plain-text path.
+			$content = $this->attributeForward($content, $forwardedFrom, $ownerW3id);
 
 			$localMessageId = $this->postTalkMessage(
 				$roomToken,
@@ -1043,6 +1058,168 @@ class ChatSyncService {
 			// The (entity_type, global_id) index already holds the share row,
 			// so a collision here is expected on some backends and harmless:
 			// the share mapping is what actually suppresses the loopback.
+		}
+	}
+
+	/**
+	 * Resolve a forwarded message into the content it points at.
+	 *
+	 * The Message schema has no forward concept: `type` is limited to
+	 * text/image/file/system and `additionalProperties` is false. Peers extend
+	 * it anyway -- the same envelopes carry `link`, `readByAt` and `file`, none
+	 * of which are in the schema either -- and a forward is expressed as:
+	 *
+	 *     "type": "forward",
+	 *     "content": "",
+	 *     "forwardedFrom": {
+	 *         "vault":     "@ename",       // eVault holding the original
+	 *         "messageId": "<envelope id>",// the original, in that vault
+	 *         "chatId":    "<chat id>"     // conversation it came from
+	 *     }
+	 *
+	 * The forward itself is empty, so rendering it as-is produces a blank
+	 * message. Everything worth showing -- the text, the attachment, the
+	 * original author -- has to be read from the referenced envelope.
+	 *
+	 * A forward whose original cannot be fetched (a vault we cannot reach, or
+	 * a message never shared with us) degrades to a short placeholder rather
+	 * than vanishing.
+	 *
+	 * @param array<string, mixed> $data
+	 * @return array{0: array<string, mixed>, 1: string, 2: string, 3: string, 4: ?array<string, mixed>}
+	 *                                                                                                   [data, rawContent, content, messageType, forwardedFrom]
+	 */
+	private function resolveForwardedMessage(
+		array $data,
+		string $rawContent,
+		string $content,
+		string $messageType,
+	): array {
+		$forwardedFrom = $data['forwardedFrom'] ?? null;
+		if (!is_array($forwardedFrom)) {
+			return [$data, $rawContent, $content, $messageType, null];
+		}
+
+		$vault = is_string($forwardedFrom['vault'] ?? null) ? $forwardedFrom['vault'] : '';
+		$messageId = is_string($forwardedFrom['messageId'] ?? null) ? $forwardedFrom['messageId'] : '';
+
+		if ($vault === '' || $messageId === '') {
+			$this->logger->info('[W3DS Sync] Forward without a usable reference', [
+				'forwardedFrom' => $forwardedFrom,
+			]);
+
+			return [$data, $rawContent, $content, $messageType, $forwardedFrom];
+		}
+
+		$original = null;
+		try {
+			$envelope = $this->evaultClient->fetchMetaEnvelopeById($vault, $messageId);
+			$parsed = is_array($envelope) ? ($envelope['parsed'] ?? null) : null;
+			if (is_array($parsed) && $parsed !== []) {
+				$original = $parsed;
+			}
+		} catch (\Throwable $e) {
+			$this->logger->warning('[W3DS Sync] Could not fetch forwarded original', [
+				'vault' => $vault,
+				'messageId' => $messageId,
+				'exception' => $e->getMessage(),
+			]);
+		}
+
+		if ($original === null) {
+			// Say something rather than showing an empty bubble.
+			$fallback = $rawContent !== '' ? $rawContent : '[forwarded message]';
+
+			return [$data, $fallback, $this->mentionTranslator->toTalk($fallback), 'text', $forwardedFrom];
+		}
+
+		// Take the original's payload wholesale, then restore the fields that
+		// belong to *this* message rather than the one being quoted: it was
+		// sent here, now, by the forwarder.
+		$merged = $original;
+		foreach (['id', 'chatId', 'senderId', 'senderEName', 'createdAt', 'updatedAt'] as $field) {
+			if (isset($data[$field])) {
+				$merged[$field] = $data[$field];
+			} else {
+				unset($merged[$field]);
+			}
+		}
+		$merged['forwardedFrom'] = $forwardedFrom;
+
+		// A forwarder can add their own note; keep it when they did, otherwise
+		// use the original's text.
+		$originalContent = is_string($original['content'] ?? null) ? $original['content'] : '';
+		$newRaw = $rawContent !== '' ? $rawContent : $originalContent;
+		$merged['content'] = $newRaw;
+
+		// `forward` is not a renderable type. Fall back to the original's own
+		// type, which is what decides whether this materialises as an
+		// attachment or as text.
+		$newType = is_string($original['type'] ?? null) && $original['type'] !== 'forward'
+			? $original['type']
+			: 'text';
+
+		$this->logger->info('[W3DS Sync] Resolved forwarded message', [
+			'vault' => $vault,
+			'messageId' => $messageId,
+			'resolvedType' => $newType,
+		]);
+
+		return [$merged, $newRaw, $this->mentionTranslator->toTalk($newRaw), $newType, $forwardedFrom];
+	}
+
+	/**
+	 * Prefix a message with who it was originally from.
+	 *
+	 * Talk has no notion of a forward, so the only way to preserve the
+	 * distinction the sending platform drew is in the text itself. Sending
+	 * platforms show a "Forwarded from <name>" header; this is the closest
+	 * equivalent Talk can render.
+	 *
+	 * The original author is named by their eVault, which is an eName. Resolve
+	 * it to a local display name when the person is known here, and otherwise
+	 * say only that the message was forwarded rather than printing a raw
+	 * identifier at the user.
+	 *
+	 * @param array<string, mixed>|null $forwardedFrom
+	 */
+	private function attributeForward(string $content, ?array $forwardedFrom, string $ownerW3id): string {
+		if ($forwardedFrom === null) {
+			return $content;
+		}
+
+		$vault = is_string($forwardedFrom['vault'] ?? null) ? $forwardedFrom['vault'] : '';
+		$label = $this->resolveForwardAuthorLabel($vault, $ownerW3id);
+
+		$header = $label !== null
+			? 'Forwarded from ' . $label
+			: 'Forwarded message';
+
+		return $content !== '' ? $header . "\n" . $content : $header;
+	}
+
+	/**
+	 * Human-readable name for the vault a forward came from, or null when the
+	 * person is not known to this instance.
+	 */
+	private function resolveForwardAuthorLabel(string $vault, string $ownerW3id): ?string {
+		if ($vault === '') {
+			return null;
+		}
+
+		try {
+			$w3id = $this->resolveParticipantIdToW3id($vault, $ownerW3id) ?? $vault;
+			$uid = $this->resolveW3idToNcUid($w3id);
+			if ($uid === null) {
+				return null;
+			}
+
+			$user = \OCP\Server::get(\OCP\IUserManager::class)->get($uid);
+			$name = $user?->getDisplayName();
+
+			return is_string($name) && trim($name) !== '' ? trim($name) : null;
+		} catch (\Throwable) {
+			return null;
 		}
 	}
 
