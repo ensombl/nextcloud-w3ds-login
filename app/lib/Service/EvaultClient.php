@@ -784,7 +784,11 @@ class EvaultClient {
 				// show. Ask GraphQL for this one identity instead.
 				$own = $this->findOwnProfileEnvelopeId($w3id);
 				if ($own !== null) {
-					$this->cache->set($cacheKey, $own, self::PROFILE_ID_CACHE_TTL);
+					// Both directions, always. Caching only eName -> envelope
+					// leaves resolveW3idFromProfileEnvelopeId() unable to name
+					// this person, and a chat's participantIds carry envelope
+					// IDs, so the peer silently drops out of the room.
+					$this->primeProfileCacheEntry($w3id, $own);
 				}
 
 				return $own;
@@ -827,9 +831,11 @@ class EvaultClient {
 				]);
 			}
 
-			// Re-prime the canonical mapping under the cache key we'll read on next call.
+			// Re-prime the canonical mapping under the cache key we'll read on
+			// next call, in both directions: the reverse entry is what lets a
+			// chat's participantIds (which are envelope IDs) name a person.
 			if ($found !== null) {
-				$this->cache->set($cacheKey, $found, self::PROFILE_ID_CACHE_TTL);
+				$this->primeProfileCacheEntry($w3id, $found);
 			}
 			return $found;
 		} catch (\Throwable $e) {
