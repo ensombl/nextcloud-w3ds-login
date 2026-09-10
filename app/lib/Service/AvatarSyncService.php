@@ -339,7 +339,7 @@ class AvatarSyncService {
 			$side = min(max($width, $height), self::MAX_DIMENSION);
 
 			// Preserve the aspect ratio inside that square.
-			$scale = min($side / $width, $side / $height);
+			$scale = (float)min($side / $width, $side / $height);
 			$drawWidth = max(1, (int)round((float)$width * $scale));
 			$drawHeight = max(1, (int)round((float)$height * $scale));
 
