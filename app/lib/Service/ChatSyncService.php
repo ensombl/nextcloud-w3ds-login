@@ -22,6 +22,12 @@ class ChatSyncService {
 	private const INBOUND_POST_LOCK_TTL = 10;
 	private const MESSAGE_SIG_CACHE_PREFIX = 'w3ds_msg_sig_';
 	private const MESSAGE_SIG_CACHE_TTL = 86400; // 24h — enough to span a typical poll window
+	/**
+	 * Entity type under which cross-replica message signatures are persisted
+	 * in the mapping table. Distinct from 'message' so a signature can never
+	 * be mistaken for an envelope ID.
+	 */
+	private const MESSAGE_SIG_ENTITY = 'message_sig';
 	private const CHAT_PARTICIPANT_HWM_PREFIX = 'w3ds_chat_pmax_';
 	private const CHAT_PARTICIPANT_HWM_TTL = 604800; // 7d high-water mark guard against pushChat shrinkage
 	private const PULL_LIST_CACHE_TTL = 120; // 2 min for chat/message ontology lists during pull sync
@@ -750,8 +756,26 @@ class ChatSyncService {
 		// this trades a rarer duplicate for no longer losing real messages.
 		$signature = $this->messageIdentitySignature($senderUid, $chatGlobalId, $data, $rawContent);
 		$sigKey = self::MESSAGE_SIG_CACHE_PREFIX . $signature;
-		$existingLocal = $this->cache->get($sigKey);
+
+		// The signature has to outlive the request. `createDistributed()`
+		// falls back to a per-request ArrayCache whenever no Redis or
+		// memcached is configured, which is the default for a single-server
+		// install -- so on those instances the cache was empty at the start of
+		// every poll and the same logical message was posted once per
+		// participant replica, and again on the next poll. That is the
+		// duplicate: a two-person chat shows everything twice.
+		//
+		// The mapping table is the durable store we already have, and its
+		// (entity_type, global_id) unique index gives us the insert-or-lose
+		// race semantics this needs. Signatures go in under their own entity
+		// type so they cannot collide with real envelope IDs.
+		$existingLocal = $this->cache->get($sigKey)
+			?? $this->idMappingMapper->getLocalId(self::MESSAGE_SIG_ENTITY, $signature);
 		if (is_string($existingLocal) && $existingLocal !== '') {
+			// Re-prime the cache so the rest of this poll skips it without a
+			// query.
+			$this->cache->set($sigKey, $existingLocal, self::MESSAGE_SIG_CACHE_TTL);
+
 			// Record this replica's mapping so future polls skip it cheaply.
 			try {
 				$this->idMappingMapper->storeMapping('message', $existingLocal, $globalId, $ownerW3id);
@@ -801,6 +825,7 @@ class ChatSyncService {
 						$ownerW3id,
 					);
 					$this->cache->set($sigKey, 'share:' . $share->getId(), self::MESSAGE_SIG_CACHE_TTL);
+					$this->rememberMessageSignature($signature, 'share:' . $share->getId(), $ownerW3id);
 					return;
 				}
 
@@ -823,6 +848,7 @@ class ChatSyncService {
 			$this->setSyncLock('message', $localMessageId);
 			$this->idMappingMapper->storeMapping('message', $localMessageId, $globalId, $ownerW3id);
 			$this->cache->set($sigKey, $localMessageId, self::MESSAGE_SIG_CACHE_TTL);
+			$this->rememberMessageSignature($signature, $localMessageId, $ownerW3id);
 		} catch (\Throwable $e) {
 			$this->logger->error('Failed to create local message from webhook', [
 				'globalId' => $globalId,
@@ -849,6 +875,31 @@ class ChatSyncService {
 			(hexdec(substr($hash, 16, 4)) & 0x3fff) | 0x8000,
 			substr($hash, 20, 12),
 		);
+	}
+
+	/**
+	 * Persist a message signature so the next request still recognises this
+	 * message as already posted.
+	 *
+	 * The in-memory cache cannot be relied on: without Redis or memcached
+	 * configured, `createDistributed()` hands back a per-request ArrayCache,
+	 * so the signature is gone by the next poll and every replica of the same
+	 * logical message posts again.
+	 *
+	 * Best effort. A losing insert race means another request recorded the
+	 * same signature first, which is the outcome we wanted anyway.
+	 */
+	private function rememberMessageSignature(string $signature, string $localId, string $ownerW3id): void {
+		try {
+			$this->idMappingMapper->storeMapping(
+				self::MESSAGE_SIG_ENTITY,
+				$localId,
+				$signature,
+				$ownerW3id,
+			);
+		} catch (\Throwable) {
+			// Unique-index collision: someone else already recorded it.
+		}
 	}
 
 	/**
