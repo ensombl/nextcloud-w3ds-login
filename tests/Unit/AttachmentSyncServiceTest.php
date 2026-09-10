@@ -123,4 +123,65 @@ class AttachmentSyncServiceTest extends TestCase {
 		$this->assertSame('photo.jpeg', $this->invoke('sanitiseFilename', ['photo.jpeg']));
 		$this->assertSame('émoji-ok.txt', $this->invoke('sanitiseFilename', ['émoji-ok.txt']));
 	}
+
+	// -------- captions --------
+	//
+	// Talk keeps the text a user typed alongside a file in the share
+	// reference, at parameters.metaData.caption, not as the comment message
+	// (which stays the `{file}` placeholder). Miss it and the attachment
+	// arrives on other platforms with the sender's words dropped.
+
+	private function shareRef(array $metaData = []): string {
+		$params = ['share' => '6', 'mimeType' => 'image/png'];
+		if ($metaData !== []) {
+			$params['metaData'] = $metaData;
+		}
+
+		return json_encode(['message' => 'file_shared', 'parameters' => $params]);
+	}
+
+	public function testExtractsTheCaptionAUserTyped(): void {
+		$this->assertSame(
+			'look at this',
+			$this->service()->extractCaption($this->shareRef(['caption' => 'look at this'])),
+		);
+	}
+
+	public function testTrimsSurroundingWhitespaceFromACaption(): void {
+		$this->assertSame(
+			'look at this',
+			$this->service()->extractCaption($this->shareRef(['caption' => "  look at this\n"])),
+		);
+	}
+
+	public function testReturnsNullWhenTheShareCarriesNoCaption(): void {
+		$this->assertNull($this->service()->extractCaption($this->shareRef()));
+		$this->assertNull($this->service()->extractCaption($this->shareRef(['mimeType' => 'image/png'])));
+	}
+
+	public function testTreatsAnEmptyOrWhitespaceCaptionAsAbsent(): void {
+		$this->assertNull($this->service()->extractCaption($this->shareRef(['caption' => ''])));
+		$this->assertNull($this->service()->extractCaption($this->shareRef(['caption' => '   '])));
+		$this->assertNull($this->service()->extractCaption($this->shareRef(['caption' => "\n\t"])));
+	}
+
+	public function testIgnoresACaptionThatIsNotAString(): void {
+		$this->assertNull($this->service()->extractCaption($this->shareRef(['caption' => ['a']])));
+		$this->assertNull($this->service()->extractCaption($this->shareRef(['caption' => 42])));
+	}
+
+	public function testReturnsNullForMessagesThatAreNotShareReferences(): void {
+		$this->assertNull($this->service()->extractCaption('just some text'));
+		$this->assertNull($this->service()->extractCaption(''));
+		$this->assertNull($this->service()->extractCaption('{"broken":'));
+	}
+
+	public function testKeepsACaptionThatHappensToLookLikeAFilename(): void {
+		// Dropping a filename-shaped caption is the receiving side's job, and
+		// only once it knows the real filename; the extractor stays literal.
+		$this->assertSame(
+			'photo.jpg',
+			$this->service()->extractCaption($this->shareRef(['caption' => 'photo.jpg'])),
+		);
+	}
 }

@@ -535,9 +535,14 @@ class ChatSyncService {
 			if ($attachment !== null) {
 				$payload['mediaUrl'] = $attachment['mediaUrl'];
 				$payload['type'] = $attachment['type'];
-				// The raw JSON share reference is meaningless off-platform;
-				// the filename at least renders as something sensible.
-				$payload['content'] = $attachment['filename'];
+				// The raw JSON share reference is meaningless off-platform.
+				// Prefer the caption the sender typed, which is the only text
+				// they actually wrote; fall back to the filename so the
+				// message still renders as something sensible. Mentions in a
+				// caption are translated like any other message text.
+				$payload['content'] = $attachment['caption'] !== null
+					? $this->mentionTranslator->toWire($attachment['caption'])
+					: $attachment['filename'];
 			} else {
 				// Upload failed. Send the message as text rather than
 				// dropping it, so the conversation stays intact.
@@ -752,7 +757,16 @@ class ChatSyncService {
 			// comment for the share, so there's nothing further to post.
 			$mediaUrl = $data['mediaUrl'] ?? null;
 			if (in_array($messageType, ['file', 'image'], true) && is_string($mediaUrl) && $mediaUrl !== '') {
-				$share = $this->attachmentSync->pullAttachment($mediaUrl, $senderUid, $roomToken);
+				// `content` on an attachment envelope is the sender's caption
+				// when they wrote one, and the bare filename otherwise.
+				// pullAttachment() drops it when it merely repeats the
+				// filename, which it only knows after dereferencing the URI.
+				$share = $this->attachmentSync->pullAttachment(
+					$mediaUrl,
+					$senderUid,
+					$roomToken,
+					$content !== '' ? $content : null,
+				);
 				if ($share !== null) {
 					// Map the envelope to the share so the same attachment is
 					// not re-materialised on the next poll.

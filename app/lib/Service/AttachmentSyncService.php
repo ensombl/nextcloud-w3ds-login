@@ -7,6 +7,7 @@ namespace OCA\W3dsLogin\Service;
 use OCP\Files\File;
 use OCP\Files\IRootFolder;
 use OCP\Files\NotFoundException;
+use OCP\IRequest;
 use OCP\Share\IManager as IShareManager;
 use OCP\Share\IShare;
 use Psr\Log\LoggerInterface;
@@ -43,10 +44,18 @@ class AttachmentSyncService {
 	/** Folder created in the recipient's home for inbound attachments. */
 	private const INBOX_FOLDER = 'W3DS Attachments';
 
+	/**
+	 * Stand-in route for shares we create outside a web request. Talk only
+	 * compares this against its own recording route, so the value is
+	 * irrelevant as long as it is a string.
+	 */
+	private const SYNTHETIC_SHARE_ROUTE = 'w3ds_login.sync.share';
+
 	public function __construct(
 		private EvaultClient $evaultClient,
 		private IRootFolder $rootFolder,
 		private IShareManager $shareManager,
+		private IRequest $request,
 		private LoggerInterface $logger,
 	) {
 	}
@@ -69,11 +78,36 @@ class AttachmentSyncService {
 	}
 
 	/**
+	 * Extract the caption a user typed alongside a file share.
+	 *
+	 * Talk keeps the caption inside the share reference itself, at
+	 * `parameters.metaData.caption`, rather than as the comment text (which
+	 * stays the `{file}` placeholder). Its own renderer substitutes the
+	 * caption for the filename when one is present, so it is the message the
+	 * sender actually wrote and the only text worth replicating.
+	 */
+	public function extractCaption(string $commentMessage): ?string {
+		$decoded = json_decode($commentMessage, true);
+		if (!is_array($decoded)) {
+			return null;
+		}
+
+		$caption = $decoded['parameters']['metaData']['caption'] ?? null;
+		if (!is_string($caption)) {
+			return null;
+		}
+
+		$caption = trim($caption);
+
+		return $caption !== '' ? $caption : null;
+	}
+
+	/**
 	 * Upload a Talk file share to the sender's eVault.
 	 *
 	 * @param string $commentMessage The raw comment message (JSON share ref)
 	 * @param string[] $acl eNames allowed to read the blob
-	 * @return array{mediaUrl: string, type: string, filename: string}|null
+	 * @return array{mediaUrl: string, type: string, filename: string, caption: ?string}|null
 	 */
 	public function pushAttachment(
 		string $senderUid,
@@ -130,6 +164,7 @@ class AttachmentSyncService {
 				// receiving platform uses it to decide how to render.
 				'type' => str_starts_with($mime, 'image/') ? 'image' : 'file',
 				'filename' => $file->getName(),
+				'caption' => $this->extractCaption($commentMessage),
 			];
 		} catch (\Throwable $e) {
 			$this->logger->warning('[W3DS Attachment] Failed to push attachment', [
@@ -146,7 +181,7 @@ class AttachmentSyncService {
 	 *
 	 * @return IShare|null The created room share, or null when unavailable
 	 */
-	public function pullAttachment(string $mediaUrl, string $recipientUid, string $roomToken): ?IShare {
+	public function pullAttachment(string $mediaUrl, string $recipientUid, string $roomToken, ?string $caption = null): ?IShare {
 		try {
 			$meta = $this->evaultClient->dereferenceFileUri($mediaUrl);
 			if ($meta === null) {
@@ -171,7 +206,16 @@ class AttachmentSyncService {
 				return null;
 			}
 
-			return $this->shareIntoRoom($file, $recipientUid, $roomToken);
+			// A caption that merely repeats the filename says nothing: Talk
+			// renders the caption in place of the filename, so passing it
+			// through would just show the same string twice. Senders that
+			// wrote no caption send the filename as content, which is exactly
+			// this case.
+			if ($caption !== null && trim($caption) === $meta['filename']) {
+				$caption = null;
+			}
+
+			return $this->shareIntoRoom($file, $recipientUid, $roomToken, $caption);
 		} catch (\Throwable $e) {
 			$this->logger->warning('[W3DS Attachment] Failed to materialise inbound attachment', [
 				'mediaUrl' => $mediaUrl,
@@ -280,11 +324,66 @@ class AttachmentSyncService {
 	}
 
 	/**
+	 * Run $fn with the request parameters Talk's share listener expects.
+	 *
+	 * That listener runs on every room share and reads two things straight
+	 * off the request: `_route`, which it passes to strtolower() unguarded,
+	 * and `talkMetaData`, which carries the caption. Neither exists when the
+	 * share originates from a background job, a webhook or a poll, so the
+	 * listener fatals on the null route and takes the whole share down with
+	 * it -- inbound attachments never materialised outside a web request.
+	 *
+	 * Supplying both, then restoring what was there, keeps the listener on
+	 * its normal path and gets the caption onto the generated message. The
+	 * concrete Request merges URL parameters into the same bag getParam()
+	 * reads; if this implementation does not support that, we fall back to
+	 * sharing without a caption rather than failing.
+	 *
+	 * @template T
+	 * @param array<string, mixed> $metaData
+	 * @param callable(): T $fn
+	 * @return T
+	 */
+	private function withTalkMetaData(array $metaData, callable $fn): mixed {
+		if (!method_exists($this->request, 'setUrlParameters')) {
+			return $fn();
+		}
+
+		$previousMeta = $this->request->getParam('talkMetaData');
+		$previousRoute = $this->request->getParam('_route');
+		try {
+			$this->request->setUrlParameters([
+				'talkMetaData' => json_encode($metaData),
+				// Any non-null route works: Talk only compares it against its
+				// own recording route to decide whether to skip.
+				'_route' => is_string($previousRoute) ? $previousRoute : self::SYNTHETIC_SHARE_ROUTE,
+			]);
+
+			return $fn();
+		} finally {
+			// Restoring to '' rather than dropping keys: Talk treats an
+			// unparseable value as "no metadata", which is what we want, and
+			// the parameter bag has no removal API.
+			$this->request->setUrlParameters([
+				'talkMetaData' => $previousMeta ?? '',
+				'_route' => is_string($previousRoute) ? $previousRoute : '',
+			]);
+		}
+	}
+
+	/**
 	 * Share a file into a Talk room. Talk turns the share into a chat
 	 * message with the file parameters attached, which is what makes it
 	 * render as an attachment.
+	 *
+	 * A caption cannot be set on the share object: Talk's own share listener
+	 * reads it from the `talkMetaData` request parameter and folds it into
+	 * the system message it generates. We are not in a share request here, so
+	 * we put it on the request ourselves for the duration of the call. Doing
+	 * it any other way means posting the caption as a separate message, which
+	 * would show up as a stray line of text next to the file.
 	 */
-	private function shareIntoRoom(File $file, string $uid, string $roomToken): ?IShare {
+	private function shareIntoRoom(File $file, string $uid, string $roomToken, ?string $caption = null): ?IShare {
 		try {
 			$share = $this->shareManager->newShare();
 			$share->setNode($file)
@@ -293,7 +392,14 @@ class AttachmentSyncService {
 				->setSharedWith($roomToken)
 				->setPermissions(\OCP\Constants::PERMISSION_READ);
 
-			return $this->shareManager->createShare($share);
+			// Always go through withTalkMetaData(), caption or not: it also
+			// supplies the `_route` parameter Talk's share listener
+			// dereferences unguarded, without which no inbound share survives
+			// outside a web request.
+			return $this->withTalkMetaData(
+				$caption !== null ? ['caption' => $caption] : [],
+				fn (): IShare => $this->shareManager->createShare($share),
+			);
 		} catch (\Throwable $e) {
 			$this->logger->warning('[W3DS Attachment] Failed to share attachment into room', [
 				'roomToken' => $roomToken,
