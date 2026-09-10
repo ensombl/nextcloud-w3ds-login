@@ -231,4 +231,79 @@ class AvatarSyncServiceTest extends TestCase {
 		$this->assertNull($this->invoke('normaliseForStorage', ['not-an-image']));
 		$this->assertNull($this->invoke('normaliseForStorage', ['']));
 	}
+
+	// -------- keeping the stored avatar resizable --------
+
+	public function testDownscalesAnOversizedSquarePicture(): void {
+		// Nextcloud keeps the original and derives each requested size on
+		// demand, inside a web request. A camera-resolution picture cannot be
+		// decoded within a default 128M memory_limit, so that derivation
+		// throws and /avatar/<uid>/512 returns 500 -- which renders as the
+		// generated initials in Talk's conversation list while smaller,
+		// already-cached sizes still look correct.
+		$out = $this->invoke('normaliseForStorage', [$this->imageBytes(1600, 1600)]);
+
+		$this->assertNotNull($out, 'an oversized picture must be re-encoded, not stored as-is');
+		$this->assertSame([512, 512, 'image/png'], $this->describe($out));
+	}
+
+	public function testDownscalesAndSquaresInOnePass(): void {
+		// Both problems at once, which is the common case for a phone photo.
+		$out = $this->invoke('normaliseForStorage', [$this->imageBytes(3648, 2736, 'jpeg')]);
+
+		$this->assertNotNull($out);
+		$this->assertSame([512, 512, 'image/png'], $this->describe($out));
+	}
+
+	public function testDownscalingPreservesTheAspectRatio(): void {
+		// A 2:1 source must still be 2:1 inside the padded square: scaling
+		// each axis independently to fill it would stretch the picture.
+		$width = 1024;
+		$height = 512;
+		$out = $this->invoke('normaliseForStorage', [$this->imageBytes($width, $height, 'jpeg')]);
+
+		$image = imagecreatefromstring($out);
+		$side = imagesx($image);
+
+		// The drawn region is the part that is not transparent padding.
+		$opaqueRows = 0;
+		for ($y = 0; $y < $side; $y++) {
+			for ($x = 0; $x < $side; $x++) {
+				if (((imagecolorat($image, $x, $y) >> 24) & 0x7F) < 127) {
+					$opaqueRows++;
+					break;
+				}
+			}
+		}
+		imagedestroy($image);
+
+		$expected = (int)round($side * ($height / $width));
+		$this->assertEqualsWithDelta($expected, $opaqueRows, 2, 'aspect ratio must survive downscaling');
+	}
+
+	public function testLeavesAPictureAtTheLimitUntouched(): void {
+		// Exactly at the cap, square, and already PNG: nothing to fix, so the
+		// original bytes are kept rather than re-encoded.
+		$this->assertNull($this->invoke('normaliseForStorage', [$this->imageBytes(512, 512)]));
+	}
+
+	public function testRefusesAnImageWhoseDimensionsAreTooLargeToDecode(): void {
+		// A decompression bomb is small on the wire and enormous in memory,
+		// so the size check cannot catch it; the header must be read first.
+		// 30000x30000 is ~3.6GB decoded and only a few KB compressed.
+		$image = imagecreatetruecolor(1, 1);
+		ob_start();
+		imagepng($image);
+		$tiny = (string)ob_get_clean();
+		imagedestroy($image);
+
+		// Rewrite the IHDR dimensions in place, so the header claims a size
+		// the payload does not have -- exactly a bomb's shape.
+		$forged = substr_replace($tiny, pack('NN', 30000, 30000), 16, 8);
+
+		$this->assertNull(
+			$this->invoke('normaliseForStorage', [$forged]),
+			'an image above the pixel ceiling must be refused before GD decodes it',
+		);
+	}
 }

@@ -5,9 +5,12 @@ declare(strict_types=1);
 namespace OCA\W3dsLogin\Service;
 
 use OCP\Files\File;
+use OCP\Files\Folder;
 use OCP\Files\IRootFolder;
 use OCP\Files\NotFoundException;
+use OCP\Files\NotPermittedException;
 use OCP\IRequest;
+use OCP\Lock\LockedException;
 use OCP\Share\IManager as IShareManager;
 use OCP\Share\IShare;
 use Psr\Log\LoggerInterface;
@@ -52,6 +55,18 @@ class AttachmentSyncService {
 
 	/** Folder created in the recipient's home for inbound attachments. */
 	private const INBOX_FOLDER = 'W3DS Attachments';
+
+	/**
+	 * How many times to re-check a folder or file that a concurrent request
+	 * holds a lock on. Inbound sync is driven by every open tab's poll, cron
+	 * and the webhook at once, so contention is normal rather than
+	 * exceptional, and losing the race must not lose the attachment.
+	 */
+	private const FOLDER_CREATE_ATTEMPTS = 10;
+
+	/** Pause between those attempts. The competing operation is a single
+	 * local metadata write, so it resolves in well under a second. */
+	private const FOLDER_CREATE_RETRY_DELAY_US = 100_000;
 
 	/**
 	 * Stand-in route for shares we create outside a web request. Talk only
@@ -576,19 +591,76 @@ class AttachmentSyncService {
 			return null;
 		}
 
-		try {
-			$folder = $userFolder->nodeExists(self::INBOX_FOLDER)
-				? $userFolder->get(self::INBOX_FOLDER)
-				: $userFolder->newFolder(self::INBOX_FOLDER);
-		} catch (NotFoundException) {
-			return null;
-		}
-
-		if (!$folder instanceof \OCP\Files\Folder) {
+		$folder = $this->ensureInboxFolder($userFolder);
+		if ($folder === null) {
 			return null;
 		}
 
 		return $this->writeAttachmentFile($folder, $this->sanitiseFilename($filename), $bytes);
+	}
+
+	/**
+	 * Get the inbox folder, creating it if this is the first attachment.
+	 *
+	 * Creating it is a race. Inbound sync runs from every open browser tab's
+	 * poll, from cron and from the webhook, and several of those can process
+	 * the first attachment for a user at the same moment. Nextcloud takes an
+	 * exclusive lock on the parent while creating a folder, so every request
+	 * but one fails with LockedException -- and, because the failure happened
+	 * while resolving the destination, those attachments were dropped
+	 * entirely rather than retried. That is the whole reason a file or image
+	 * sent from another platform never appeared.
+	 *
+	 * The loser of the race does not need to create anything: the winner's
+	 * folder is what it wanted. So a creation failure is re-checked rather
+	 * than propagated, and only a folder that still does not exist is a real
+	 * error. Retried a few times because the winner's lock is held for the
+	 * duration of its own create, not just the instant of ours.
+	 */
+	private function ensureInboxFolder(Folder $userFolder): ?Folder {
+		for ($attempt = 0; $attempt < self::FOLDER_CREATE_ATTEMPTS; $attempt++) {
+			try {
+				if ($userFolder->nodeExists(self::INBOX_FOLDER)) {
+					$existing = $userFolder->get(self::INBOX_FOLDER);
+
+					return $existing instanceof Folder ? $existing : null;
+				}
+
+				$created = $userFolder->newFolder(self::INBOX_FOLDER);
+
+				return $created instanceof Folder ? $created : null;
+			} catch (LockedException) {
+				// A concurrent request is creating the very folder we want.
+				// Wait for it to finish and look again.
+				usleep(self::FOLDER_CREATE_RETRY_DELAY_US);
+			} catch (NotPermittedException|NotFoundException $e) {
+				$this->logger->warning('[W3DS Attachment] Cannot create the attachments folder', [
+					'exception' => get_class($e) . ': ' . $e->getMessage(),
+				]);
+
+				return null;
+			} catch (\Throwable $e) {
+				// newFolder() throws a bare exception when the name was taken
+				// between the check and the create, which is the same race
+				// seen from the other side. Re-check before giving up.
+				if ($userFolder->nodeExists(self::INBOX_FOLDER)) {
+					usleep(self::FOLDER_CREATE_RETRY_DELAY_US);
+					continue;
+				}
+
+				$this->logger->warning('[W3DS Attachment] Cannot create the attachments folder', [
+					'exception' => get_class($e) . ': ' . $e->getMessage(),
+				]);
+
+				return null;
+			}
+		}
+
+		$this->logger->warning('[W3DS Attachment] Timed out waiting for the attachments folder', [
+			'folder' => self::INBOX_FOLDER,
+		]);
+
+		return null;
 	}
 
 	/**
@@ -611,35 +683,14 @@ class AttachmentSyncService {
 	 * name taken and adopts the winner's completed file instead of writing
 	 * over it. Nothing ever observes a half-written file under the final name.
 	 */
-	private function writeAttachmentFile(\OCP\Files\Folder $folder, string $name, string $bytes): ?File {
+	private function writeAttachmentFile(Folder $folder, string $name, string $bytes): ?File {
 		// Not `.part`: Nextcloud reserves that suffix for its own partial
 		// uploads and refuses writes to any file using it, so staging there
 		// fails outright and the attachment never lands.
 		$temporary = '.w3ds-incoming-' . bin2hex(random_bytes(8)) . '.tmp';
 
-		try {
-			// Create then write: Folder::newFile() with content in one call is
-			// rejected on some storages.
-			$file = $folder->newFile($temporary);
-			$file->putContent($bytes);
-		} catch (\Throwable $e) {
-			$this->logger->warning('[W3DS Attachment] Failed to stage attachment', [
-				'name' => $name,
-				'staged' => $temporary,
-				// Several Files exceptions carry an empty message, which says
-				// nothing on its own; the class is the useful part.
-				'exception' => get_class($e) . ': ' . $e->getMessage(),
-			]);
-
-			// Do not leave the staging entry behind on a failed write.
-			try {
-				if ($folder->nodeExists($temporary)) {
-					$folder->get($temporary)->delete();
-				}
-			} catch (\Throwable) {
-				// Nothing further to do; a stray staging file is inert.
-			}
-
+		$file = $this->stageAttachmentFile($folder, $temporary, $name, $bytes);
+		if ($file === null) {
 			return null;
 		}
 
@@ -676,6 +727,66 @@ class AttachmentSyncService {
 		]);
 
 		return $file;
+	}
+
+	/**
+	 * Write the bytes to a staging name inside the folder.
+	 *
+	 * The staging name is unique to this attempt, so nothing else competes
+	 * for it -- but the folder holding it is shared, and Nextcloud locks the
+	 * parent while a sibling is being created. A concurrent attachment for
+	 * the same user therefore surfaces here as a LockedException that has
+	 * nothing to do with this file, and dropping the attachment over it would
+	 * be losing data to unrelated contention. Retried for the same reason
+	 * ensureInboxFolder() retries.
+	 */
+	private function stageAttachmentFile(Folder $folder, string $temporary, string $name, string $bytes): ?File {
+		for ($attempt = 0; $attempt < self::FOLDER_CREATE_ATTEMPTS; $attempt++) {
+			try {
+				// Create then write: Folder::newFile() with content in one call is
+				// rejected on some storages.
+				$file = $folder->newFile($temporary);
+				$file->putContent($bytes);
+
+				return $file;
+			} catch (LockedException) {
+				$this->discardStagedFile($folder, $temporary);
+				usleep(self::FOLDER_CREATE_RETRY_DELAY_US);
+			} catch (\Throwable $e) {
+				$this->logger->warning('[W3DS Attachment] Failed to stage attachment', [
+					'name' => $name,
+					'staged' => $temporary,
+					// Several Files exceptions carry an empty message, which says
+					// nothing on its own; the class is the useful part.
+					'exception' => get_class($e) . ': ' . $e->getMessage(),
+				]);
+
+				$this->discardStagedFile($folder, $temporary);
+
+				return null;
+			}
+		}
+
+		$this->logger->warning('[W3DS Attachment] Timed out staging attachment', [
+			'name' => $name,
+		]);
+
+		return null;
+	}
+
+	/**
+	 * Remove a staging entry after a failed write, so a partial file is never
+	 * left behind. Failing to clean up is not itself worth reporting: a stray
+	 * dotfile under a staging name is inert and is never shared into a room.
+	 */
+	private function discardStagedFile(Folder $folder, string $temporary): void {
+		try {
+			if ($folder->nodeExists($temporary)) {
+				$folder->get($temporary)->delete();
+			}
+		} catch (\Throwable) {
+			// Nothing further to do.
+		}
 	}
 
 	/**
