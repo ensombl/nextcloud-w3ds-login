@@ -146,6 +146,38 @@ class IdMappingMapper extends QBMapper {
 	}
 
 	/**
+	 * Whether a claim exists and was taken within the last $ttl seconds.
+	 *
+	 * Claims stand in for a lock, and a process that dies between taking one
+	 * and releasing it would otherwise block that key forever. Treating an old
+	 * row as absent bounds the damage to $ttl, and sweeps it so the next
+	 * caller can take it cleanly.
+	 */
+	public function hasFreshClaim(string $entityType, string $claimKey, int $ttl): bool {
+		try {
+			$createdAt = $this->readInTx(
+				fn () => (string)$this->findByLocalId($entityType, $claimKey)->getCreatedAt(),
+			);
+		} catch (\Throwable) {
+			// Unreadable: treat as unclaimed rather than blocking the caller.
+			return false;
+		}
+
+		if ($createdAt === null || $createdAt === '') {
+			return false;
+		}
+
+		if ((int)$createdAt >= time() - $ttl) {
+			return true;
+		}
+
+		// Expired: drop it so this key is not blocked indefinitely.
+		$this->releaseClaim($entityType, $claimKey);
+
+		return false;
+	}
+
+	/**
 	 * Release a claim taken by tryClaim(), so a later retry can proceed.
 	 */
 	public function releaseClaim(string $entityType, string $claimKey): void {

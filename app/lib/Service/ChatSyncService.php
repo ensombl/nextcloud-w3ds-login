@@ -54,6 +54,22 @@ class ChatSyncService {
 	 * inbound envelope across concurrent requests.
 	 */
 	private const INGEST_CLAIM_ENTITY = 'ingest_claim';
+	/**
+	 * Entity type for the durable copy of the "inbound post in flight" guard.
+	 * The cache copy cannot be relied on: without a distributed cache
+	 * configured it is per-request, and the request that must observe the
+	 * guard is always a different one.
+	 */
+	private const INBOUND_POST_ENTITY = 'inbound_post';
+	/**
+	 * How long a claim is honoured before it is treated as abandoned.
+	 *
+	 * Claims stand in for locks, so a process that dies between taking one and
+	 * releasing it would block that key forever. Comfortably longer than the
+	 * slowest legitimate ingest (a 250 MB download) and short enough that a
+	 * crash costs one retry cycle rather than a lost message.
+	 */
+	private const CLAIM_TTL = 900;
 	private const CHAT_PARTICIPANT_HWM_PREFIX = 'w3ds_chat_pmax_';
 	private const CHAT_PARTICIPANT_HWM_TTL = 604800; // 7d high-water mark guard against pushChat shrinkage
 	private const PULL_LIST_CACHE_TTL = 120; // 2 min for chat/message ontology lists during pull sync
@@ -503,7 +519,14 @@ class ChatSyncService {
 		// eVault. The unique index picks exactly one winner.
 		$pushClaimKey = 'push|' . $localId;
 		if (!$this->idMappingMapper->tryClaim(self::INGEST_CLAIM_ENTITY, $pushClaimKey, $w3id)) {
-			return;
+			// Only yield to a claim that is actually live. A request killed
+			// mid-push would otherwise keep this comment from ever syncing.
+			if ($this->idMappingMapper->hasFreshClaim(self::INGEST_CLAIM_ENTITY, $pushClaimKey, self::CLAIM_TTL)) {
+				return;
+			}
+			if (!$this->idMappingMapper->tryClaim(self::INGEST_CLAIM_ENTITY, $pushClaimKey, $w3id)) {
+				return;
+			}
 		}
 
 		try {
@@ -801,7 +824,15 @@ class ChatSyncService {
 		// requests is a different process.
 		$claimKey = 'ingest|' . $globalId;
 		if (!$this->idMappingMapper->tryClaim(self::INGEST_CLAIM_ENTITY, $claimKey, $ownerW3id)) {
-			return; // Another request is ingesting this envelope right now.
+			// Another request is ingesting this envelope right now -- but only
+			// yield to a claim that is still live, or a request killed
+			// mid-ingest would strand this message permanently.
+			if ($this->idMappingMapper->hasFreshClaim(self::INGEST_CLAIM_ENTITY, $claimKey, self::CLAIM_TTL)) {
+				return;
+			}
+			if (!$this->idMappingMapper->tryClaim(self::INGEST_CLAIM_ENTITY, $claimKey, $ownerW3id)) {
+				return;
+			}
 		}
 
 		try {
@@ -1977,14 +2008,39 @@ class ChatSyncService {
 
 	private function beginInboundPost(string $senderUid, string $roomToken): void {
 		$this->cache->set($this->inboundPostKey($senderUid, $roomToken), true, self::INBOUND_POST_LOCK_TTL);
+		// The cache alone cannot carry this. `createDistributed()` degrades to
+		// a per-request store when no distributed cache is configured, which
+		// is the default, and the request that must see this flag is a
+		// *different* one -- Talk's listener firing inside sendMessage(), or a
+		// concurrent poller. Without a durable copy the guard was silently
+		// inert on a default install, and inbound messages were re-pushed.
+		$this->idMappingMapper->tryClaim(
+			self::INBOUND_POST_ENTITY,
+			$this->inboundPostKey($senderUid, $roomToken),
+			$senderUid,
+		);
 	}
 
 	private function endInboundPost(string $senderUid, string $roomToken): void {
 		$this->cache->remove($this->inboundPostKey($senderUid, $roomToken));
+		$this->idMappingMapper->releaseClaim(
+			self::INBOUND_POST_ENTITY,
+			$this->inboundPostKey($senderUid, $roomToken),
+		);
 	}
 
 	private function isInboundPostActive(string $senderUid, string $roomToken): bool {
-		return $this->cache->get($this->inboundPostKey($senderUid, $roomToken)) !== null;
+		if ($this->cache->get($this->inboundPostKey($senderUid, $roomToken)) !== null) {
+			return true;
+		}
+
+		// TTL-bounded: a request that dies mid-ingest must not block outbound
+		// sync for this user and room forever.
+		return $this->idMappingMapper->hasFreshClaim(
+			self::INBOUND_POST_ENTITY,
+			$this->inboundPostKey($senderUid, $roomToken),
+			self::INBOUND_POST_LOCK_TTL,
+		);
 	}
 
 	// ---------------------------------------------------------------

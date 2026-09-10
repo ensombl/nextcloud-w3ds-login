@@ -588,34 +588,89 @@ class AttachmentSyncService {
 			return null;
 		}
 
-		$target = $this->uniqueName($folder, $this->sanitiseFilename($filename));
+		return $this->writeAttachmentFile($folder, $this->sanitiseFilename($filename), $bytes);
+	}
 
-		// Create then write: Folder::newFile() with content in one call is
-		// rejected on some storages.
-		$file = $folder->newFile($target);
-		$file->putContent($bytes);
+	/**
+	 * Write bytes to a fresh file, without ever exposing a partial one.
+	 *
+	 * Two requests can ingest the same attachment at once -- polling is driven
+	 * by every open browser tab, plus cron, plus the webhook. Choosing a name
+	 * with nodeExists() and creating it later is check-then-act: both requests
+	 * can pick the same free name, and the second truncates and rewrites the
+	 * file while the first is still being read. A reader in that window gets a
+	 * partially written image: the header parses, so dimensions are right, but
+	 * the pixel data is garbage and the preview renders as a flat block.
+	 *
+	 * Nextcloud cannot serialise this for us here: file locking requires a
+	 * distributed cache, and there is none by default.
+	 *
+	 * So the write goes to a name unique to *this* attempt, which no
+	 * concurrent request can also choose, and the file is only moved to its
+	 * final name once the bytes are on disk. A loser of the race finds the
+	 * name taken and adopts the winner's completed file instead of writing
+	 * over it. Nothing ever observes a half-written file under the final name.
+	 */
+	private function writeAttachmentFile(\OCP\Files\Folder $folder, string $name, string $bytes): ?File {
+		$temporary = '.w3ds-incoming-' . bin2hex(random_bytes(8)) . '.part';
 
-		// Re-read the node rather than returning the one we just wrote
-		// through. newFile() creates an *empty* file, so this File object was
-		// built from a zero-byte cache entry, and putContent() does not
-		// refresh it. Talk decides whether an attachment can be previewed
-		// with `$size > 0 && isMimeSupported(...)` on the shared node, so a
-		// stale zero size means an image renders as an empty frame -- right
-		// dimensions, no picture -- while opening it works, because that
-		// path reads the file from disk again.
 		try {
-			$fresh = $folder->get($target);
-			if ($fresh instanceof File) {
-				return $fresh;
-			}
+			// Create then write: Folder::newFile() with content in one call is
+			// rejected on some storages.
+			$file = $folder->newFile($temporary);
+			$file->putContent($bytes);
 		} catch (\Throwable $e) {
-			$this->logger->warning('[W3DS Attachment] Could not re-read stored attachment', [
-				'target' => $target,
+			$this->logger->warning('[W3DS Attachment] Failed to stage attachment', [
 				'exception' => $e->getMessage(),
 			]);
+			return null;
 		}
 
+		for ($attempt = 0; $attempt < 100; $attempt++) {
+			$target = $attempt === 0 ? $name : $this->numberedName($name, $attempt);
+
+			try {
+				// Racy by nature, but only as a shortcut: the move below is
+				// what actually decides, and it fails if we lose.
+				if ($folder->nodeExists($target)) {
+					continue;
+				}
+
+				$file->move($folder->getPath() . '/' . $target);
+
+				// Re-read so the returned node reflects the completed file
+				// rather than the staging entry it was created from. Talk
+				// gates previews on the shared node's size, so a stale zero
+				// would suppress them.
+				$moved = $folder->get($target);
+
+				return $moved instanceof File ? $moved : $file;
+			} catch (\Throwable) {
+				// Someone claimed this name between the check and the move.
+				// Try the next one.
+				continue;
+			}
+		}
+
+		// Could not find a free name; keep the staged file rather than losing
+		// the attachment entirely.
+		$this->logger->warning('[W3DS Attachment] Could not place attachment under a final name', [
+			'name' => $name,
+		]);
+
 		return $file;
+	}
+
+	/**
+	 * `name (n).ext` -- the conventional way to sit alongside a file that
+	 * already holds the name.
+	 */
+	private function numberedName(string $name, int $n): string {
+		$dot = strrpos($name, '.');
+		$stem = $dot === false ? $name : substr($name, 0, $dot);
+		$ext = $dot === false ? '' : substr($name, $dot);
+
+		return $stem . ' (' . $n . ')' . $ext;
 	}
 
 	/**
@@ -632,28 +687,6 @@ class AttachmentSyncService {
 		}
 
 		return $name;
-	}
-
-	/**
-	 * Append ` (n)` before the extension until the name is free.
-	 */
-	private function uniqueName(\OCP\Files\Folder $folder, string $name): string {
-		if (!$folder->nodeExists($name)) {
-			return $name;
-		}
-
-		$dot = strrpos($name, '.');
-		$stem = $dot === false ? $name : substr($name, 0, $dot);
-		$ext = $dot === false ? '' : substr($name, $dot);
-
-		for ($i = 1; $i < 100; $i++) {
-			$candidate = $stem . ' (' . $i . ')' . $ext;
-			if (!$folder->nodeExists($candidate)) {
-				return $candidate;
-			}
-		}
-
-		return $stem . '-' . bin2hex(random_bytes(4)) . $ext;
 	}
 
 	/**
