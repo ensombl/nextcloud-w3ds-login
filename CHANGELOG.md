@@ -5,13 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Entries below are reconstructed from commit history. The repository carries no
-release tags yet, so the version headings correspond to the `<version>` values
-recorded in `appinfo/info.xml` rather than to published releases.
+Entries below are reconstructed from commit history.
 
 ## [Unreleased]
 
-## [0.7.0]
+## [0.7.0] - 2026-09-10
+
+### Fixed
+
+- Avatars are downscaled before storage, so a high-resolution profile picture no
+  longer exhausts the web tier's memory limit and falls back to initials.
+- Attachments and avatars that arrive while another poller is running are no
+  longer dropped when both race to create the same folder.
+- Content mirrored from a remote W3DS platform is displayed only and is no
+  longer written back to the eVault as if it originated here.
 
 ### Added
 

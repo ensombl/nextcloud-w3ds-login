@@ -33,12 +33,19 @@ Talk chat sync (requires Nextcloud Talk):
     <licence>AGPL-3.0-or-later</licence>
     <author>Ensombl Pte. Ltd.</author>
     <namespace>W3dsLogin</namespace>
+    <documentation>
+        <user>https://github.com/ensombl/nextcloud-w3ds-login/blob/main/docs/how-it-works.md</user>
+        <admin>https://github.com/ensombl/nextcloud-w3ds-login/blob/main/docs/installation.md</admin>
+        <developer>https://github.com/ensombl/nextcloud-w3ds-login/blob/main/docs/how-it-works.md</developer>
+    </documentation>
     <category>security</category>
     <category>integration</category>
     <category>social</category>
     <website>https://github.com/ensombl/nextcloud-w3ds-login</website>
     <bugs>https://github.com/ensombl/nextcloud-w3ds-login/issues</bugs>
     <repository type="git">https://github.com/ensombl/nextcloud-w3ds-login.git</repository>
+    <screenshot>https://raw.githubusercontent.com/ensombl/nextcloud-w3ds-login/main/screenshots/01-login-button.png</screenshot>
+    <screenshot>https://raw.githubusercontent.com/ensombl/nextcloud-w3ds-login/main/screenshots/02-qr-signin.png</screenshot>
     <dependencies>
         <php min-version="8.1"/>
         <nextcloud min-version="30" max-version="33"/>
