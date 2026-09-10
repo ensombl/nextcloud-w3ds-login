@@ -968,9 +968,8 @@ class ChatSyncService {
 			// elsewhere from appearing. A `system` message is excluded: those
 			// are membership notices, never user content.
 			if ($mediaUrl !== null && $messageType !== 'system') {
-				// Talk has no forward concept, so the attribution has to ride
-				// along in the caption. Without it a forwarded image is
-				// indistinguishable from one the forwarder took themselves.
+				// A share cannot carry a reply parent, so an attachment
+				// forward keeps the textual attribution.
 				$attributed = $this->attributeForward($content, $forwardedFrom, $ownerW3id);
 
 				// `content` on an attachment envelope is the sender's caption
@@ -1003,7 +1002,16 @@ class ChatSyncService {
 			}
 
 			// Same attribution for the plain-text path.
-			$content = $this->attributeForward($content, $forwardedFrom, $ownerW3id);
+			//
+			// Prefer Talk's own quoting: replying to the forwarded message
+			// renders a real quote block attributed to its author, which is
+			// both the native representation and unforgeable, unlike a line of
+			// text anyone could type. Only when the original is not present
+			// locally do we fall back to naming it in the text.
+			$quotedLocalId = $this->localCommentForForward($forwardedFrom, $roomToken);
+			if ($quotedLocalId === null) {
+				$content = $this->attributeForward($content, $forwardedFrom, $ownerW3id);
+			}
 
 			$localMessageId = $this->postTalkMessage(
 				$roomToken,
@@ -1011,6 +1019,7 @@ class ChatSyncService {
 				$content,
 				$messageType,
 				is_string($data['createdAt'] ?? null) ? $data['createdAt'] : null,
+				$quotedLocalId,
 			);
 			if ($localMessageId === null) {
 				return;
@@ -1166,6 +1175,45 @@ class ChatSyncService {
 		]);
 
 		return [$merged, $newRaw, $this->mentionTranslator->toTalk($newRaw), $newType, $forwardedFrom];
+	}
+
+	/**
+	 * Local Talk comment for the message a forward points at, if we have it.
+	 *
+	 * `forwardedFrom.messageId` names an envelope in the *sender's* vault. The
+	 * same logical message is stored under a different envelope id in every
+	 * participant's vault, so a direct lookup only succeeds when we happen to
+	 * have ingested that particular replica. That is the common case for a
+	 * message forwarded within a conversation we are already part of.
+	 *
+	 * Returns null when the original was never synced here, or lives in a
+	 * different room -- Talk rejects a reply parent from another room.
+	 *
+	 * @param array<string, mixed>|null $forwardedFrom
+	 */
+	private function localCommentForForward(?array $forwardedFrom, string $roomToken): ?string {
+		if ($forwardedFrom === null) {
+			return null;
+		}
+
+		$messageId = is_string($forwardedFrom['messageId'] ?? null) ? $forwardedFrom['messageId'] : '';
+		if ($messageId === '') {
+			return null;
+		}
+
+		try {
+			$localId = $this->idMappingMapper->getLocalId('message', $messageId);
+		} catch (\Throwable) {
+			return null;
+		}
+
+		// Attachments are recorded as `share:<id>`, which is not a comment id
+		// and cannot be quoted.
+		if ($localId === null || !ctype_digit($localId)) {
+			return null;
+		}
+
+		return $localId;
 	}
 
 	/**
@@ -1774,12 +1822,29 @@ class ChatSyncService {
 		string $content,
 		string $messageType,
 		?string $createdAt = null,
+		?string $replyToLocalId = null,
 	): ?string {
 		try {
 			$manager = \OCP\Server::get(\OCA\Talk\Manager::class);
 			$room = $manager->getRoomByToken($roomToken);
 
 			$chatManager = \OCP\Server::get(\OCA\Talk\Chat\ChatManager::class);
+
+			// A forward is posted as a reply to the message it forwards, when
+			// that message exists here. Talk then renders its own quote block,
+			// attributed to the original author, which is the closest native
+			// equivalent of the sending platform's forward header -- and
+			// unlike a text prefix it cannot be forged by typing it.
+			$replyTo = null;
+			if ($replyToLocalId !== null) {
+				try {
+					// getComment() already refuses a comment belonging to a
+					// different room, so a returned comment is safe to quote.
+					$replyTo = $chatManager->getComment($room, $replyToLocalId);
+				} catch (\Throwable) {
+					// Original not available locally; post unquoted.
+				}
+			}
 
 			// Stamp the message with the time the sender actually sent it.
 			// Using "now" instead makes every backfilled message look like it
@@ -1793,7 +1858,7 @@ class ChatSyncService {
 				$senderUid,
 				$content,
 				$creationDateTime,
-				null,
+				$replyTo,
 				'',
 				false,
 			);
