@@ -15,7 +15,11 @@ occ:
 shell:
 	docker compose exec app bash
 
+# Talk (spreed) is not part of the Nextcloud base image, and chat sync is a
+# no-op without it, so install it alongside our own app.
 enable:
+	docker compose exec --user www-data app php occ app:install spreed || \
+		docker compose exec --user www-data app php occ app:enable spreed
 	docker compose exec --user www-data app php occ app:enable w3ds_login
 
 restart:
