@@ -595,6 +595,26 @@ class AttachmentSyncService {
 		$file = $folder->newFile($target);
 		$file->putContent($bytes);
 
+		// Re-read the node rather than returning the one we just wrote
+		// through. newFile() creates an *empty* file, so this File object was
+		// built from a zero-byte cache entry, and putContent() does not
+		// refresh it. Talk decides whether an attachment can be previewed
+		// with `$size > 0 && isMimeSupported(...)` on the shared node, so a
+		// stale zero size means an image renders as an empty frame -- right
+		// dimensions, no picture -- while opening it works, because that
+		// path reads the file from disk again.
+		try {
+			$fresh = $folder->get($target);
+			if ($fresh instanceof File) {
+				return $fresh;
+			}
+		} catch (\Throwable $e) {
+			$this->logger->warning('[W3DS Attachment] Could not re-read stored attachment', [
+				'target' => $target,
+				'exception' => $e->getMessage(),
+			]);
+		}
+
 		return $file;
 	}
 
