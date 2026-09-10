@@ -26,6 +26,12 @@ class Application extends App implements IBootstrap {
 
 	// Talk event classes (may vary by Talk version)
 	private const TALK_MESSAGE_SENT_EVENT = 'OCA\\Talk\\Events\\ChatMessageSentEvent';
+	// A file share is not a chat message to Talk: ChatManager routes it
+	// through addSystemMessage(), which emits SystemMessageSentEvent with the
+	// `object_shared` verb. Listening only for ChatMessageSentEvent therefore
+	// misses every attachment. The listener filters on verb, so ordinary
+	// system messages (joins, calls, renames) are still ignored.
+	private const TALK_SYSTEM_MESSAGE_SENT_EVENT = 'OCA\\Talk\\Events\\SystemMessageSentEvent';
 	private const TALK_ROOM_CREATED_EVENT = 'OCA\\Talk\\Events\\RoomCreatedEvent';
 	private const TALK_ATTENDEES_ADDED_EVENT = 'OCA\\Talk\\Events\\AttendeesAddedEvent';
 	private const TALK_ATTENDEES_REMOVED_EVENT = 'OCA\\Talk\\Events\\AttendeesRemovedEvent';
@@ -50,6 +56,7 @@ class Application extends App implements IBootstrap {
 		// Register Talk event listeners -- Nextcloud resolves lazily,
 		// so these are safe even if Talk is not installed (events just never fire)
 		$context->registerEventListener(self::TALK_MESSAGE_SENT_EVENT, MessageSentListener::class);
+		$context->registerEventListener(self::TALK_SYSTEM_MESSAGE_SENT_EVENT, MessageSentListener::class);
 		$context->registerEventListener(self::TALK_ROOM_CREATED_EVENT, RoomCreatedListener::class);
 		// Only roster-change events. ParticipantModifiedEvent fires on read-marker
 		// updates and similar per-user state changes, which would re-push the chat

@@ -58,6 +58,7 @@ class ChatSyncService {
 		ICacheFactory $cacheFactory,
 		private LoggerInterface $logger,
 		private MentionTranslator $mentionTranslator,
+		private AttachmentSyncService $attachmentSync,
 	) {
 		$this->cache = $cacheFactory->createDistributed(Application::APP_ID);
 	}
@@ -519,6 +520,46 @@ class ChatSyncService {
 			$acl = $participantW3ids;
 		}
 
+		// A file share carries no user text -- the comment message is a JSON
+		// share reference and the bytes live in Nextcloud. Upload the blob and
+		// describe it the way peer platforms do, since that is what their
+		// renderers read (see the field notes on pushAttachment()).
+		if (($messageData['verb'] ?? '') === AttachmentSyncService::TALK_SHARE_VERB) {
+			$attachment = $this->attachmentSync->pushAttachment(
+				$ncUid,
+				$w3id,
+				(string)($messageData['message'] ?? ''),
+				$acl,
+			);
+
+			if ($attachment !== null) {
+				// `fileId` holds the w3ds://file URI and `file` its metadata:
+				// that pair is what other platforms dereference to render an
+				// attachment. `mediaUrl` is also populated because the Message
+				// schema names it, but a w3ds:// value there is not something
+				// an <img> can load, so it cannot be the only reference.
+				$payload['fileId'] = $attachment['mediaUrl'];
+				$payload['file'] = [
+					'name' => $attachment['filename'],
+					'size' => (string)$attachment['size'],
+					'mimeType' => $attachment['mimeType'],
+				];
+				$payload['mediaUrl'] = $attachment['mediaUrl'];
+				$payload['type'] = $attachment['type'];
+				// Peers put the caption in `content` and carry the filename in
+				// `file.name`, so an absent caption means empty content rather
+				// than the filename repeated.
+				$payload['content'] = $attachment['caption'] !== null
+					? $this->mentionTranslator->toWire($attachment['caption'])
+					: '';
+			} else {
+				// Upload failed. Send the message as text rather than
+				// dropping it, so the conversation stays intact.
+				$payload['type'] = 'text';
+				$payload['content'] = '[attachment could not be synced]';
+			}
+		}
+
 		$existingGlobalId = $this->idMappingMapper->getGlobalId('message', $localId);
 
 		if ($existingGlobalId !== null) {
@@ -719,6 +760,44 @@ class ChatSyncService {
 		// before we know the resulting local ID.
 		$this->beginInboundPost($senderUid, $roomToken);
 		try {
+			// An attachment message materialises as a real Talk file share
+			// rather than text: download the blob, drop it in the recipient's
+			// Files, and share it into the room. Talk generates its own
+			// comment for the share, so there's nothing further to post.
+			// Peers reference the blob from `fileId` and often omit
+			// `mediaUrl` entirely, or fill it with a base64 data URI meant for
+			// direct rendering. Prefer whichever field actually holds a
+			// w3ds://file URI, which is the only thing we can dereference.
+			$mediaUrl = $this->pickAttachmentUri($data);
+			if (in_array($messageType, ['file', 'image'], true) && $mediaUrl !== null) {
+				// `content` on an attachment envelope is the sender's caption
+				// when they wrote one, and the bare filename otherwise.
+				// pullAttachment() drops it when it merely repeats the
+				// filename, which it only knows after dereferencing the URI.
+				$share = $this->attachmentSync->pullAttachment(
+					$mediaUrl,
+					$senderUid,
+					$roomToken,
+					$content !== '' ? $content : null,
+				);
+				if ($share !== null) {
+					// Map the envelope to the share so the same attachment is
+					// not re-materialised on the next poll.
+					$this->idMappingMapper->storeMapping(
+						'message',
+						'share:' . $share->getId(),
+						$globalId,
+						$ownerW3id,
+					);
+					$this->cache->set($sigKey, 'share:' . $share->getId(), self::MESSAGE_SIG_CACHE_TTL);
+					return;
+				}
+
+				// Fall through to a text message so the conversation still
+				// shows that something was sent.
+				$content = $content !== '' ? $content : '[attachment]';
+			}
+
 			$localMessageId = $this->postTalkMessage(
 				$roomToken,
 				$senderUid,
@@ -1374,9 +1453,34 @@ class ChatSyncService {
 		return ($talkType === 1 || $talkType === 5) ? 'direct' : 'group';
 	}
 
+	/**
+	 * Pick the dereferenceable attachment URI out of a Message envelope.
+	 *
+	 * Platforms disagree about where the blob reference lives. The reference
+	 * implementation writes the `w3ds://file` URI to `fileId` and uses
+	 * `mediaUrl` for a base64 data URI it can render inline, when it fills it
+	 * at all. We write both. A data URI is useless to us (Talk needs real
+	 * bytes in the recipient's Files), so take the first field that actually
+	 * carries a w3ds://file URI rather than trusting either name.
+	 */
+	private function pickAttachmentUri(array $data): ?string {
+		foreach (['fileId', 'mediaUrl'] as $field) {
+			$value = $data[$field] ?? null;
+			if (is_string($value) && str_starts_with($value, 'w3ds://file')) {
+				return $value;
+			}
+		}
+
+		return null;
+	}
+
 	private function mapMessageVerbToGlobal(string $verb): string {
 		return match ($verb) {
 			'system' => 'system',
+			// Talk's file-share verb. `object` was never emitted for shares,
+			// so the previous mapping could not fire; the concrete type
+			// (image vs file) is refined by the attachment payload.
+			'object_shared' => 'file',
 			'object' => 'file',
 			default => 'text',
 		};

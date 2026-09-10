@@ -45,6 +45,9 @@ class EvaultClient {
 	private const RATE_LIMIT_MAX_WAIT = 60;
 	private const RATE_LIMIT_MAX_RETRIES = 2;
 
+	/** Protocol cap on a single upload's decoded size (eVault rejects above this). */
+	private const MAX_UPLOAD_BYTES = 250 * 1024 * 1024;
+
 	private ICache $cache;
 
 	public function __construct(
@@ -513,6 +516,209 @@ class EvaultClient {
 	}
 
 	/**
+	 * Upload a file to the user's eVault and return its `w3ds://file` URI.
+	 *
+	 * Blobs are addressed by URI rather than embedded in the message
+	 * envelope. The eVault streams the bytes to object storage and records a
+	 * File MetaEnvelope (ontology `w3ds-file-v1`), which is what the returned
+	 * URI addresses.
+	 *
+	 * @param string $content Raw file bytes (base64-encoded here)
+	 * @return string|null The `w3ds://file` URI, or null when the upload failed
+	 */
+	public function uploadFile(
+		string $w3id,
+		string $filename,
+		string $contentType,
+		string $content,
+		array $acl = ['*'],
+	): ?string {
+		if (strlen($content) > self::MAX_UPLOAD_BYTES) {
+			$this->logger->warning('Refusing to upload file above the protocol size limit', [
+				'w3id' => $w3id,
+				'filename' => $filename,
+				'bytes' => strlen($content),
+			]);
+			return null;
+		}
+
+		$query = <<<'GRAPHQL'
+        mutation UploadFile($input: UploadFileInput!) {
+            uploadFile(input: $input) {
+                uri
+                metaEnvelopeId
+                publicUrl
+                errors { field message code }
+            }
+        }
+        GRAPHQL;
+
+		try {
+			$data = $this->graphql($w3id, $query, [
+				'input' => [
+					'filename' => $filename,
+					'contentType' => $contentType,
+					'content' => base64_encode($content),
+					'acl' => $acl,
+				],
+			]);
+
+			$result = $data['uploadFile'] ?? null;
+			if (!is_array($result)) {
+				return null;
+			}
+
+			if (!empty($result['errors'])) {
+				$this->logger->warning('eVault rejected file upload', [
+					'w3id' => $w3id,
+					'filename' => $filename,
+					'errors' => $result['errors'],
+				]);
+				return null;
+			}
+
+			$uri = $result['uri'] ?? null;
+			return is_string($uri) && $uri !== '' ? $uri : null;
+		} catch (\Throwable $e) {
+			$this->logger->warning('File upload to eVault failed', [
+				'w3id' => $w3id,
+				'filename' => $filename,
+				'exception' => $e->getMessage(),
+			]);
+			return null;
+		}
+	}
+
+	/**
+	 * Parse a `w3ds://file?id=@ename/envelopeId` URI.
+	 *
+	 * @return array{ename: string, metaEnvelopeId: string}|null
+	 */
+	public function parseFileUri(string $uri): ?array {
+		if (!str_starts_with($uri, 'w3ds://file')) {
+			return null;
+		}
+
+		$query = parse_url($uri, PHP_URL_QUERY);
+		if (!is_string($query)) {
+			return null;
+		}
+
+		parse_str($query, $params);
+		$id = $params['id'] ?? null;
+		if (!is_string($id) || !str_starts_with($id, '@')) {
+			return null;
+		}
+
+		// `@ename/envelopeId` -- split on the first slash, matching the
+		// reference parser. Both segments must be non-empty, and an eName is
+		// more than a bare '@'.
+		$slash = strpos($id, '/');
+		if ($slash === false) {
+			return null;
+		}
+
+		$ename = substr($id, 0, $slash);
+		$metaEnvelopeId = substr($id, $slash + 1);
+
+		if (strlen($ename) <= 1 || $metaEnvelopeId === '') {
+			return null;
+		}
+
+		return [
+			'ename' => $ename,
+			'metaEnvelopeId' => $metaEnvelopeId,
+		];
+	}
+
+	/**
+	 * Resolve a `w3ds://file` URI to the file's metadata and public URL.
+	 *
+	 * Reads the File MetaEnvelope directly rather than following the eVault's
+	 * `/files/:id` redirect, so we get `filename` and `contentType` in the
+	 * same round trip instead of inferring them from the blob.
+	 *
+	 * @return array{publicUrl: string, filename: string, contentType: string, size: int}|null
+	 */
+	public function dereferenceFileUri(string $uri): ?array {
+		$parsed = $this->parseFileUri($uri);
+		if ($parsed === null) {
+			$this->logger->info('Not a parseable w3ds file URI, ignoring', ['uri' => $uri]);
+			return null;
+		}
+
+		try {
+			$envelope = $this->fetchMetaEnvelopeById($parsed['ename'], $parsed['metaEnvelopeId']);
+			$payload = is_array($envelope) ? ($envelope['parsed'] ?? null) : null;
+			if (!is_array($payload)) {
+				return null;
+			}
+
+			$publicUrl = $payload['publicUrl'] ?? null;
+			if (!is_string($publicUrl) || $publicUrl === '') {
+				return null;
+			}
+
+			// The redirect target is validated on the eVault side, but we
+			// fetch it ourselves, so re-check the scheme here.
+			if (!str_starts_with($publicUrl, 'http://') && !str_starts_with($publicUrl, 'https://')) {
+				$this->logger->warning('File envelope carries an unsafe URL scheme, ignoring', [
+					'uri' => $uri,
+				]);
+				return null;
+			}
+
+			return [
+				'publicUrl' => $publicUrl,
+				'filename' => is_string($payload['filename'] ?? null) ? $payload['filename'] : 'attachment',
+				'contentType' => is_string($payload['contentType'] ?? null) ? $payload['contentType'] : 'application/octet-stream',
+				'size' => is_numeric($payload['size'] ?? null) ? (int)$payload['size'] : 0,
+			];
+		} catch (\Throwable $e) {
+			$this->logger->warning('Failed to dereference file URI', [
+				'uri' => $uri,
+				'exception' => $e->getMessage(),
+			]);
+			return null;
+		}
+	}
+
+	/**
+	 * Download the bytes behind a resolved file URL.
+	 *
+	 * Goes through Nextcloud's HTTP client so the admin's proxy and SSRF
+	 * settings apply -- object storage may be on a host the admin has
+	 * opinions about.
+	 */
+	public function downloadFile(string $publicUrl, int $maxBytes): ?string {
+		try {
+			$response = $this->clientService->newClient()->get($publicUrl, [
+				'timeout' => self::HTTP_TIMEOUT,
+			]);
+
+			$body = (string)$response->getBody();
+			if ($body === '') {
+				return null;
+			}
+
+			if (strlen($body) > $maxBytes) {
+				$this->logger->warning('Remote attachment exceeds the configured limit, skipping', [
+					'bytes' => strlen($body),
+					'maxBytes' => $maxBytes,
+				]);
+				return null;
+			}
+
+			return $body;
+		} catch (\Throwable $e) {
+			$this->logger->warning('Failed to download attachment', [
+				'exception' => $e->getMessage(),
+			]);
+			return null;
+		}
+	}
+
+	/**
 	 * Fetch a single MetaEnvelope by ID. Used for read-back verification.
 	 *
 	 * @return array<string, mixed>|null Decoded envelope (id, ontology, parsed) or null
@@ -578,7 +784,11 @@ class EvaultClient {
 				// show. Ask GraphQL for this one identity instead.
 				$own = $this->findOwnProfileEnvelopeId($w3id);
 				if ($own !== null) {
-					$this->cache->set($cacheKey, $own, self::PROFILE_ID_CACHE_TTL);
+					// Both directions, always. Caching only eName -> envelope
+					// leaves resolveW3idFromProfileEnvelopeId() unable to name
+					// this person, and a chat's participantIds carry envelope
+					// IDs, so the peer silently drops out of the room.
+					$this->primeProfileCacheEntry($w3id, $own);
 				}
 
 				return $own;
@@ -621,9 +831,11 @@ class EvaultClient {
 				]);
 			}
 
-			// Re-prime the canonical mapping under the cache key we'll read on next call.
+			// Re-prime the canonical mapping under the cache key we'll read on
+			// next call, in both directions: the reverse entry is what lets a
+			// chat's participantIds (which are envelope IDs) name a person.
 			if ($found !== null) {
-				$this->cache->set($cacheKey, $found, self::PROFILE_ID_CACHE_TTL);
+				$this->primeProfileCacheEntry($w3id, $found);
 			}
 			return $found;
 		} catch (\Throwable $e) {
