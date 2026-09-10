@@ -521,9 +521,9 @@ class ChatSyncService {
 		}
 
 		// A file share carries no user text -- the comment message is a JSON
-		// share reference and the bytes live in Nextcloud. Upload the blob
-		// and reference it by `w3ds://file` URI, which is what the Message
-		// schema's `mediaUrl` expects.
+		// share reference and the bytes live in Nextcloud. Upload the blob and
+		// describe it the way peer platforms do, since that is what their
+		// renderers read (see the field notes on pushAttachment()).
 		if (($messageData['verb'] ?? '') === AttachmentSyncService::TALK_SHARE_VERB) {
 			$attachment = $this->attachmentSync->pushAttachment(
 				$ncUid,
@@ -533,16 +533,25 @@ class ChatSyncService {
 			);
 
 			if ($attachment !== null) {
+				// `fileId` holds the w3ds://file URI and `file` its metadata:
+				// that pair is what other platforms dereference to render an
+				// attachment. `mediaUrl` is also populated because the Message
+				// schema names it, but a w3ds:// value there is not something
+				// an <img> can load, so it cannot be the only reference.
+				$payload['fileId'] = $attachment['mediaUrl'];
+				$payload['file'] = [
+					'name' => $attachment['filename'],
+					'size' => (string)$attachment['size'],
+					'mimeType' => $attachment['mimeType'],
+				];
 				$payload['mediaUrl'] = $attachment['mediaUrl'];
 				$payload['type'] = $attachment['type'];
-				// The raw JSON share reference is meaningless off-platform.
-				// Prefer the caption the sender typed, which is the only text
-				// they actually wrote; fall back to the filename so the
-				// message still renders as something sensible. Mentions in a
-				// caption are translated like any other message text.
+				// Peers put the caption in `content` and carry the filename in
+				// `file.name`, so an absent caption means empty content rather
+				// than the filename repeated.
 				$payload['content'] = $attachment['caption'] !== null
 					? $this->mentionTranslator->toWire($attachment['caption'])
-					: $attachment['filename'];
+					: '';
 			} else {
 				// Upload failed. Send the message as text rather than
 				// dropping it, so the conversation stays intact.
@@ -755,8 +764,12 @@ class ChatSyncService {
 			// rather than text: download the blob, drop it in the recipient's
 			// Files, and share it into the room. Talk generates its own
 			// comment for the share, so there's nothing further to post.
-			$mediaUrl = $data['mediaUrl'] ?? null;
-			if (in_array($messageType, ['file', 'image'], true) && is_string($mediaUrl) && $mediaUrl !== '') {
+			// Peers reference the blob from `fileId` and often omit
+			// `mediaUrl` entirely, or fill it with a base64 data URI meant for
+			// direct rendering. Prefer whichever field actually holds a
+			// w3ds://file URI, which is the only thing we can dereference.
+			$mediaUrl = $this->pickAttachmentUri($data);
+			if (in_array($messageType, ['file', 'image'], true) && $mediaUrl !== null) {
 				// `content` on an attachment envelope is the sender's caption
 				// when they wrote one, and the bare filename otherwise.
 				// pullAttachment() drops it when it merely repeats the
@@ -1438,6 +1451,27 @@ class ChatSyncService {
 	private function mapRoomTypeToGlobal(int $talkType): string {
 		// Talk types: 1=ONE_TO_ONE, 2=GROUP, 3=PUBLIC, 4=CHANGELOG, 5=FORMER_ONE_TO_ONE, 6=NOTE_TO_SELF
 		return ($talkType === 1 || $talkType === 5) ? 'direct' : 'group';
+	}
+
+	/**
+	 * Pick the dereferenceable attachment URI out of a Message envelope.
+	 *
+	 * Platforms disagree about where the blob reference lives. The reference
+	 * implementation writes the `w3ds://file` URI to `fileId` and uses
+	 * `mediaUrl` for a base64 data URI it can render inline, when it fills it
+	 * at all. We write both. A data URI is useless to us (Talk needs real
+	 * bytes in the recipient's Files), so take the first field that actually
+	 * carries a w3ds://file URI rather than trusting either name.
+	 */
+	private function pickAttachmentUri(array $data): ?string {
+		foreach (['fileId', 'mediaUrl'] as $field) {
+			$value = $data[$field] ?? null;
+			if (is_string($value) && str_starts_with($value, 'w3ds://file')) {
+				return $value;
+			}
+		}
+
+		return null;
 	}
 
 	private function mapMessageVerbToGlobal(string $verb): string {

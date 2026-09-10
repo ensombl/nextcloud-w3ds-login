@@ -107,7 +107,7 @@ class AttachmentSyncService {
 	 *
 	 * @param string $commentMessage The raw comment message (JSON share ref)
 	 * @param string[] $acl eNames allowed to read the blob
-	 * @return array{mediaUrl: string, type: string, filename: string, caption: ?string}|null
+	 * @return array{mediaUrl: string, type: string, filename: string, mimeType: string, size: int, caption: ?string}|null
 	 */
 	public function pushAttachment(
 		string $senderUid,
@@ -164,6 +164,8 @@ class AttachmentSyncService {
 				// receiving platform uses it to decide how to render.
 				'type' => str_starts_with($mime, 'image/') ? 'image' : 'file',
 				'filename' => $file->getName(),
+				'mimeType' => $mime,
+				'size' => $size,
 				'caption' => $this->extractCaption($commentMessage),
 			];
 		} catch (\Throwable $e) {
