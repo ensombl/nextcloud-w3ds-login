@@ -556,7 +556,7 @@ class ChatSyncService {
 		// Check if we already have this chat locally
 		$existingLocalId = $this->idMappingMapper->getLocalId('chat', $globalId);
 		if ($existingLocalId !== null) {
-			$this->updateLocalChat($existingLocalId, $data);
+			$this->updateLocalChat($existingLocalId, $data, $ownerW3id);
 			return;
 		}
 
@@ -567,45 +567,13 @@ class ChatSyncService {
 		// not sink the whole room. A group chat whose members mostly live on
 		// other platforms is still a room this user belongs to, so the viewer
 		// (the eVault owner we are reading from) is always a participant.
-		$participantIds = $data['participantIds'] ?? [];
-		$references = is_array($participantIds) ? $participantIds : [];
-		$participantUids = [];
-		$seenW3ids = [];
-		$unresolved = 0;
-		foreach ($references as $pid) {
-			$w3id = $this->resolveParticipantIdToW3id((string)$pid, $ownerW3id);
-			if ($w3id === null) {
-				$unresolved++;
-				continue;
-			}
-			// The same person can be named by both shapes; count them once.
-			if (isset($seenW3ids[$w3id])) {
-				continue;
-			}
-			$seenW3ids[$w3id] = true;
-			$uid = $this->resolveW3idToNcUid($w3id);
-			if ($uid !== null) {
-				$participantUids[] = $uid;
-			} else {
-				$unresolved++;
-			}
-		}
-
-		// Guarantee the viewer's own membership. Without this, a room whose
-		// participantIds carry only unresolvable off-platform peers is dropped
-		// entirely and the user never sees the conversation.
-		$viewerUid = $this->resolveW3idToNcUid($ownerW3id);
-		if ($viewerUid !== null && !in_array($viewerUid, $participantUids, true)) {
-			$participantUids[] = $viewerUid;
-		}
-
-		$participantUids = array_values(array_unique($participantUids));
+		[$participantUids, $unresolved] = $this->resolveChatParticipantUids($data, $ownerW3id);
 
 		if (empty($participantUids)) {
 			$this->logger->warning('[W3DS Sync] No resolvable participants for inbound chat', [
 				'globalId' => $globalId,
 				'ownerW3id' => $ownerW3id,
-				'participantIdCount' => count($references),
+				'participantIdCount' => count(is_array($data['participantIds'] ?? null) ? $data['participantIds'] : []),
 			]);
 			return;
 		}
@@ -1248,7 +1216,132 @@ class ChatSyncService {
 		}
 	}
 
-	private function updateLocalChat(string $roomToken, array $data): void {
+	/**
+	 * Resolve a chat envelope's `participantIds` to local Nextcloud UIDs.
+	 *
+	 * Participants are named either by User profile envelope ID or by eName;
+	 * resolveParticipantIdToW3id() handles both shapes, and the same person
+	 * can be named by both, so identities are de-duplicated before mapping.
+	 *
+	 * Peers we cannot resolve are simply not represented locally; that must
+	 * not sink the whole room. A group chat whose members mostly live on
+	 * other platforms is still a room this user belongs to, so the viewer
+	 * (the eVault owner we are reading from) is always a participant.
+	 *
+	 * @param array<string, mixed> $data
+	 * @return array{0: list<string>, 1: int} [resolved UIDs, unresolved count]
+	 */
+	private function resolveChatParticipantUids(array $data, string $ownerW3id): array {
+		$participantIds = $data['participantIds'] ?? [];
+		$references = is_array($participantIds) ? $participantIds : [];
+		$participantUids = [];
+		$seenW3ids = [];
+		$unresolved = 0;
+		foreach ($references as $pid) {
+			$w3id = $this->resolveParticipantIdToW3id((string)$pid, $ownerW3id);
+			if ($w3id === null) {
+				$unresolved++;
+				continue;
+			}
+			if (isset($seenW3ids[$w3id])) {
+				continue;
+			}
+			$seenW3ids[$w3id] = true;
+			$uid = $this->resolveW3idToNcUid($w3id);
+			if ($uid !== null) {
+				$participantUids[] = $uid;
+			} else {
+				$unresolved++;
+			}
+		}
+
+		// Guarantee the viewer's own membership. Without this, a room whose
+		// participantIds carry only unresolvable off-platform peers is dropped
+		// entirely and the user never sees the conversation.
+		$viewerUid = $this->resolveW3idToNcUid($ownerW3id);
+		if ($viewerUid !== null && !in_array($viewerUid, $participantUids, true)) {
+			$participantUids[] = $viewerUid;
+		}
+
+		return [array_values(array_unique($participantUids)), $unresolved];
+	}
+
+	/**
+	 * Add anyone named by the chat envelope who is missing from the local
+	 * Talk room.
+	 *
+	 * Membership was previously only ever established at room creation time,
+	 * so a peer who joined the conversation later -- or who simply could not
+	 * be provisioned during the first ingest, which happens routinely when
+	 * the eVault rate-limits the profile lookup -- stayed absent from the
+	 * participant list forever, with no later pass that would correct it.
+	 *
+	 * Additive only: this reconciles people in, and never removes an existing
+	 * attendee, since the envelope we are reading is one replica's view and a
+	 * partial list must not be able to evict people from a live room.
+	 *
+	 * @param array<string, mixed> $data
+	 */
+	private function reconcileChatParticipants(string $roomToken, array $data, string $ownerW3id): void {
+		[$participantUids] = $this->resolveChatParticipantUids($data, $ownerW3id);
+		if (empty($participantUids)) {
+			return;
+		}
+
+		try {
+			$manager = \OCP\Server::get(\OCA\Talk\Manager::class);
+			$room = $manager->getRoomByToken($roomToken);
+			$participantService = \OCP\Server::get(\OCA\Talk\Service\ParticipantService::class);
+			$userManager = \OCP\Server::get(\OCP\IUserManager::class);
+
+			$existing = [];
+			foreach ($participantService->getParticipantsForRoom($room) as $p) {
+				$attendee = $p->getAttendee();
+				if ($attendee->getActorType() === 'users') {
+					$existing[$attendee->getActorId()] = true;
+				}
+			}
+
+			$missing = [];
+			foreach ($participantUids as $uid) {
+				if (isset($existing[$uid])) {
+					continue;
+				}
+				$user = $userManager->get($uid);
+				if ($user === null) {
+					continue;
+				}
+				$missing[] = [
+					'actorType' => 'users',
+					'actorId' => $uid,
+					'displayName' => $user->getDisplayName(),
+				];
+			}
+
+			if (empty($missing)) {
+				return;
+			}
+
+			// Adding an attendee fires Talk's attendee events, which the
+			// outbound listeners answer by pushing the room back to the
+			// eVault. This membership came *from* the eVault, so hold the
+			// sync lock to keep the ingest from echoing straight back out.
+			$this->setSyncLock('chat', $roomToken);
+			$participantService->addUsers($room, $missing);
+
+			$this->logger->info('[W3DS Sync] Added missing participants to existing chat', [
+				'roomToken' => $roomToken,
+				'addedUids' => array_column($missing, 'actorId'),
+			]);
+		} catch (\Throwable $e) {
+			$this->logger->warning('[W3DS Sync] Failed to reconcile chat participants', [
+				'roomToken' => $roomToken,
+				'exception' => $e->getMessage(),
+			]);
+		}
+	}
+
+	private function updateLocalChat(string $roomToken, array $data, string $ownerW3id = ''): void {
 		try {
 			$manager = \OCP\Server::get(\OCA\Talk\Manager::class);
 			$room = $manager->getRoomByToken($roomToken);
@@ -1265,6 +1358,10 @@ class ChatSyncService {
 				'roomToken' => $roomToken,
 				'exception' => $e,
 			]);
+		}
+
+		if ($ownerW3id !== '') {
+			$this->reconcileChatParticipants($roomToken, $data, $ownerW3id);
 		}
 	}
 

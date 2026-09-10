@@ -16,6 +16,12 @@ use OCP\Security\ISecureRandom;
 use Psr\Log\LoggerInterface;
 
 class UserProvisioningService {
+	/** Per-user config key recording the last avatar refresh attempt. */
+	private const AVATAR_CHECKED_AT_KEY = 'avatar_checked_at';
+
+	/** Avatars are cosmetic; one eVault round trip per user per day is plenty. */
+	private const AVATAR_REFRESH_INTERVAL = 86400;
+
 	public function __construct(
 		private W3dsMappingMapper $mapper,
 		private IUserManager $userManager,
@@ -24,6 +30,7 @@ class UserProvisioningService {
 		private IConfig $config,
 		private TentativeUserMapper $tentativeUserMapper,
 		private LoggerInterface $logger,
+		private AvatarSyncService $avatarSync,
 	) {
 	}
 
@@ -78,6 +85,45 @@ class UserProvisioningService {
 		}
 
 		$this->hydrateProfileFromEvault($user, $w3id, $prefetchedProfile);
+	}
+
+	/**
+	 * Refresh a linked user's avatar from their eVault profile.
+	 *
+	 * The provisioning path only runs once, so without this a picture
+	 * changed on another platform would never propagate. Throttled via a
+	 * per-user config timestamp: a login is a hot path and the avatar is
+	 * cosmetic, so at most one eVault round trip per user per interval.
+	 *
+	 * Silent on every failure -- this must never obstruct a login.
+	 */
+	public function refreshAvatarIfStale(IUser $user, string $w3id): void {
+		try {
+			$uid = $user->getUID();
+			$last = (int)$this->config->getUserValue($uid, Application::APP_ID, self::AVATAR_CHECKED_AT_KEY, '0');
+			if ($last > 0 && (time() - $last) < self::AVATAR_REFRESH_INTERVAL) {
+				return;
+			}
+
+			// Record the attempt before doing the work, so a persistently
+			// failing eVault doesn't re-trigger a fetch on every login.
+			$this->config->setUserValue($uid, Application::APP_ID, self::AVATAR_CHECKED_AT_KEY, (string)time());
+
+			$profileId = $this->evaultClient->getProfileEnvelopeId($w3id);
+			if ($profileId === null) {
+				return;
+			}
+			$envelope = $this->evaultClient->fetchMetaEnvelopeById($w3id, $profileId);
+			$parsed = $envelope['parsed'] ?? null;
+			if (is_array($parsed)) {
+				$this->avatarSync->syncFromProfile($uid, $parsed);
+			}
+		} catch (\Throwable $e) {
+			$this->logger->info('Avatar refresh failed; keeping existing avatar', [
+				'w3id' => $w3id,
+				'exception' => $e->getMessage(),
+			]);
+		}
 	}
 
 	/**
@@ -258,7 +304,16 @@ class UserProvisioningService {
 		}
 
 		try {
-			$this->mapper->findByNcUid($username);
+			$existingMapping = $this->mapper->findByNcUid($username);
+
+			// Mapped to the very w3id we were asked for. The lookup at the
+			// top of findOrCreateUser missed it because the mapping landed
+			// concurrently, so this is simply the winner of a race we lost:
+			// return it. Treating this as a conflict is what left a peer
+			// unprovisioned and therefore missing from their conversations.
+			if ($existingMapping->getW3id() === $w3id) {
+				return $user;
+			}
 
 			// Already mapped, to a different w3id than the one we were asked
 			// for. Two identities deriving one username would be a hash
@@ -266,6 +321,7 @@ class UserProvisioningService {
 			$this->logger->error('Refusing to adopt an account mapped to another W3ID', [
 				'w3id' => $w3id,
 				'uid' => $username,
+				'mappedW3id' => $existingMapping->getW3id(),
 			]);
 
 			return null;
@@ -334,6 +390,12 @@ class UserProvisioningService {
 			if (is_string($email) && $email !== '') {
 				$user->setEMailAddress($email);
 			}
+
+			// Auto-provisioned accounts otherwise land with no visual identity
+			// at all, so a busy group chat renders as a wall of identical
+			// initials. Failures here are logged and swallowed inside the
+			// avatar service; the account is still perfectly usable without one.
+			$this->avatarSync->syncFromProfile($user->getUID(), $parsed);
 		} catch (\Throwable $e) {
 			$this->logger->info('Could not hydrate profile from eVault; continuing with defaults', [
 				'w3id' => $w3id,
