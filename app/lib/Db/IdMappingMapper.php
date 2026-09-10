@@ -96,6 +96,36 @@ class IdMappingMapper extends QBMapper {
 	}
 
 	/**
+	 * Count mappings of a type whose global_id starts with $prefix.
+	 *
+	 * Used to number repeat occurrences of an identical message within one
+	 * eVault. `$prefix` is built from hex digests and separators, never from
+	 * user text, so it carries no LIKE wildcards; it is still escaped so a
+	 * future caller cannot turn it into one.
+	 */
+	public function countByGlobalIdPrefix(string $entityType, string $prefix): int {
+		$qb = $this->db->getQueryBuilder();
+		$escaped = $this->db->escapeLikeParameter($prefix);
+		$qb->select($qb->createFunction('COUNT(*)'))
+			->from($this->getTableName())
+			->where($qb->expr()->eq('entity_type', $qb->createNamedParameter($entityType)))
+			->andWhere($qb->expr()->like('global_id', $qb->createNamedParameter($escaped . '%')));
+
+		$this->db->beginTransaction();
+		try {
+			$result = $qb->executeQuery();
+			$count = (int)$result->fetchOne();
+			$result->closeCursor();
+			$this->db->commit();
+
+			return $count;
+		} catch (\Throwable $e) {
+			$this->db->rollBack();
+			throw $e;
+		}
+	}
+
+	/**
 	 * @return IdMapping[]
 	 */
 	public function findAllByOwner(string $ownerW3id, string $entityType): array {

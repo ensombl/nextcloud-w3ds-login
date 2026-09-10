@@ -28,6 +28,17 @@ class ChatSyncService {
 	 * be mistaken for an envelope ID.
 	 */
 	private const MESSAGE_SIG_ENTITY = 'message_sig';
+	/**
+	 * Prefix marking an occurrence-numbering row, which records "this
+	 * envelope, from this vault, is the Nth copy of this exact text". Keeps
+	 * those rows distinguishable from the identity rows that share the table.
+	 */
+	private const MESSAGE_OCCURRENCE_PREFIX = 'occ|';
+	/**
+	 * Entity type for occurrence-numbering rows. Separate from the identity
+	 * rows so counting occurrences never scans them.
+	 */
+	private const MESSAGE_OCC_ENTITY = 'message_occ';
 	private const CHAT_PARTICIPANT_HWM_PREFIX = 'w3ds_chat_pmax_';
 	private const CHAT_PARTICIPANT_HWM_TTL = 604800; // 7d high-water mark guard against pushChat shrinkage
 	private const PULL_LIST_CACHE_TTL = 120; // 2 min for chat/message ontology lists during pull sync
@@ -740,21 +751,17 @@ class ChatSyncService {
 		$content = $this->mentionTranslator->toTalk($rawContent);
 		$messageType = $data['type'] ?? 'text';
 
-		// Cross-replica dedup: the same logical message lives in every
-		// participant's eVault under a *different* global_id, so the outer
-		// envelope ID cannot identify it. We need something stable across
-		// replicas.
-		//
-		// Prefer the sender-assigned inner `id` when the envelope carries one;
-		// that is a genuine per-message identity and replicates unchanged.
-		// Otherwise fall back to a content signature — but include createdAt,
-		// which the previous content-only signature omitted. Without it, any
-		// repeat of an identical string by the same sender in the same room
-		// within the cache TTL was dropped and never posted: "ok", "yes",
-		// "+1", a re-sent link. Replicas of one logical message can carry
-		// different createdAt values (each platform stamps on replication), so
-		// this trades a rarer duplicate for no longer losing real messages.
-		$signature = $this->messageIdentitySignature($senderUid, $chatGlobalId, $data, $rawContent);
+		// Cross-replica dedup. See messageIdentitySignature() for why the
+		// outer envelope ID cannot be used directly and how a genuine repeat
+		// ("ok" twice) is kept distinct from a replica of one message.
+		$signature = $this->messageIdentitySignature(
+			$senderUid,
+			$chatGlobalId,
+			$data,
+			$rawContent,
+			$ownerW3id,
+			$globalId,
+		);
 		$sigKey = self::MESSAGE_SIG_CACHE_PREFIX . $signature;
 
 		// The signature has to outlive the request. `createDistributed()`
@@ -905,17 +912,50 @@ class ChatSyncService {
 	/**
 	 * Build the cross-replica identity key for an inbound message.
 	 *
-	 * The outer envelope ID differs per replica, so it cannot be used. Prefer
-	 * the sender-assigned inner `id` when present — that is a real per-message
-	 * identity that survives replication. Fall back to
-	 * (sender, chat, content, createdAt), which distinguishes a legitimately
-	 * repeated message from a replica of the same one.
+	 * The problem this solves: one logical message is readable from several
+	 * eVaults. The envelope lives in the owner's vault, and every other
+	 * participant's vault holds a `reference` pointer to it, so polling each
+	 * participant surfaces the same message repeatedly. Posting on each sight
+	 * of it is what made messages appear twice.
+	 *
+	 * Identity is therefore taken from the envelope itself wherever possible:
+	 *
+	 * 1. The sender-assigned inner `id`. The Message schema requires it, and
+	 *    it is a genuine per-message identity that survives replication. This
+	 *    is exact: two real messages with identical text always carry
+	 *    different ids, so nothing is ever wrongly collapsed.
+	 *
+	 * 2. Failing that, the envelope's own global ID *qualified by the vault it
+	 *    came from*. In practice no peer mapping writes `id` (the reference
+	 *    adapter's mappings simply do not emit one), so this is the live path.
+	 *    An envelope ID is stable per vault, so re-polling the same vault
+	 *    recognises the message, while a different vault's copy is a distinct
+	 *    key -- which is exactly the case (3) exists to close.
+	 *
+	 * 3. A content signature, used *only* to link the copies found in
+	 *    different vaults back to one another. This is the fuzzy step, so it
+	 *    must not swallow a genuine repeat: a user really can send "ok" twice.
+	 *    Content plus timestamp is not enough on its own, because platforms
+	 *    re-stamp `createdAt` on replication, and two quick "ok"s can share a
+	 *    whole-second timestamp.
+	 *
+	 *    So the content key is *occurrence-numbered*: the Nth identical
+	 *    message from a given vault gets ordinal N. The first "ok" from
+	 *    Meshenger matches the first "ok" seen elsewhere, the second matches
+	 *    the second, and a real repeat is never folded into its predecessor.
+	 *    Numbering is per source vault, so replicas of one message (one per
+	 *    vault) all receive the same ordinal.
+	 *
+	 * @param string $ownerW3id The vault this envelope was read from
+	 * @param string $globalId The envelope's ID within that vault
 	 */
 	private function messageIdentitySignature(
 		string $senderUid,
 		string $chatGlobalId,
 		array $data,
 		string $content,
+		string $ownerW3id = '',
+		string $globalId = '',
 	): string {
 		$innerId = $data['id'] ?? null;
 		if (is_string($innerId) && $innerId !== '') {
@@ -925,7 +965,62 @@ class ChatSyncService {
 		$createdAt = $data['createdAt'] ?? '';
 		$createdAt = is_string($createdAt) ? $createdAt : '';
 
-		return md5($senderUid . '|' . $chatGlobalId . '|' . $content . '|' . $createdAt);
+		// The content key, shared by every copy of this message regardless of
+		// which vault it was read from. Timestamp is deliberately excluded:
+		// platforms re-stamp it on replication, so including it would stop
+		// copies of one message from matching at all.
+		$contentKey = md5($senderUid . '|' . $chatGlobalId . '|' . $content);
+
+		// Without a source vault there is nothing to number occurrences
+		// against, so fall back to the old timestamp-qualified key.
+		if ($ownerW3id === '' || $globalId === '') {
+			return md5($contentKey . '|' . $createdAt);
+		}
+
+		// Which occurrence of this exact text, from this exact vault, is this?
+		//
+		// Row layout matters here, because the table carries unique indexes on
+		// both (entity_type, local_id) and (entity_type, global_id). The
+		// envelope ID goes in `local_id`, unique because an envelope is only
+		// numbered once. The prefixed ordinal goes in `global_id`, unique
+		// because a given (text, vault) pair has exactly one Nth occurrence.
+		// Putting the bare ordinal in `local_id` would collide the moment two
+		// different messages both wanted to be occurrence 0.
+		//
+		// Recording the envelope means a re-poll resolves to the ordinal it
+		// was already given rather than allocating a fresh one, so the count
+		// is stable instead of growing on every poll.
+		$occurrencePrefix = self::MESSAGE_OCCURRENCE_PREFIX . $contentKey . '|' . md5($ownerW3id) . '|';
+
+		$existing = $this->idMappingMapper->getGlobalId(self::MESSAGE_OCC_ENTITY, $globalId);
+		if (is_string($existing) && str_starts_with($existing, $occurrencePrefix)) {
+			return md5($contentKey . '|#' . substr($existing, strlen($occurrencePrefix)));
+		}
+
+		$ordinal = $this->idMappingMapper->countByGlobalIdPrefix(
+			self::MESSAGE_OCC_ENTITY,
+			$occurrencePrefix,
+		);
+
+		try {
+			$this->idMappingMapper->storeMapping(
+				self::MESSAGE_OCC_ENTITY,
+				$globalId,
+				$occurrencePrefix . $ordinal,
+				$ownerW3id,
+			);
+		} catch (\Throwable) {
+			// Another request numbered this envelope, or claimed this ordinal,
+			// first. Re-read to adopt whatever it decided so both requests
+			// agree; if that read finds nothing, fall through with the ordinal
+			// we computed.
+			$settled = $this->idMappingMapper->getGlobalId(self::MESSAGE_OCC_ENTITY, $globalId);
+			if (is_string($settled) && str_starts_with($settled, $occurrencePrefix)) {
+				$ordinal = (int)substr($settled, strlen($occurrencePrefix));
+			}
+		}
+
+		return md5($contentKey . '|#' . $ordinal);
 	}
 
 	// ---------------------------------------------------------------

@@ -32,6 +32,13 @@ class ChatSyncServiceMessageIdentityTest extends TestCase {
 		return (string)$method->invoke($service, $chat, $sender, $localId);
 	}
 
+	/**
+	 * Legacy fallback only: with no source vault supplied there is nothing to
+	 * number occurrences against, so identity degrades to content plus
+	 * timestamp. Two "ok"s a few minutes apart stay distinct here, but two in
+	 * the same second would not -- which is why the real path passes a vault
+	 * and numbers occurrences instead. See ChatSyncServiceRepeatedMessageTest.
+	 */
 	public function testRepeatedContentAtDifferentTimesIsNotDeduped(): void {
 		// The reported message-loss case: "ok" sent twice in the same room.
 		$first = $this->signature(['createdAt' => '2026-05-01T10:00:00+00:00'], 'ok');
