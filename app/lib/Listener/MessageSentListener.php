@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace OCA\W3dsLogin\Listener;
 
+use OCA\W3dsLogin\Service\AttachmentSyncService;
 use OCA\W3dsLogin\Service\ChatSyncService;
 use OCP\EventDispatcher\Event;
 use OCP\EventDispatcher\IEventListener;
@@ -16,6 +17,13 @@ use Psr\Log\LoggerInterface;
  * @implements IEventListener<Event>
  */
 class MessageSentListener implements IEventListener {
+	/**
+	 * Comment verbs worth replicating: `comment` is user text, and
+	 * `object_shared` is a file share. Everything else Talk emits is room
+	 * bookkeeping.
+	 */
+	private const SYNCABLE_VERBS = ['comment', AttachmentSyncService::TALK_SHARE_VERB];
+
 	public function __construct(
 		private ChatSyncService $chatSyncService,
 		private LoggerInterface $logger,
@@ -54,6 +62,16 @@ class MessageSentListener implements IEventListener {
 			$roomToken = $room->getToken();
 			$message = $comment->getMessage();
 			$verb = $comment->getVerb();
+
+			// We now hear SystemMessageSentEvent too, because that is the only
+			// event a file share emits. Talk's other system messages (joins,
+			// leaves, calls, renames, read markers) are room bookkeeping, not
+			// conversation, and pushing them would litter every peer's eVault
+			// with envelopes no platform can render. Sync exactly the two
+			// verbs that carry something a person wrote or shared.
+			if (!in_array($verb, self::SYNCABLE_VERBS, true)) {
+				return;
+			}
 
 			$this->logger->info('[W3DS Sync] Chat message detected', [
 				'messageId' => $messageId,
