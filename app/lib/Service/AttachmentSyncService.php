@@ -612,7 +612,10 @@ class AttachmentSyncService {
 	 * over it. Nothing ever observes a half-written file under the final name.
 	 */
 	private function writeAttachmentFile(\OCP\Files\Folder $folder, string $name, string $bytes): ?File {
-		$temporary = '.w3ds-incoming-' . bin2hex(random_bytes(8)) . '.part';
+		// Not `.part`: Nextcloud reserves that suffix for its own partial
+		// uploads and refuses writes to any file using it, so staging there
+		// fails outright and the attachment never lands.
+		$temporary = '.w3ds-incoming-' . bin2hex(random_bytes(8)) . '.tmp';
 
 		try {
 			// Create then write: Folder::newFile() with content in one call is
@@ -621,8 +624,22 @@ class AttachmentSyncService {
 			$file->putContent($bytes);
 		} catch (\Throwable $e) {
 			$this->logger->warning('[W3DS Attachment] Failed to stage attachment', [
-				'exception' => $e->getMessage(),
+				'name' => $name,
+				'staged' => $temporary,
+				// Several Files exceptions carry an empty message, which says
+				// nothing on its own; the class is the useful part.
+				'exception' => get_class($e) . ': ' . $e->getMessage(),
 			]);
+
+			// Do not leave the staging entry behind on a failed write.
+			try {
+				if ($folder->nodeExists($temporary)) {
+					$folder->get($temporary)->delete();
+				}
+			} catch (\Throwable) {
+				// Nothing further to do; a stray staging file is inert.
+			}
+
 			return null;
 		}
 
