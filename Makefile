@@ -18,10 +18,15 @@ shell:
 # On a fresh volume the entrypoint is still unpacking Nextcloud into
 # /var/www/html when the container reports as started, so occ does not exist
 # yet. Poll until it answers before running any occ command.
+#
+# `occ status` exits 0 even while Nextcloud is unpacked but not yet installed,
+# printing "Nextcloud is not installed". In that state the `app` namespace has
+# no commands and `app:enable` fails, so gate on `installed: true` instead of
+# on the exit code.
 wait:
 	@echo "Waiting for Nextcloud to finish installing..."
 	@for i in $$(seq 1 120); do \
-		if docker compose exec --user www-data app php occ status >/dev/null 2>&1; then \
+		if docker compose exec --user www-data app php occ status 2>/dev/null | grep -q 'installed: true'; then \
 			echo "Nextcloud is ready."; exit 0; \
 		fi; \
 		sleep 2; \
