@@ -1003,15 +1003,18 @@ class ChatSyncService {
 
 			// Same attribution for the plain-text path.
 			//
-			// Prefer Talk's own quoting: replying to the forwarded message
-			// renders a real quote block attributed to its author, which is
-			// both the native representation and unforgeable, unlike a line of
-			// text anyone could type. Only when the original is not present
-			// locally do we fall back to naming it in the text.
+			// Talk's reply mechanism cannot express this. A forward moves a
+			// message *between* conversations, and Talk refuses a reply parent
+			// belonging to another room, so quoting the original is rejected
+			// in exactly the case that matters. Its own cross-room quoting
+			// (`private_reply`) is restricted to one-to-one rooms between the
+			// two actors, which a forward is generally not.
+			//
+			// So the attribution stays in the text. It is weaker than a
+			// server-rendered quote -- a user could type the same words -- but
+			// it is the only representation Talk will actually display here.
 			$quotedLocalId = $this->localCommentForForward($forwardedFrom, $roomToken);
-			if ($quotedLocalId === null) {
-				$content = $this->attributeForward($content, $forwardedFrom, $ownerW3id);
-			}
+			$content = $this->attributeForward($content, $forwardedFrom, $ownerW3id);
 
 			$localMessageId = $this->postTalkMessage(
 				$roomToken,
