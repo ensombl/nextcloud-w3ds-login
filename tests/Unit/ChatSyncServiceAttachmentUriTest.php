@@ -10,12 +10,16 @@ use PHPUnit\Framework\TestCase;
 /**
  * Where an attachment's blob reference actually lives on the wire.
  *
- * Platforms disagree. The reference implementation puts the `w3ds://file` URI
- * in `fileId` and treats `mediaUrl` as a slot for a base64 data URI it can
- * render inline, often leaving it out entirely. Reading only `mediaUrl` means
- * inbound attachments from those platforms resolve to nothing, and a data URI
- * found there is useless to us regardless: Talk needs real bytes written into
- * the recipient's Files, which only a dereferenceable w3ds://file URI provides.
+ * The Message schema declares `mediaUrl` as the single attachment field, typed
+ * only as `format: uri` and with additional properties forbidden. `fileId` is
+ * an extension some platforms (including this one) also write. So a reference
+ * may arrive in either field and in any of three forms: a `w3ds://file` URI, a
+ * plain object-storage URL, or a base64 `data:` URI.
+ *
+ * A w3ds:// reference is preferred wherever it appears, because it is the only
+ * form that also carries the file's real name and MIME type. But the other two
+ * are fetchable and must not be discarded: doing so is what left attachments
+ * composed on other platforms arriving as bare text.
  */
 class ChatSyncServiceAttachmentUriTest extends TestCase {
 	private const W3DS_URI = 'w3ds://file?id=@alice/8e34416e-7d22-51c1-949a-c263b53e3fbf';
@@ -48,10 +52,13 @@ class ChatSyncServiceAttachmentUriTest extends TestCase {
 		]));
 	}
 
-	public function testIgnoresADataUriWithNoUsableReferenceAnywhere(): void {
-		$this->assertNull($this->pick([
-			'mediaUrl' => 'data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD',
-		]));
+	/**
+	 * With no w3ds:// reference anywhere, the inline copy is the only copy of
+	 * the bytes. Discarding it loses the attachment outright.
+	 */
+	public function testFallsBackToADataUriWhenItIsTheOnlyReference(): void {
+		$uri = 'data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD';
+		$this->assertSame($uri, $this->pick(['mediaUrl' => $uri]));
 	}
 
 	public function testReturnsNullWhenNoAttachmentFieldsArePresent(): void {
@@ -66,12 +73,30 @@ class ChatSyncServiceAttachmentUriTest extends TestCase {
 		$this->assertNull($this->pick(['fileId' => 42]));
 	}
 
-	public function testIgnoresUrisThatAreNotW3dsFileReferences(): void {
-		$this->assertNull($this->pick(['fileId' => 'https://example.org/a.png']));
-		$this->assertNull($this->pick(['mediaUrl' => 'w3ds://profile?id=@alice/x']));
+	/**
+	 * `mediaUrl` is what the schema actually defines, so a plain URL there is
+	 * a conforming attachment, not a malformed one.
+	 */
+	public function testAcceptsAPlainUrlAsAReference(): void {
+		$this->assertSame('https://example.org/a.png', $this->pick(['fileId' => 'https://example.org/a.png']));
+		$this->assertSame('https://cdn.example.org/x.pdf', $this->pick(['mediaUrl' => 'https://cdn.example.org/x.pdf']));
 	}
 
-	public function testFallsBackToMediaUrlWhenFileIdIsUnusable(): void {
+	/**
+	 * A reference we have no way to fetch is worse than none: it would post
+	 * the raw URI as a line of text.
+	 */
+	public function testIgnoresReferencesItCannotFetch(): void {
+		$this->assertNull($this->pick(['mediaUrl' => 'w3ds://profile?id=@alice/x']));
+		$this->assertNull($this->pick(['mediaUrl' => 'ftp://example.org/a.png']));
+		$this->assertNull($this->pick(['fileId' => 'javascript:alert(1)']));
+	}
+
+	/**
+	 * The w3ds:// reference wins wherever it sits, because only it resolves to
+	 * the file's real name and MIME type.
+	 */
+	public function testPrefersAW3dsReferenceInMediaUrlOverAPlainUrlInFileId(): void {
 		$this->assertSame(self::W3DS_URI, $this->pick([
 			'fileId' => 'https://example.org/not-a-w3ds-uri.png',
 			'mediaUrl' => self::W3DS_URI,

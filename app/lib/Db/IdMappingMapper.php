@@ -96,6 +96,104 @@ class IdMappingMapper extends QBMapper {
 	}
 
 	/**
+	 * Count mappings of a type whose global_id starts with $prefix.
+	 *
+	 * Used to number repeat occurrences of an identical message within one
+	 * eVault. `$prefix` is built from hex digests and separators, never from
+	 * user text, so it carries no LIKE wildcards; it is still escaped so a
+	 * future caller cannot turn it into one.
+	 */
+	public function countByGlobalIdPrefix(string $entityType, string $prefix): int {
+		$qb = $this->db->getQueryBuilder();
+		$escaped = $this->db->escapeLikeParameter($prefix);
+		$qb->select($qb->createFunction('COUNT(*)'))
+			->from($this->getTableName())
+			->where($qb->expr()->eq('entity_type', $qb->createNamedParameter($entityType)))
+			->andWhere($qb->expr()->like('global_id', $qb->createNamedParameter($escaped . '%')));
+
+		$this->db->beginTransaction();
+		try {
+			$result = $qb->executeQuery();
+			$count = (int)$result->fetchOne();
+			$result->closeCursor();
+			$this->db->commit();
+
+			return $count;
+		} catch (\Throwable $e) {
+			$this->db->rollBack();
+			throw $e;
+		}
+	}
+
+	/**
+	 * Atomically claim a key, returning false if someone already holds it.
+	 *
+	 * The unique index on (entity_type, global_id) is the arbiter: exactly
+	 * one concurrent inserter can win, and the loser sees the constraint
+	 * violation. Used to serialise ingest of a single inbound envelope
+	 * across simultaneous requests, which a cache-based lock cannot do
+	 * reliably because it degrades to per-request storage when no
+	 * distributed cache is configured.
+	 */
+	public function tryClaim(string $entityType, string $claimKey, string $ownerW3id): bool {
+		try {
+			$this->storeMapping($entityType, $claimKey, $claimKey, $ownerW3id, 'claim');
+
+			return true;
+		} catch (\Throwable) {
+			return false;
+		}
+	}
+
+	/**
+	 * Whether a claim exists and was taken within the last $ttl seconds.
+	 *
+	 * Claims stand in for a lock, and a process that dies between taking one
+	 * and releasing it would otherwise block that key forever. Treating an old
+	 * row as absent bounds the damage to $ttl, and sweeps it so the next
+	 * caller can take it cleanly.
+	 */
+	public function hasFreshClaim(string $entityType, string $claimKey, int $ttl): bool {
+		try {
+			$createdAt = $this->readInTx(
+				fn () => (string)$this->findByLocalId($entityType, $claimKey)->getCreatedAt(),
+			);
+		} catch (\Throwable) {
+			// Unreadable: treat as unclaimed rather than blocking the caller.
+			return false;
+		}
+
+		if ($createdAt === null || $createdAt === '') {
+			return false;
+		}
+
+		if ((int)$createdAt >= time() - $ttl) {
+			return true;
+		}
+
+		// Expired: drop it so this key is not blocked indefinitely.
+		$this->releaseClaim($entityType, $claimKey);
+
+		return false;
+	}
+
+	/**
+	 * Release a claim taken by tryClaim(), so a later retry can proceed.
+	 */
+	public function releaseClaim(string $entityType, string $claimKey): void {
+		try {
+			$qb = $this->db->getQueryBuilder();
+			$qb->delete($this->getTableName())
+				->where($qb->expr()->eq('entity_type', $qb->createNamedParameter($entityType)))
+				->andWhere($qb->expr()->eq('local_id', $qb->createNamedParameter($claimKey)));
+			$qb->executeStatement();
+		} catch (\Throwable) {
+			// A stranded claim only blocks re-processing of one envelope that
+			// already failed; never worth surfacing over the original error.
+		}
+	}
+
+	/**
 	 * @return IdMapping[]
 	 */
 	public function findAllByOwner(string $ownerW3id, string $entityType): array {

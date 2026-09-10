@@ -524,7 +524,7 @@ class EvaultClient {
 	 * URI addresses.
 	 *
 	 * @param string $content Raw file bytes (base64-encoded here)
-	 * @return string|null The `w3ds://file` URI, or null when the upload failed
+	 * @return array{uri: string, publicUrl: ?string}|null The `w3ds://file` URI and object-storage URL, or null on failure
 	 */
 	public function uploadFile(
 		string $w3id,
@@ -532,7 +532,7 @@ class EvaultClient {
 		string $contentType,
 		string $content,
 		array $acl = ['*'],
-	): ?string {
+	): ?array {
 		if (strlen($content) > self::MAX_UPLOAD_BYTES) {
 			$this->logger->warning('Refusing to upload file above the protocol size limit', [
 				'w3id' => $w3id,
@@ -578,7 +578,19 @@ class EvaultClient {
 			}
 
 			$uri = $result['uri'] ?? null;
-			return is_string($uri) && $uri !== '' ? $uri : null;
+			if (!is_string($uri) || $uri === '') {
+				return null;
+			}
+
+			$publicUrl = $result['publicUrl'] ?? null;
+
+			return [
+				'uri' => $uri,
+				// Handed back so callers can publish a directly renderable
+				// reference alongside the w3ds:// one. Peers that render an
+				// attachment with an <img> cannot resolve a w3ds:// URI.
+				'publicUrl' => is_string($publicUrl) && $publicUrl !== '' ? $publicUrl : null,
+			];
 		} catch (\Throwable $e) {
 			$this->logger->warning('File upload to eVault failed', [
 				'w3id' => $w3id,
@@ -635,10 +647,19 @@ class EvaultClient {
 	 * Resolve a `w3ds://file` URI to the file's metadata and public URL.
 	 *
 	 * Reads the File MetaEnvelope directly rather than following the eVault's
-	 * `/files/:id` redirect, so we get `filename` and `contentType` in the
-	 * same round trip instead of inferring them from the blob.
+	 * `/files/:id` redirect, so we get the name and MIME type in the same
+	 * round trip instead of inferring them from the blob.
 	 *
-	 * @return array{publicUrl: string, filename: string, contentType: string, size: int}|null
+	 * Two different field vocabularies appear here, and both are legitimate.
+	 * A blob uploaded through the eVault's own `uploadFile` mutation is stored
+	 * under its internal `w3ds-file-v1` payload (`filename`, `contentType`,
+	 * `publicUrl`). A blob written by a platform as an ordinary File entity
+	 * uses the published File schema (`a1b2c3d4-...`), whose fields are `name`,
+	 * `mimeType`, `url`, and an optional base64 `data`. Reading only the first
+	 * vocabulary made every attachment of the second kind dereference to null,
+	 * which is why attachments composed on other platforms never appeared.
+	 *
+	 * @return array{publicUrl: ?string, inlineData: ?string, filename: string, contentType: string, size: int}|null
 	 */
 	public function dereferenceFileUri(string $uri): ?array {
 		$parsed = $this->parseFileUri($uri);
@@ -654,15 +675,29 @@ class EvaultClient {
 				return null;
 			}
 
-			$publicUrl = $payload['publicUrl'] ?? null;
-			if (!is_string($publicUrl) || $publicUrl === '') {
-				return null;
+			// `publicUrl` is the eVault's own upload payload; `url` is the
+			// File schema's equivalent and may be explicitly null when the
+			// bytes are carried inline instead.
+			$publicUrl = $this->firstStringField($payload, ['publicUrl', 'url']);
+			if ($publicUrl !== null
+				&& !str_starts_with($publicUrl, 'http://')
+				&& !str_starts_with($publicUrl, 'https://')) {
+				// The redirect target is validated on the eVault side, but we
+				// fetch it ourselves, so re-check the scheme here.
+				$this->logger->warning('File envelope carries an unsafe URL scheme, ignoring', [
+					'uri' => $uri,
+				]);
+				$publicUrl = null;
 			}
 
-			// The redirect target is validated on the eVault side, but we
-			// fetch it ourselves, so re-check the scheme here.
-			if (!str_starts_with($publicUrl, 'http://') && !str_starts_with($publicUrl, 'https://')) {
-				$this->logger->warning('File envelope carries an unsafe URL scheme, ignoring', [
+			// The File schema keeps a legacy base64 `data` field for blobs
+			// never pushed to object storage. It is the only copy of the
+			// bytes when `url` is null, so an envelope with one and no URL is
+			// still a perfectly resolvable attachment.
+			$inlineData = $this->firstStringField($payload, ['data']);
+
+			if ($publicUrl === null && $inlineData === null) {
+				$this->logger->info('File envelope carries neither a URL nor inline data', [
 					'uri' => $uri,
 				]);
 				return null;
@@ -670,8 +705,9 @@ class EvaultClient {
 
 			return [
 				'publicUrl' => $publicUrl,
-				'filename' => is_string($payload['filename'] ?? null) ? $payload['filename'] : 'attachment',
-				'contentType' => is_string($payload['contentType'] ?? null) ? $payload['contentType'] : 'application/octet-stream',
+				'inlineData' => $inlineData,
+				'filename' => $this->firstStringField($payload, ['filename', 'name', 'displayName']) ?? 'attachment',
+				'contentType' => $this->firstStringField($payload, ['contentType', 'mimeType']) ?? 'application/octet-stream',
 				'size' => is_numeric($payload['size'] ?? null) ? (int)$payload['size'] : 0,
 			];
 		} catch (\Throwable $e) {
@@ -681,6 +717,69 @@ class EvaultClient {
 			]);
 			return null;
 		}
+	}
+
+	/**
+	 * First of $keys present in $payload as a non-empty string.
+	 *
+	 * @param array<string, mixed> $payload
+	 * @param list<string> $keys
+	 */
+	private function firstStringField(array $payload, array $keys): ?string {
+		foreach ($keys as $key) {
+			$value = $payload[$key] ?? null;
+			if (is_string($value) && $value !== '') {
+				return $value;
+			}
+		}
+
+		return null;
+	}
+
+	/**
+	 * Decode the File schema's base64 `data` field.
+	 *
+	 * Accepts a bare base64 string or a `data:` URI, matching what the
+	 * eVault's own upload mutation accepts on the way in. Strict decoding:
+	 * PHP silently drops invalid characters otherwise, which would write a
+	 * corrupt file rather than failing.
+	 */
+	public function decodeInlineFileData(string $data, int $maxBytes): ?string {
+		$base64 = $data;
+		if (str_starts_with($base64, 'data:')) {
+			$comma = strpos($base64, ',');
+			if ($comma === false) {
+				return null;
+			}
+			$base64 = substr($base64, $comma + 1);
+		}
+
+		// Whitespace is legal in transported base64 but not in the decoder.
+		$base64 = preg_replace('/\s+/', '', $base64) ?? '';
+		if ($base64 === '') {
+			return null;
+		}
+
+		// Reject before decoding: 4 bytes of base64 are 3 bytes of output, so
+		// this bounds the allocation rather than discovering the size after.
+		if (intdiv(strlen($base64), 4) * 3 > $maxBytes) {
+			$this->logger->warning('Inline file data exceeds the configured limit, skipping', [
+				'maxBytes' => $maxBytes,
+			]);
+			return null;
+		}
+
+		$decoded = base64_decode($base64, true);
+		if ($decoded === false || $decoded === '') {
+			$this->logger->warning('File envelope carries unusable inline data');
+			return null;
+		}
+
+		if (strlen($decoded) > $maxBytes) {
+			return null;
+		}
+
+		return $decoded;
 	}
 
 	/**
@@ -715,6 +814,35 @@ class EvaultClient {
 				'exception' => $e->getMessage(),
 			]);
 			return null;
+		}
+	}
+
+	/**
+	 * Delete a MetaEnvelope from a user's eVault.
+	 *
+	 * Only used to retract envelopes this instance wrote in error, such as
+	 * the duplicate messages produced by the inbound-attachment loopback.
+	 * Deletion is permanent, so callers must be certain of the target.
+	 */
+	public function deleteMetaEnvelope(string $w3id, string $globalId): bool {
+		$query = <<<'GRAPHQL'
+        mutation DeleteMetaEnvelope($id: String!) {
+            deleteMetaEnvelope(id: $id)
+        }
+        GRAPHQL;
+
+		try {
+			$data = $this->graphql($w3id, $query, ['id' => $globalId]);
+
+			return ($data['deleteMetaEnvelope'] ?? false) === true;
+		} catch (\Throwable $e) {
+			$this->logger->warning('Failed to delete MetaEnvelope', [
+				'w3id' => $w3id,
+				'globalId' => $globalId,
+				'exception' => $e->getMessage(),
+			]);
+
+			return false;
 		}
 	}
 

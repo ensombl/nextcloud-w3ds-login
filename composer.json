@@ -18,7 +18,11 @@
     "autoload": {
         "psr-4": {
             "OCA\\W3dsLogin\\": "app/lib/"
-        }
+        },
+        "exclude-from-classmap": [
+            "app/",
+            "tests/"
+        ]
     },
     "autoload-dev": {
         "psr-4": {
@@ -27,7 +31,6 @@
     },
     "config": {
         "optimize-autoloader": true,
-        "classmap-authoritative": true,
         "platform": {
             "php": "8.1.31"
         },

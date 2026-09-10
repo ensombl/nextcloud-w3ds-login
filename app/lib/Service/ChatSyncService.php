@@ -19,9 +19,57 @@ class ChatSyncService {
 	private const SYNC_LOCK_PREFIX = 'w3ds_sync_lock_';
 	private const SYNC_LOCK_TTL = 10;
 	private const INBOUND_POST_LOCK_PREFIX = 'w3ds_inbound_post_';
-	private const INBOUND_POST_LOCK_TTL = 10;
+	/**
+	 * How long the "an inbound post is in flight" guard lives.
+	 *
+	 * It has to outlast the work it guards. Materialising an attachment means
+	 * dereferencing the file envelope, downloading up to the protocol's
+	 * 250 MB, writing it into the recipient's Files and sharing it into the
+	 * room -- all before Talk fires the event this guard is meant to suppress.
+	 * At 10s the guard expired mid-download on any sizeable file, and the
+	 * resulting share comment was pushed back out as a new message.
+	 */
+	private const INBOUND_POST_LOCK_TTL = 600;
 	private const MESSAGE_SIG_CACHE_PREFIX = 'w3ds_msg_sig_';
 	private const MESSAGE_SIG_CACHE_TTL = 86400; // 24h — enough to span a typical poll window
+	/**
+	 * Entity type under which cross-replica message signatures are persisted
+	 * in the mapping table. Distinct from 'message' so a signature can never
+	 * be mistaken for an envelope ID.
+	 */
+	private const MESSAGE_SIG_ENTITY = 'message_sig';
+	/**
+	 * Prefix marking an occurrence-numbering row, which records "this
+	 * envelope, from this vault, is the Nth copy of this exact text". Keeps
+	 * those rows distinguishable from the identity rows that share the table.
+	 */
+	private const MESSAGE_OCCURRENCE_PREFIX = 'occ|';
+	/**
+	 * Entity type for occurrence-numbering rows. Separate from the identity
+	 * rows so counting occurrences never scans them.
+	 */
+	private const MESSAGE_OCC_ENTITY = 'message_occ';
+	/**
+	 * Entity type for the short-lived row that serialises ingest of a single
+	 * inbound envelope across concurrent requests.
+	 */
+	private const INGEST_CLAIM_ENTITY = 'ingest_claim';
+	/**
+	 * Entity type for the durable copy of the "inbound post in flight" guard.
+	 * The cache copy cannot be relied on: without a distributed cache
+	 * configured it is per-request, and the request that must observe the
+	 * guard is always a different one.
+	 */
+	private const INBOUND_POST_ENTITY = 'inbound_post';
+	/**
+	 * How long a claim is honoured before it is treated as abandoned.
+	 *
+	 * Claims stand in for locks, so a process that dies between taking one and
+	 * releasing it would block that key forever. Comfortably longer than the
+	 * slowest legitimate ingest (a 250 MB download) and short enough that a
+	 * crash costs one retry cycle rather than a lost message.
+	 */
+	private const CLAIM_TTL = 900;
 	private const CHAT_PARTICIPANT_HWM_PREFIX = 'w3ds_chat_pmax_';
 	private const CHAT_PARTICIPANT_HWM_TTL = 604800; // 7d high-water mark guard against pushChat shrinkage
 	private const PULL_LIST_CACHE_TTL = 120; // 2 min for chat/message ontology lists during pull sync
@@ -463,10 +511,79 @@ class ChatSyncService {
 			return;
 		}
 
+		// Serialise outbound push of this comment. Talk can deliver the same
+		// message event to more than one worker (and our own share-adoption
+		// path can race a poll), and the "already pushed?" check below is a
+		// read that several requests can pass at once -- each then creating
+		// its own envelope, which is how duplicates ended up written to the
+		// eVault. The unique index picks exactly one winner.
+		$pushClaimKey = 'push|' . $localId;
+		if (!$this->idMappingMapper->tryClaim(self::INGEST_CLAIM_ENTITY, $pushClaimKey, $w3id)) {
+			// Only yield to a claim that is actually live. A request killed
+			// mid-push would otherwise keep this comment from ever syncing.
+			if ($this->idMappingMapper->hasFreshClaim(self::INGEST_CLAIM_ENTITY, $pushClaimKey, self::CLAIM_TTL)) {
+				return;
+			}
+			if (!$this->idMappingMapper->tryClaim(self::INGEST_CLAIM_ENTITY, $pushClaimKey, $w3id)) {
+				return;
+			}
+		}
+
+		try {
+			$this->pushMessageClaimed($ncUid, $w3id, $messageData, $roomToken, $localId);
+		} finally {
+			$this->idMappingMapper->releaseClaim(self::INGEST_CLAIM_ENTITY, $pushClaimKey);
+		}
+	}
+
+	/**
+	 * Push one Talk comment outbound. Callers must hold the push claim for
+	 * this comment; see pushMessage().
+	 */
+	private function pushMessageClaimed(
+		string $ncUid,
+		string $w3id,
+		array $messageData,
+		string $roomToken,
+		string $localId,
+	): void {
+		// Re-check under the claim: a request that finished between our first
+		// look and winning the claim has already pushed this comment.
+		if ($this->idMappingMapper->getGlobalId('message', $localId) !== null) {
+			return;
+		}
+
 		// If this message is being posted by handleInboundMessage right now,
 		// skip -- otherwise we'd ping-pong the message we just received.
 		if ($this->isInboundPostActive($ncUid, $roomToken)) {
 			return;
+		}
+
+		// A file share we materialised from an inbound envelope must never be
+		// pushed back out. Talk generates its own comment for a room share,
+		// and that comment is what reaches this listener -- but the inbound
+		// path only ever recorded the *share* (`share:<id>`), so the comment
+		// looked like a brand new local message and was replicated to the
+		// eVault as a second, spurious envelope.
+		//
+		// The comment carries the share id in its parameters, which is the
+		// join between the two: if that share is already mapped to an
+		// envelope, this comment is the echo of an inbound attachment.
+		//
+		// Checked against the mapping table rather than the in-memory guard
+		// above, because that guard lives in a cache that degrades to a
+		// per-request store without Redis, and because a large attachment can
+		// take longer to download than the guard's 10s TTL -- by which point
+		// it has expired and stops suppressing anything.
+		if (($messageData['verb'] ?? '') === AttachmentSyncService::TALK_SHARE_VERB) {
+			$shareId = $this->attachmentSync->extractShareId((string)($messageData['message'] ?? ''));
+			if ($shareId !== null
+				&& $this->idMappingMapper->getGlobalId('message', 'share:' . $shareId) !== null) {
+				// Record the comment against the same envelope so subsequent
+				// events on it resolve immediately, without re-parsing.
+				$this->adoptInboundShareComment($shareId, $localId, $w3id);
+				return;
+			}
 		}
 
 		// Resolve (or auto-create) the chat's global ID
@@ -534,17 +651,23 @@ class ChatSyncService {
 
 			if ($attachment !== null) {
 				// `fileId` holds the w3ds://file URI and `file` its metadata:
-				// that pair is what other platforms dereference to render an
-				// attachment. `mediaUrl` is also populated because the Message
-				// schema names it, but a w3ds:// value there is not something
-				// an <img> can load, so it cannot be the only reference.
+				// that pair is what platforms which dereference through the
+				// eVault read. Both are extensions; the Message schema itself
+				// declares only `mediaUrl`.
 				$payload['fileId'] = $attachment['mediaUrl'];
 				$payload['file'] = [
 					'name' => $attachment['filename'],
 					'size' => (string)$attachment['size'],
 					'mimeType' => $attachment['mimeType'],
 				];
-				$payload['mediaUrl'] = $attachment['mediaUrl'];
+				// `mediaUrl` is the only attachment field the schema defines,
+				// so for a conforming peer it is the whole attachment. Prefer
+				// the object-storage URL: a w3ds:// reference is not something
+				// an <img> can load, and a peer that renders `mediaUrl`
+				// directly would show nothing. Fall back to the w3ds:// URI
+				// only when the eVault returned no public URL, so the field is
+				// never empty.
+				$payload['mediaUrl'] = $attachment['publicUrl'] ?? $attachment['mediaUrl'];
 				$payload['type'] = $attachment['type'];
 				// Peers put the caption in `content` and carry the filename in
 				// `file.name`, so an absent caption means empty content rather
@@ -684,6 +807,55 @@ class ChatSyncService {
 			return; // Already exists
 		}
 
+		// Serialise ingest of this envelope across concurrent requests.
+		//
+		// The duplicate check above only sees work that has already
+		// *finished*. Ingest is slow -- resolving the sender, downloading an
+		// attachment, posting into Talk -- and pollRoom() is driven by every
+		// open browser tab every 15s, alongside the cron PullSyncJob and the
+		// webhook. Several of those overlap constantly, so each one read "not
+		// yet ingested" for the same envelope and all of them went on to post
+		// it. That is why a message could arrive three or four times rather
+		// than merely twice.
+		//
+		// The claim is a row insert, so the database's unique index decides
+		// the winner. A cache-based lock cannot: without Redis configured
+		// `createDistributed()` is a per-request store, and every one of these
+		// requests is a different process.
+		$claimKey = 'ingest|' . $globalId;
+		if (!$this->idMappingMapper->tryClaim(self::INGEST_CLAIM_ENTITY, $claimKey, $ownerW3id)) {
+			// Another request is ingesting this envelope right now -- but only
+			// yield to a claim that is still live, or a request killed
+			// mid-ingest would strand this message permanently.
+			if ($this->idMappingMapper->hasFreshClaim(self::INGEST_CLAIM_ENTITY, $claimKey, self::CLAIM_TTL)) {
+				return;
+			}
+			if (!$this->idMappingMapper->tryClaim(self::INGEST_CLAIM_ENTITY, $claimKey, $ownerW3id)) {
+				return;
+			}
+		}
+
+		try {
+			$this->ingestInboundMessage($globalId, $ownerW3id, $data);
+		} finally {
+			// Released so a failed attempt can be retried on the next poll.
+			// The mapping written on success is what prevents re-ingest, not
+			// this claim.
+			$this->idMappingMapper->releaseClaim(self::INGEST_CLAIM_ENTITY, $claimKey);
+		}
+	}
+
+	/**
+	 * Ingest one inbound Message envelope. Callers must hold the ingest claim
+	 * for this envelope; see handleInboundMessage().
+	 */
+	private function ingestInboundMessage(string $globalId, string $ownerW3id, array $data): void {
+		// Re-check under the claim: a request that finished between our first
+		// look and winning the claim has already posted this.
+		if ($this->idMappingMapper->getLocalId('message', $globalId) !== null) {
+			return;
+		}
+
 		// Resolve the chat
 		$chatGlobalId = $data['chatId'] ?? '';
 		$roomToken = $this->idMappingMapper->getLocalId('chat', $chatGlobalId);
@@ -728,24 +900,45 @@ class ChatSyncService {
 		$content = $this->mentionTranslator->toTalk($rawContent);
 		$messageType = $data['type'] ?? 'text';
 
-		// Cross-replica dedup: the same logical message lives in every
-		// participant's eVault under a *different* global_id, so the outer
-		// envelope ID cannot identify it. We need something stable across
-		// replicas.
-		//
-		// Prefer the sender-assigned inner `id` when the envelope carries one;
-		// that is a genuine per-message identity and replicates unchanged.
-		// Otherwise fall back to a content signature — but include createdAt,
-		// which the previous content-only signature omitted. Without it, any
-		// repeat of an identical string by the same sender in the same room
-		// within the cache TTL was dropped and never posted: "ok", "yes",
-		// "+1", a re-sent link. Replicas of one logical message can carry
-		// different createdAt values (each platform stamps on replication), so
-		// this trades a rarer duplicate for no longer losing real messages.
-		$signature = $this->messageIdentitySignature($senderUid, $chatGlobalId, $data, $rawContent);
+		// A forward carries no content of its own: the text and any
+		// attachment live in the message it points at. Resolve that original
+		// and merge it in, so the forward shows what was forwarded instead of
+		// an empty bubble.
+		[$data, $rawContent, $content, $messageType, $forwardedFrom]
+			= $this->resolveForwardedMessage($data, $rawContent, $content, $messageType);
+
+		// Cross-replica dedup. See messageIdentitySignature() for why the
+		// outer envelope ID cannot be used directly and how a genuine repeat
+		// ("ok" twice) is kept distinct from a replica of one message.
+		$signature = $this->messageIdentitySignature(
+			$senderUid,
+			$chatGlobalId,
+			$data,
+			$rawContent,
+			$ownerW3id,
+			$globalId,
+		);
 		$sigKey = self::MESSAGE_SIG_CACHE_PREFIX . $signature;
-		$existingLocal = $this->cache->get($sigKey);
+
+		// The signature has to outlive the request. `createDistributed()`
+		// falls back to a per-request ArrayCache whenever no Redis or
+		// memcached is configured, which is the default for a single-server
+		// install -- so on those instances the cache was empty at the start of
+		// every poll and the same logical message was posted once per
+		// participant replica, and again on the next poll. That is the
+		// duplicate: a two-person chat shows everything twice.
+		//
+		// The mapping table is the durable store we already have, and its
+		// (entity_type, global_id) unique index gives us the insert-or-lose
+		// race semantics this needs. Signatures go in under their own entity
+		// type so they cannot collide with real envelope IDs.
+		$existingLocal = $this->cache->get($sigKey)
+			?? $this->idMappingMapper->getLocalId(self::MESSAGE_SIG_ENTITY, $signature);
 		if (is_string($existingLocal) && $existingLocal !== '') {
+			// Re-prime the cache so the rest of this poll skips it without a
+			// query.
+			$this->cache->set($sigKey, $existingLocal, self::MESSAGE_SIG_CACHE_TTL);
+
 			// Record this replica's mapping so future polls skip it cheaply.
 			try {
 				$this->idMappingMapper->storeMapping('message', $existingLocal, $globalId, $ownerW3id);
@@ -764,12 +957,21 @@ class ChatSyncService {
 			// rather than text: download the blob, drop it in the recipient's
 			// Files, and share it into the room. Talk generates its own
 			// comment for the share, so there's nothing further to post.
-			// Peers reference the blob from `fileId` and often omit
-			// `mediaUrl` entirely, or fill it with a base64 data URI meant for
-			// direct rendering. Prefer whichever field actually holds a
-			// w3ds://file URI, which is the only thing we can dereference.
 			$mediaUrl = $this->pickAttachmentUri($data);
-			if (in_array($messageType, ['file', 'image'], true) && $mediaUrl !== null) {
+
+			// A resolvable `mediaUrl` is what makes this an attachment, not
+			// the declared `type`. The schema's enum is advisory about
+			// rendering, and senders get it wrong in both directions: some
+			// leave `type` at its `text` default while filling `mediaUrl`,
+			// which previously posted the URI as a line of text and dropped
+			// the file. Requiring both is what kept attachments composed
+			// elsewhere from appearing. A `system` message is excluded: those
+			// are membership notices, never user content.
+			if ($mediaUrl !== null && $messageType !== 'system') {
+				// A share cannot carry a reply parent, so an attachment
+				// forward keeps the textual attribution.
+				$attributed = $this->attributeForward($content, $forwardedFrom, $ownerW3id);
+
 				// `content` on an attachment envelope is the sender's caption
 				// when they wrote one, and the bare filename otherwise.
 				// pullAttachment() drops it when it merely repeats the
@@ -778,7 +980,7 @@ class ChatSyncService {
 					$mediaUrl,
 					$senderUid,
 					$roomToken,
-					$content !== '' ? $content : null,
+					$attributed !== '' ? $attributed : null,
 				);
 				if ($share !== null) {
 					// Map the envelope to the share so the same attachment is
@@ -790,6 +992,7 @@ class ChatSyncService {
 						$ownerW3id,
 					);
 					$this->cache->set($sigKey, 'share:' . $share->getId(), self::MESSAGE_SIG_CACHE_TTL);
+					$this->rememberMessageSignature($signature, 'share:' . $share->getId(), $ownerW3id);
 					return;
 				}
 
@@ -798,12 +1001,28 @@ class ChatSyncService {
 				$content = $content !== '' ? $content : '[attachment]';
 			}
 
+			// Same attribution for the plain-text path.
+			//
+			// Talk's reply mechanism cannot express this. A forward moves a
+			// message *between* conversations, and Talk refuses a reply parent
+			// belonging to another room, so quoting the original is rejected
+			// in exactly the case that matters. Its own cross-room quoting
+			// (`private_reply`) is restricted to one-to-one rooms between the
+			// two actors, which a forward is generally not.
+			//
+			// So the attribution stays in the text. It is weaker than a
+			// server-rendered quote -- a user could type the same words -- but
+			// it is the only representation Talk will actually display here.
+			$quotedLocalId = $this->localCommentForForward($forwardedFrom, $roomToken);
+			$content = $this->attributeForward($content, $forwardedFrom, $ownerW3id);
+
 			$localMessageId = $this->postTalkMessage(
 				$roomToken,
 				$senderUid,
 				$content,
 				$messageType,
 				is_string($data['createdAt'] ?? null) ? $data['createdAt'] : null,
+				$quotedLocalId,
 			);
 			if ($localMessageId === null) {
 				return;
@@ -812,6 +1031,7 @@ class ChatSyncService {
 			$this->setSyncLock('message', $localMessageId);
 			$this->idMappingMapper->storeMapping('message', $localMessageId, $globalId, $ownerW3id);
 			$this->cache->set($sigKey, $localMessageId, self::MESSAGE_SIG_CACHE_TTL);
+			$this->rememberMessageSignature($signature, $localMessageId, $ownerW3id);
 		} catch (\Throwable $e) {
 			$this->logger->error('Failed to create local message from webhook', [
 				'globalId' => $globalId,
@@ -819,6 +1039,238 @@ class ChatSyncService {
 			]);
 		} finally {
 			$this->endInboundPost($senderUid, $roomToken);
+		}
+	}
+
+	/**
+	 * Point a share comment at the envelope its share already maps to.
+	 *
+	 * An inbound attachment is recorded against the share Talk created
+	 * (`share:<id>`), but the comment Talk generates for that share has its
+	 * own id. Mapping the comment to the same envelope means the ordinary
+	 * `getGlobalId('message', $localId)` check recognises it, so the echo is
+	 * suppressed without re-deriving anything.
+	 *
+	 * Best effort: the share mapping alone already stops the loopback, and
+	 * this is only a shortcut for later events on the same comment.
+	 */
+	private function adoptInboundShareComment(string $shareId, string $localId, string $w3id): void {
+		try {
+			$globalId = $this->idMappingMapper->getGlobalId('message', 'share:' . $shareId);
+			if ($globalId === null) {
+				return;
+			}
+
+			if ($this->idMappingMapper->getGlobalId('message', $localId) !== null) {
+				return;
+			}
+
+			$this->idMappingMapper->storeMapping('message', $localId, $globalId, $w3id, 'inbound');
+		} catch (\Throwable) {
+			// The (entity_type, global_id) index already holds the share row,
+			// so a collision here is expected on some backends and harmless:
+			// the share mapping is what actually suppresses the loopback.
+		}
+	}
+
+	/**
+	 * Resolve a forwarded message into the content it points at.
+	 *
+	 * The Message schema has no forward concept: `type` is limited to
+	 * text/image/file/system and `additionalProperties` is false. Peers extend
+	 * it anyway -- the same envelopes carry `link`, `readByAt` and `file`, none
+	 * of which are in the schema either -- and a forward is expressed as:
+	 *
+	 *     "type": "forward",
+	 *     "content": "",
+	 *     "forwardedFrom": {
+	 *         "vault":     "@ename",       // eVault holding the original
+	 *         "messageId": "<envelope id>",// the original, in that vault
+	 *         "chatId":    "<chat id>"     // conversation it came from
+	 *     }
+	 *
+	 * The forward itself is empty, so rendering it as-is produces a blank
+	 * message. Everything worth showing -- the text, the attachment, the
+	 * original author -- has to be read from the referenced envelope.
+	 *
+	 * A forward whose original cannot be fetched (a vault we cannot reach, or
+	 * a message never shared with us) degrades to a short placeholder rather
+	 * than vanishing.
+	 *
+	 * @param array<string, mixed> $data
+	 * @return array{0: array<string, mixed>, 1: string, 2: string, 3: string, 4: ?array<string, mixed>}
+	 *                                                                                                   [data, rawContent, content, messageType, forwardedFrom]
+	 */
+	private function resolveForwardedMessage(
+		array $data,
+		string $rawContent,
+		string $content,
+		string $messageType,
+	): array {
+		$forwardedFrom = $data['forwardedFrom'] ?? null;
+		if (!is_array($forwardedFrom)) {
+			return [$data, $rawContent, $content, $messageType, null];
+		}
+
+		$vault = is_string($forwardedFrom['vault'] ?? null) ? $forwardedFrom['vault'] : '';
+		$messageId = is_string($forwardedFrom['messageId'] ?? null) ? $forwardedFrom['messageId'] : '';
+
+		if ($vault === '' || $messageId === '') {
+			$this->logger->info('[W3DS Sync] Forward without a usable reference', [
+				'forwardedFrom' => $forwardedFrom,
+			]);
+
+			return [$data, $rawContent, $content, $messageType, $forwardedFrom];
+		}
+
+		$original = null;
+		try {
+			$envelope = $this->evaultClient->fetchMetaEnvelopeById($vault, $messageId);
+			$parsed = is_array($envelope) ? ($envelope['parsed'] ?? null) : null;
+			if (is_array($parsed) && $parsed !== []) {
+				$original = $parsed;
+			}
+		} catch (\Throwable $e) {
+			$this->logger->warning('[W3DS Sync] Could not fetch forwarded original', [
+				'vault' => $vault,
+				'messageId' => $messageId,
+				'exception' => $e->getMessage(),
+			]);
+		}
+
+		if ($original === null) {
+			// Say something rather than showing an empty bubble.
+			$fallback = $rawContent !== '' ? $rawContent : '[forwarded message]';
+
+			return [$data, $fallback, $this->mentionTranslator->toTalk($fallback), 'text', $forwardedFrom];
+		}
+
+		// Take the original's payload wholesale, then restore the fields that
+		// belong to *this* message rather than the one being quoted: it was
+		// sent here, now, by the forwarder.
+		$merged = $original;
+		foreach (['id', 'chatId', 'senderId', 'senderEName', 'createdAt', 'updatedAt'] as $field) {
+			if (isset($data[$field])) {
+				$merged[$field] = $data[$field];
+			} else {
+				unset($merged[$field]);
+			}
+		}
+		$merged['forwardedFrom'] = $forwardedFrom;
+
+		// A forwarder can add their own note; keep it when they did, otherwise
+		// use the original's text.
+		$originalContent = is_string($original['content'] ?? null) ? $original['content'] : '';
+		$newRaw = $rawContent !== '' ? $rawContent : $originalContent;
+		$merged['content'] = $newRaw;
+
+		// `forward` is not a renderable type. Fall back to the original's own
+		// type, which is what decides whether this materialises as an
+		// attachment or as text.
+		$newType = is_string($original['type'] ?? null) && $original['type'] !== 'forward'
+			? $original['type']
+			: 'text';
+
+		$this->logger->info('[W3DS Sync] Resolved forwarded message', [
+			'vault' => $vault,
+			'messageId' => $messageId,
+			'resolvedType' => $newType,
+		]);
+
+		return [$merged, $newRaw, $this->mentionTranslator->toTalk($newRaw), $newType, $forwardedFrom];
+	}
+
+	/**
+	 * Local Talk comment for the message a forward points at, if we have it.
+	 *
+	 * `forwardedFrom.messageId` names an envelope in the *sender's* vault. The
+	 * same logical message is stored under a different envelope id in every
+	 * participant's vault, so a direct lookup only succeeds when we happen to
+	 * have ingested that particular replica. That is the common case for a
+	 * message forwarded within a conversation we are already part of.
+	 *
+	 * Returns null when the original was never synced here, or lives in a
+	 * different room -- Talk rejects a reply parent from another room.
+	 *
+	 * @param array<string, mixed>|null $forwardedFrom
+	 */
+	private function localCommentForForward(?array $forwardedFrom, string $roomToken): ?string {
+		if ($forwardedFrom === null) {
+			return null;
+		}
+
+		$messageId = is_string($forwardedFrom['messageId'] ?? null) ? $forwardedFrom['messageId'] : '';
+		if ($messageId === '') {
+			return null;
+		}
+
+		try {
+			$localId = $this->idMappingMapper->getLocalId('message', $messageId);
+		} catch (\Throwable) {
+			return null;
+		}
+
+		// Attachments are recorded as `share:<id>`, which is not a comment id
+		// and cannot be quoted.
+		if ($localId === null || !ctype_digit($localId)) {
+			return null;
+		}
+
+		return $localId;
+	}
+
+	/**
+	 * Prefix a message with who it was originally from.
+	 *
+	 * Talk has no notion of a forward, so the only way to preserve the
+	 * distinction the sending platform drew is in the text itself. Sending
+	 * platforms show a "Forwarded from <name>" header; this is the closest
+	 * equivalent Talk can render.
+	 *
+	 * The original author is named by their eVault, which is an eName. Resolve
+	 * it to a local display name when the person is known here, and otherwise
+	 * say only that the message was forwarded rather than printing a raw
+	 * identifier at the user.
+	 *
+	 * @param array<string, mixed>|null $forwardedFrom
+	 */
+	private function attributeForward(string $content, ?array $forwardedFrom, string $ownerW3id): string {
+		if ($forwardedFrom === null) {
+			return $content;
+		}
+
+		$vault = is_string($forwardedFrom['vault'] ?? null) ? $forwardedFrom['vault'] : '';
+		$label = $this->resolveForwardAuthorLabel($vault, $ownerW3id);
+
+		$header = $label !== null
+			? 'Forwarded from ' . $label
+			: 'Forwarded message';
+
+		return $content !== '' ? $header . "\n" . $content : $header;
+	}
+
+	/**
+	 * Human-readable name for the vault a forward came from, or null when the
+	 * person is not known to this instance.
+	 */
+	private function resolveForwardAuthorLabel(string $vault, string $ownerW3id): ?string {
+		if ($vault === '') {
+			return null;
+		}
+
+		try {
+			$w3id = $this->resolveParticipantIdToW3id($vault, $ownerW3id) ?? $vault;
+			$uid = $this->resolveW3idToNcUid($w3id);
+			if ($uid === null) {
+				return null;
+			}
+
+			$user = \OCP\Server::get(\OCP\IUserManager::class)->get($uid);
+			$name = $user?->getDisplayName();
+
+			return is_string($name) && trim($name) !== '' ? trim($name) : null;
+		} catch (\Throwable) {
+			return null;
 		}
 	}
 
@@ -841,19 +1293,77 @@ class ChatSyncService {
 	}
 
 	/**
+	 * Persist a message signature so the next request still recognises this
+	 * message as already posted.
+	 *
+	 * The in-memory cache cannot be relied on: without Redis or memcached
+	 * configured, `createDistributed()` hands back a per-request ArrayCache,
+	 * so the signature is gone by the next poll and every replica of the same
+	 * logical message posts again.
+	 *
+	 * Best effort. A losing insert race means another request recorded the
+	 * same signature first, which is the outcome we wanted anyway.
+	 */
+	private function rememberMessageSignature(string $signature, string $localId, string $ownerW3id): void {
+		try {
+			$this->idMappingMapper->storeMapping(
+				self::MESSAGE_SIG_ENTITY,
+				$localId,
+				$signature,
+				$ownerW3id,
+			);
+		} catch (\Throwable) {
+			// Unique-index collision: someone else already recorded it.
+		}
+	}
+
+	/**
 	 * Build the cross-replica identity key for an inbound message.
 	 *
-	 * The outer envelope ID differs per replica, so it cannot be used. Prefer
-	 * the sender-assigned inner `id` when present — that is a real per-message
-	 * identity that survives replication. Fall back to
-	 * (sender, chat, content, createdAt), which distinguishes a legitimately
-	 * repeated message from a replica of the same one.
+	 * The problem this solves: one logical message is readable from several
+	 * eVaults. The envelope lives in the owner's vault, and every other
+	 * participant's vault holds a `reference` pointer to it, so polling each
+	 * participant surfaces the same message repeatedly. Posting on each sight
+	 * of it is what made messages appear twice.
+	 *
+	 * Identity is therefore taken from the envelope itself wherever possible:
+	 *
+	 * 1. The sender-assigned inner `id`. The Message schema requires it, and
+	 *    it is a genuine per-message identity that survives replication. This
+	 *    is exact: two real messages with identical text always carry
+	 *    different ids, so nothing is ever wrongly collapsed.
+	 *
+	 * 2. Failing that, the envelope's own global ID *qualified by the vault it
+	 *    came from*. In practice no peer mapping writes `id` (the reference
+	 *    adapter's mappings simply do not emit one), so this is the live path.
+	 *    An envelope ID is stable per vault, so re-polling the same vault
+	 *    recognises the message, while a different vault's copy is a distinct
+	 *    key -- which is exactly the case (3) exists to close.
+	 *
+	 * 3. A content signature, used *only* to link the copies found in
+	 *    different vaults back to one another. This is the fuzzy step, so it
+	 *    must not swallow a genuine repeat: a user really can send "ok" twice.
+	 *    Content plus timestamp is not enough on its own, because platforms
+	 *    re-stamp `createdAt` on replication, and two quick "ok"s can share a
+	 *    whole-second timestamp.
+	 *
+	 *    So the content key is *occurrence-numbered*: the Nth identical
+	 *    message from a given vault gets ordinal N. The first "ok" from
+	 *    Meshenger matches the first "ok" seen elsewhere, the second matches
+	 *    the second, and a real repeat is never folded into its predecessor.
+	 *    Numbering is per source vault, so replicas of one message (one per
+	 *    vault) all receive the same ordinal.
+	 *
+	 * @param string $ownerW3id The vault this envelope was read from
+	 * @param string $globalId The envelope's ID within that vault
 	 */
 	private function messageIdentitySignature(
 		string $senderUid,
 		string $chatGlobalId,
 		array $data,
 		string $content,
+		string $ownerW3id = '',
+		string $globalId = '',
 	): string {
 		$innerId = $data['id'] ?? null;
 		if (is_string($innerId) && $innerId !== '') {
@@ -863,7 +1373,62 @@ class ChatSyncService {
 		$createdAt = $data['createdAt'] ?? '';
 		$createdAt = is_string($createdAt) ? $createdAt : '';
 
-		return md5($senderUid . '|' . $chatGlobalId . '|' . $content . '|' . $createdAt);
+		// The content key, shared by every copy of this message regardless of
+		// which vault it was read from. Timestamp is deliberately excluded:
+		// platforms re-stamp it on replication, so including it would stop
+		// copies of one message from matching at all.
+		$contentKey = md5($senderUid . '|' . $chatGlobalId . '|' . $content);
+
+		// Without a source vault there is nothing to number occurrences
+		// against, so fall back to the old timestamp-qualified key.
+		if ($ownerW3id === '' || $globalId === '') {
+			return md5($contentKey . '|' . $createdAt);
+		}
+
+		// Which occurrence of this exact text, from this exact vault, is this?
+		//
+		// Row layout matters here, because the table carries unique indexes on
+		// both (entity_type, local_id) and (entity_type, global_id). The
+		// envelope ID goes in `local_id`, unique because an envelope is only
+		// numbered once. The prefixed ordinal goes in `global_id`, unique
+		// because a given (text, vault) pair has exactly one Nth occurrence.
+		// Putting the bare ordinal in `local_id` would collide the moment two
+		// different messages both wanted to be occurrence 0.
+		//
+		// Recording the envelope means a re-poll resolves to the ordinal it
+		// was already given rather than allocating a fresh one, so the count
+		// is stable instead of growing on every poll.
+		$occurrencePrefix = self::MESSAGE_OCCURRENCE_PREFIX . $contentKey . '|' . md5($ownerW3id) . '|';
+
+		$existing = $this->idMappingMapper->getGlobalId(self::MESSAGE_OCC_ENTITY, $globalId);
+		if (is_string($existing) && str_starts_with($existing, $occurrencePrefix)) {
+			return md5($contentKey . '|#' . substr($existing, strlen($occurrencePrefix)));
+		}
+
+		$ordinal = $this->idMappingMapper->countByGlobalIdPrefix(
+			self::MESSAGE_OCC_ENTITY,
+			$occurrencePrefix,
+		);
+
+		try {
+			$this->idMappingMapper->storeMapping(
+				self::MESSAGE_OCC_ENTITY,
+				$globalId,
+				$occurrencePrefix . $ordinal,
+				$ownerW3id,
+			);
+		} catch (\Throwable) {
+			// Another request numbered this envelope, or claimed this ordinal,
+			// first. Re-read to adopt whatever it decided so both requests
+			// agree; if that read finds nothing, fall through with the ordinal
+			// we computed.
+			$settled = $this->idMappingMapper->getGlobalId(self::MESSAGE_OCC_ENTITY, $globalId);
+			if (is_string($settled) && str_starts_with($settled, $occurrencePrefix)) {
+				$ordinal = (int)substr($settled, strlen($occurrencePrefix));
+			}
+		}
+
+		return md5($contentKey . '|#' . $ordinal);
 	}
 
 	// ---------------------------------------------------------------
@@ -1260,12 +1825,29 @@ class ChatSyncService {
 		string $content,
 		string $messageType,
 		?string $createdAt = null,
+		?string $replyToLocalId = null,
 	): ?string {
 		try {
 			$manager = \OCP\Server::get(\OCA\Talk\Manager::class);
 			$room = $manager->getRoomByToken($roomToken);
 
 			$chatManager = \OCP\Server::get(\OCA\Talk\Chat\ChatManager::class);
+
+			// A forward is posted as a reply to the message it forwards, when
+			// that message exists here. Talk then renders its own quote block,
+			// attributed to the original author, which is the closest native
+			// equivalent of the sending platform's forward header -- and
+			// unlike a text prefix it cannot be forged by typing it.
+			$replyTo = null;
+			if ($replyToLocalId !== null) {
+				try {
+					// getComment() already refuses a comment belonging to a
+					// different room, so a returned comment is safe to quote.
+					$replyTo = $chatManager->getComment($room, $replyToLocalId);
+				} catch (\Throwable) {
+					// Original not available locally; post unquoted.
+				}
+			}
 
 			// Stamp the message with the time the sender actually sent it.
 			// Using "now" instead makes every backfilled message look like it
@@ -1279,7 +1861,7 @@ class ChatSyncService {
 				$senderUid,
 				$content,
 				$creationDateTime,
-				null,
+				$replyTo,
 				'',
 				false,
 			);
@@ -1456,17 +2038,43 @@ class ChatSyncService {
 	/**
 	 * Pick the dereferenceable attachment URI out of a Message envelope.
 	 *
-	 * Platforms disagree about where the blob reference lives. The reference
-	 * implementation writes the `w3ds://file` URI to `fileId` and uses
-	 * `mediaUrl` for a base64 data URI it can render inline, when it fills it
-	 * at all. We write both. A data URI is useless to us (Talk needs real
-	 * bytes in the recipient's Files), so take the first field that actually
-	 * carries a w3ds://file URI rather than trusting either name.
+	 * The Message schema declares exactly one attachment field, `mediaUrl`,
+	 * and forbids additional properties, so `mediaUrl` is the only reference a
+	 * conforming platform can send. `fileId` is an extension we and some peers
+	 * also write; it is checked first only because when both are present it is
+	 * the one guaranteed to hold a w3ds:// URI.
+	 *
+	 * `mediaUrl` is typed `format: uri`, which admits three things in
+	 * practice: a `w3ds://file` reference, a plain https URL to the blob, and
+	 * a base64 `data:` URI. Only the first was previously accepted, so an
+	 * attachment sent from a platform that fills `mediaUrl` the other two ways
+	 * resolved to nothing and the message arrived as bare text. All three are
+	 * dereferenceable, so all three are returned here and the caller decides
+	 * how to fetch the bytes.
 	 */
 	private function pickAttachmentUri(array $data): ?string {
-		foreach (['fileId', 'mediaUrl'] as $field) {
+		$fields = ['fileId', 'mediaUrl'];
+
+		// A w3ds:// reference wins wherever it appears. It is the only form
+		// that carries the file's real name and MIME type, and a sender that
+		// supplies one alongside a plain URL means the URL as a rendering
+		// convenience, not as the better reference.
+		foreach ($fields as $field) {
 			$value = $data[$field] ?? null;
 			if (is_string($value) && str_starts_with($value, 'w3ds://file')) {
+				return $value;
+			}
+		}
+
+		// Otherwise take whatever we can actually fetch.
+		foreach ($fields as $field) {
+			$value = $data[$field] ?? null;
+			if (!is_string($value) || $value === '') {
+				continue;
+			}
+			if (str_starts_with($value, 'data:')
+				|| str_starts_with($value, 'http://')
+				|| str_starts_with($value, 'https://')) {
 				return $value;
 			}
 		}
@@ -1645,14 +2253,39 @@ class ChatSyncService {
 
 	private function beginInboundPost(string $senderUid, string $roomToken): void {
 		$this->cache->set($this->inboundPostKey($senderUid, $roomToken), true, self::INBOUND_POST_LOCK_TTL);
+		// The cache alone cannot carry this. `createDistributed()` degrades to
+		// a per-request store when no distributed cache is configured, which
+		// is the default, and the request that must see this flag is a
+		// *different* one -- Talk's listener firing inside sendMessage(), or a
+		// concurrent poller. Without a durable copy the guard was silently
+		// inert on a default install, and inbound messages were re-pushed.
+		$this->idMappingMapper->tryClaim(
+			self::INBOUND_POST_ENTITY,
+			$this->inboundPostKey($senderUid, $roomToken),
+			$senderUid,
+		);
 	}
 
 	private function endInboundPost(string $senderUid, string $roomToken): void {
 		$this->cache->remove($this->inboundPostKey($senderUid, $roomToken));
+		$this->idMappingMapper->releaseClaim(
+			self::INBOUND_POST_ENTITY,
+			$this->inboundPostKey($senderUid, $roomToken),
+		);
 	}
 
 	private function isInboundPostActive(string $senderUid, string $roomToken): bool {
-		return $this->cache->get($this->inboundPostKey($senderUid, $roomToken)) !== null;
+		if ($this->cache->get($this->inboundPostKey($senderUid, $roomToken)) !== null) {
+			return true;
+		}
+
+		// TTL-bounded: a request that dies mid-ingest must not block outbound
+		// sync for this user and room forever.
+		return $this->idMappingMapper->hasFreshClaim(
+			self::INBOUND_POST_ENTITY,
+			$this->inboundPostKey($senderUid, $roomToken),
+			self::INBOUND_POST_LOCK_TTL,
+		);
 	}
 
 	// ---------------------------------------------------------------
