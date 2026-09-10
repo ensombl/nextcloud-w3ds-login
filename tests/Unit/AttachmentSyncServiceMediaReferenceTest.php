@@ -98,10 +98,15 @@ class AttachmentSyncServiceMediaReferenceTest extends TestCase {
 		$this->assertSame('attachment.pdf', $this->resolve('data:application/pdf;base64,AAAA')['filename']);
 	}
 
-	public function testFallsBackToAnUntypedNameForAnUnknownMediaType(): void {
+	/**
+	 * An unrecognised type still has to produce a named file. Nextcloud
+	 * infers type from the stored name, so an extensionless blob has no icon,
+	 * no preview and no working "open with".
+	 */
+	public function testFallsBackToAGenericExtensionForAnUnknownMediaType(): void {
 		$meta = $this->resolve('data:application/x-thing;base64,AAAA');
 
-		$this->assertSame('attachment', $meta['filename']);
+		$this->assertSame('attachment.bin', $meta['filename']);
 		$this->assertSame('application/x-thing', $meta['contentType']);
 	}
 

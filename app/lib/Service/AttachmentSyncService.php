@@ -35,11 +35,20 @@ class AttachmentSyncService {
 	public const TALK_SHARE_VERB = 'object_shared';
 
 	/**
-	 * Cap on bytes we will move in either direction. Well under the
-	 * protocol's 250 MB upload limit: this runs inline on a chat request,
-	 * and the receiving instance still has to honour the user's quota.
+	 * Cap on bytes we will move in either direction.
+	 *
+	 * This matches the protocol's own 250 MB upload limit, which is what a
+	 * sending platform enforces, so anything that legitimately exists in an
+	 * eVault can be received. A lower cap here does not protect anything: the
+	 * bytes were already accepted on the sending side, and the recipient's
+	 * own storage quota is enforced independently when the file is written.
+	 *
+	 * It used to be 25 MB, which images almost never reach but documents,
+	 * archives and video routinely do -- so images arrived and files silently
+	 * did not. `File.size` is required by the ontology, so the check below
+	 * always had a real value to reject on.
 	 */
-	private const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+	private const MAX_ATTACHMENT_BYTES = 250 * 1024 * 1024;
 
 	/** Folder created in the recipient's home for inbound attachments. */
 	private const INBOX_FOLDER = 'W3DS Attachments';
@@ -208,6 +217,21 @@ class AttachmentSyncService {
 				return null;
 			}
 
+			// A bare object-storage URL announces no type, and its path is
+			// often an opaque key, so neither the name nor the declared MIME
+			// type says what this is. The bytes do. Without this a document
+			// fetched from such a URL is stored as an unnamed blob that
+			// Nextcloud shows with no icon, no preview and no working
+			// "open with" -- the visible difference between a file that
+			// "arrives" and one that does not.
+			if ($meta['contentType'] === 'application/octet-stream') {
+				$sniffed = $this->sniffContentType($bytes);
+				if ($sniffed !== null) {
+					$meta['contentType'] = $sniffed;
+					$meta['filename'] = $this->ensureExtension($meta['filename'], $sniffed);
+				}
+			}
+
 			$file = $this->storeInUserFiles($recipientUid, $meta['filename'], $bytes);
 			if ($file === null) {
 				return null;
@@ -248,7 +272,17 @@ class AttachmentSyncService {
 	 */
 	private function resolveAttachment(string $mediaUrl): ?array {
 		if (str_starts_with($mediaUrl, 'w3ds://file')) {
-			return $this->evaultClient->dereferenceFileUri($mediaUrl);
+			$meta = $this->evaultClient->dereferenceFileUri($mediaUrl);
+			if ($meta === null) {
+				return null;
+			}
+
+			// `File.name` carries the original name and `File.mimeType` is
+			// required, so this is where a document whose name lost its
+			// suffix in transit gets it back.
+			$meta['filename'] = $this->ensureExtension($meta['filename'], $meta['contentType']);
+
+			return $meta;
 		}
 
 		if (str_starts_with($mediaUrl, 'data:')) {
@@ -261,7 +295,7 @@ class AttachmentSyncService {
 			return [
 				'publicUrl' => null,
 				'inlineData' => $mediaUrl,
-				'filename' => 'attachment' . $this->extensionForMimeType($contentType),
+				'filename' => $this->ensureExtension('attachment', $contentType),
 				'contentType' => $contentType,
 				// Unknown until decoded; decodeInlineFileData() enforces the
 				// real limit, so 0 here just skips the pre-check.
@@ -341,14 +375,23 @@ class AttachmentSyncService {
 	}
 
 	/**
-	 * Extension for the media types worth naming precisely.
+	 * Derive a file extension from a media type.
 	 *
-	 * Only images matter here: Talk decides whether to render a preview from
-	 * the stored file, so an image that lands as `attachment` with no
-	 * extension shows as a download link instead of the picture that was
-	 * sent. Everything else is served fine by a generic extension.
+	 * `File.mimeType` is required by the ontology, so it is the one piece of
+	 * type information always available, and Nextcloud keys both preview
+	 * rendering and the icon shown in Files off the stored *name*. A file
+	 * that lands with no extension is treated as opaque binary: an image
+	 * still previewed because the whitelist below covered it, while a PDF or
+	 * a spreadsheet arrived as a nameless blob. Hence a general mapping
+	 * rather than an image-only one.
+	 *
+	 * Unknown types fall back to `.bin` rather than to no extension at all,
+	 * so the stored file is always recognisably a file.
 	 */
 	private function extensionForMimeType(string $mimeType): string {
+		// Normalise `image/png; charset=binary` and similar.
+		$mimeType = strtolower(trim(explode(';', $mimeType)[0]));
+
 		return match ($mimeType) {
 			'image/jpeg', 'image/jpg' => '.jpg',
 			'image/png' => '.png',
@@ -356,10 +399,143 @@ class AttachmentSyncService {
 			'image/webp' => '.webp',
 			'image/svg+xml' => '.svg',
 			'image/heic' => '.heic',
+			'image/bmp' => '.bmp',
+			'image/tiff' => '.tiff',
 			'application/pdf' => '.pdf',
 			'text/plain' => '.txt',
+			'text/csv' => '.csv',
+			'text/html' => '.html',
+			'text/markdown' => '.md',
+			'application/json' => '.json',
+			'application/xml', 'text/xml' => '.xml',
+			'application/zip' => '.zip',
+			'application/gzip' => '.gz',
+			'application/x-tar' => '.tar',
+			'application/x-7z-compressed' => '.7z',
+			'application/rtf' => '.rtf',
+			'application/msword' => '.doc',
+			'application/vnd.openxmlformats-officedocument.wordprocessingml.document' => '.docx',
+			'application/vnd.ms-excel' => '.xls',
+			'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' => '.xlsx',
+			'application/vnd.ms-powerpoint' => '.ppt',
+			'application/vnd.openxmlformats-officedocument.presentationml.presentation' => '.pptx',
+			'application/vnd.oasis.opendocument.text' => '.odt',
+			'application/vnd.oasis.opendocument.spreadsheet' => '.ods',
+			'application/vnd.oasis.opendocument.presentation' => '.odp',
+			'audio/mpeg' => '.mp3',
+			'audio/ogg' => '.ogg',
+			'audio/wav', 'audio/x-wav' => '.wav',
+			'audio/mp4', 'audio/m4a' => '.m4a',
+			'video/mp4' => '.mp4',
+			'video/quicktime' => '.mov',
+			'video/webm' => '.webm',
+			'video/x-matroska' => '.mkv',
 			default => '',
 		};
+	}
+
+	/**
+	 * Identify content from its leading bytes.
+	 *
+	 * Used only when the reference gave us nothing to go on: a plain URL
+	 * carries no declared type and often an opaque path. PHP's own
+	 * `finfo` does this properly, so prefer it and fall back to a handful of
+	 * unambiguous magic numbers when the extension is unavailable.
+	 *
+	 * Returns null when the content cannot be identified, leaving the caller
+	 * to keep its existing generic type rather than guessing.
+	 */
+	private function sniffContentType(string $bytes): ?string {
+		if ($bytes === '') {
+			return null;
+		}
+
+		if (class_exists(\finfo::class)) {
+			try {
+				$detected = (new \finfo(FILEINFO_MIME_TYPE))->buffer($bytes);
+				if (is_string($detected)
+					&& $detected !== ''
+					&& $detected !== 'application/octet-stream') {
+					return $detected;
+				}
+			} catch (\Throwable) {
+				// fileinfo unavailable or unhappy; fall through to magic bytes.
+			}
+		}
+
+		// A deliberately small table: only signatures with no realistic
+		// false-positive, since a wrong answer renames the user's file.
+		$signatures = [
+			'%PDF-' => 'application/pdf',
+			"\x89PNG\r\n\x1a\n" => 'image/png',
+			"\xFF\xD8\xFF" => 'image/jpeg',
+			'GIF87a' => 'image/gif',
+			'GIF89a' => 'image/gif',
+			"7z\xBC\xAF\x27\x1C" => 'application/x-7z-compressed',
+			"\x1F\x8B" => 'application/gzip',
+		];
+
+		foreach ($signatures as $magic => $mime) {
+			if (str_starts_with($bytes, $magic)) {
+				return $mime;
+			}
+		}
+
+		// ZIP magic also covers the OOXML and ODF container formats, which
+		// are far more common as chat attachments than a bare archive. ODF
+		// names its type in the payload; OOXML is identified by its parts.
+		if (str_starts_with($bytes, "PK\x03\x04")) {
+			if (str_contains($bytes, 'mimetypeapplication/vnd.oasis.opendocument.text')) {
+				return 'application/vnd.oasis.opendocument.text';
+			}
+			if (str_contains($bytes, 'mimetypeapplication/vnd.oasis.opendocument.spreadsheet')) {
+				return 'application/vnd.oasis.opendocument.spreadsheet';
+			}
+			if (str_contains($bytes, 'mimetypeapplication/vnd.oasis.opendocument.presentation')) {
+				return 'application/vnd.oasis.opendocument.presentation';
+			}
+			if (str_contains($bytes, 'word/')) {
+				return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+			}
+			if (str_contains($bytes, 'xl/')) {
+				return 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+			}
+			if (str_contains($bytes, 'ppt/')) {
+				return 'application/vnd.openxmlformats-officedocument.presentationml.presentation';
+			}
+
+			return 'application/zip';
+		}
+
+		return null;
+	}
+
+	/**
+	 * Ensure a filename carries an extension, deriving one from the media
+	 * type when it does not.
+	 *
+	 * `File.name` is "the original file name" and `File.mimeType` is
+	 * required, but a name arriving from another platform is not guaranteed
+	 * to have a usable suffix -- object keys and generated names frequently
+	 * have none. Nextcloud infers a file's type from its name, so a document
+	 * stored without one is an unrecognised blob with no icon and no preview.
+	 */
+	private function ensureExtension(string $filename, string $mimeType): string {
+		$extension = $this->extensionForMimeType($mimeType);
+
+		// Already suffixed with the right extension: nothing to do.
+		if ($extension !== '' && str_ends_with(strtolower($filename), $extension)) {
+			return $filename;
+		}
+
+		// Any other plausible extension is left alone: the sender's own
+		// naming is more informative than our table (.jpeg vs .jpg, .yml,
+		// .tar.gz), and renaming it would be a downgrade.
+		if (preg_match('/\.[A-Za-z0-9]{1,8}$/', $filename) === 1) {
+			return $filename;
+		}
+
+		return $filename . ($extension !== '' ? $extension : '.bin');
 	}
 
 	/**
