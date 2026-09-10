@@ -107,7 +107,7 @@ class AttachmentSyncService {
 	 *
 	 * @param string $commentMessage The raw comment message (JSON share ref)
 	 * @param string[] $acl eNames allowed to read the blob
-	 * @return array{mediaUrl: string, type: string, filename: string, mimeType: string, size: int, caption: ?string}|null
+	 * @return array{mediaUrl: string, publicUrl: ?string, type: string, filename: string, mimeType: string, size: int, caption: ?string}|null
 	 */
 	public function pushAttachment(
 		string $senderUid,
@@ -141,14 +141,14 @@ class AttachmentSyncService {
 			}
 
 			$mime = $file->getMimeType();
-			$uri = $this->evaultClient->uploadFile(
+			$uploaded = $this->evaultClient->uploadFile(
 				$senderW3id,
 				$file->getName(),
 				$mime,
 				$content,
 				$acl,
 			);
-			if ($uri === null) {
+			if ($uploaded === null) {
 				return null;
 			}
 
@@ -159,7 +159,12 @@ class AttachmentSyncService {
 			]);
 
 			return [
-				'mediaUrl' => $uri,
+				'mediaUrl' => $uploaded['uri'],
+				// The object-storage URL, when the eVault returned one. A peer
+				// that renders `mediaUrl` directly cannot resolve a w3ds://
+				// reference, so publishing this alongside it is what makes an
+				// attachment we send visible on those platforms.
+				'publicUrl' => $uploaded['publicUrl'],
 				// The Message schema distinguishes `image` from `file`; a
 				// receiving platform uses it to decide how to render.
 				'type' => str_starts_with($mime, 'image/') ? 'image' : 'file',
@@ -185,7 +190,7 @@ class AttachmentSyncService {
 	 */
 	public function pullAttachment(string $mediaUrl, string $recipientUid, string $roomToken, ?string $caption = null): ?IShare {
 		try {
-			$meta = $this->evaultClient->dereferenceFileUri($mediaUrl);
+			$meta = $this->resolveAttachment($mediaUrl);
 			if ($meta === null) {
 				return null;
 			}
@@ -198,7 +203,7 @@ class AttachmentSyncService {
 				return null;
 			}
 
-			$bytes = $this->evaultClient->downloadFile($meta['publicUrl'], self::MAX_ATTACHMENT_BYTES);
+			$bytes = $this->fetchBytes($meta);
 			if ($bytes === null) {
 				return null;
 			}
@@ -225,6 +230,136 @@ class AttachmentSyncService {
 			]);
 			return null;
 		}
+	}
+
+	/**
+	 * Resolve whatever a Message envelope put in `mediaUrl` into file
+	 * metadata plus a way to get the bytes.
+	 *
+	 * The Message schema types `mediaUrl` only as `format: uri`, so a
+	 * conforming sender may hand us any of three things. A `w3ds://file`
+	 * reference needs a lookup against the owning eVault to learn the name
+	 * and MIME type. A plain https URL is already the blob. A `data:` URI
+	 * carries the bytes inline. Only the first was handled before, so
+	 * attachments composed on platforms that use either of the other two
+	 * forms never materialised.
+	 *
+	 * @return array{publicUrl: ?string, inlineData: ?string, filename: string, contentType: string, size: int}|null
+	 */
+	private function resolveAttachment(string $mediaUrl): ?array {
+		if (str_starts_with($mediaUrl, 'w3ds://file')) {
+			return $this->evaultClient->dereferenceFileUri($mediaUrl);
+		}
+
+		if (str_starts_with($mediaUrl, 'data:')) {
+			// A data URI names no file, so the extension has to come from the
+			// declared media type. Talk keys its preview handling off the
+			// stored file's name, so guessing badly means an image that never
+			// renders inline.
+			$contentType = $this->dataUriContentType($mediaUrl) ?? 'application/octet-stream';
+
+			return [
+				'publicUrl' => null,
+				'inlineData' => $mediaUrl,
+				'filename' => 'attachment' . $this->extensionForMimeType($contentType),
+				'contentType' => $contentType,
+				// Unknown until decoded; decodeInlineFileData() enforces the
+				// real limit, so 0 here just skips the pre-check.
+				'size' => 0,
+			];
+		}
+
+		if (str_starts_with($mediaUrl, 'http://') || str_starts_with($mediaUrl, 'https://')) {
+			return [
+				'publicUrl' => $mediaUrl,
+				'inlineData' => null,
+				'filename' => $this->filenameFromUrl($mediaUrl),
+				'contentType' => 'application/octet-stream',
+				'size' => 0,
+			];
+		}
+
+		$this->logger->info('[W3DS Attachment] Unrecognised media reference, ignoring', [
+			'mediaUrl' => substr($mediaUrl, 0, 64),
+		]);
+
+		return null;
+	}
+
+	/**
+	 * Get the bytes for a resolved attachment, from storage or from the
+	 * envelope's own inline copy.
+	 *
+	 * @param array{publicUrl: ?string, inlineData: ?string, filename: string, contentType: string, size: int} $meta
+	 */
+	private function fetchBytes(array $meta): ?string {
+		// Prefer the URL: it streams, whereas inline data is already fully in
+		// memory and is only a fallback for blobs never pushed to storage.
+		if ($meta['publicUrl'] !== null) {
+			$bytes = $this->evaultClient->downloadFile($meta['publicUrl'], self::MAX_ATTACHMENT_BYTES);
+			if ($bytes !== null) {
+				return $bytes;
+			}
+		}
+
+		if ($meta['inlineData'] !== null) {
+			return $this->evaultClient->decodeInlineFileData($meta['inlineData'], self::MAX_ATTACHMENT_BYTES);
+		}
+
+		return null;
+	}
+
+	/**
+	 * Read the media type out of a `data:` URI, ignoring its parameters.
+	 */
+	private function dataUriContentType(string $uri): ?string {
+		if (!preg_match('#^data:([^;,]+)#i', $uri, $m)) {
+			return null;
+		}
+
+		$type = strtolower(trim($m[1]));
+
+		return $type !== '' ? $type : null;
+	}
+
+	/**
+	 * Derive a filename from a blob URL's path, falling back to a generic
+	 * name when the URL carries nothing usable.
+	 */
+	private function filenameFromUrl(string $url): string {
+		$path = parse_url($url, PHP_URL_PATH);
+		if (!is_string($path) || $path === '') {
+			return 'attachment';
+		}
+
+		$name = rawurldecode(basename($path));
+		$name = $this->sanitiseFilename($name);
+
+		// A path ending in a directory, or one whose last segment is not a
+		// filename at all, gives us nothing worth showing.
+		return $name !== '' ? $name : 'attachment';
+	}
+
+	/**
+	 * Extension for the media types worth naming precisely.
+	 *
+	 * Only images matter here: Talk decides whether to render a preview from
+	 * the stored file, so an image that lands as `attachment` with no
+	 * extension shows as a download link instead of the picture that was
+	 * sent. Everything else is served fine by a generic extension.
+	 */
+	private function extensionForMimeType(string $mimeType): string {
+		return match ($mimeType) {
+			'image/jpeg', 'image/jpg' => '.jpg',
+			'image/png' => '.png',
+			'image/gif' => '.gif',
+			'image/webp' => '.webp',
+			'image/svg+xml' => '.svg',
+			'image/heic' => '.heic',
+			'application/pdf' => '.pdf',
+			'text/plain' => '.txt',
+			default => '',
+		};
 	}
 
 	/**

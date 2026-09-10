@@ -534,17 +534,23 @@ class ChatSyncService {
 
 			if ($attachment !== null) {
 				// `fileId` holds the w3ds://file URI and `file` its metadata:
-				// that pair is what other platforms dereference to render an
-				// attachment. `mediaUrl` is also populated because the Message
-				// schema names it, but a w3ds:// value there is not something
-				// an <img> can load, so it cannot be the only reference.
+				// that pair is what platforms which dereference through the
+				// eVault read. Both are extensions; the Message schema itself
+				// declares only `mediaUrl`.
 				$payload['fileId'] = $attachment['mediaUrl'];
 				$payload['file'] = [
 					'name' => $attachment['filename'],
 					'size' => (string)$attachment['size'],
 					'mimeType' => $attachment['mimeType'],
 				];
-				$payload['mediaUrl'] = $attachment['mediaUrl'];
+				// `mediaUrl` is the only attachment field the schema defines,
+				// so for a conforming peer it is the whole attachment. Prefer
+				// the object-storage URL: a w3ds:// reference is not something
+				// an <img> can load, and a peer that renders `mediaUrl`
+				// directly would show nothing. Fall back to the w3ds:// URI
+				// only when the eVault returned no public URL, so the field is
+				// never empty.
+				$payload['mediaUrl'] = $attachment['publicUrl'] ?? $attachment['mediaUrl'];
 				$payload['type'] = $attachment['type'];
 				// Peers put the caption in `content` and carry the filename in
 				// `file.name`, so an absent caption means empty content rather
@@ -764,12 +770,17 @@ class ChatSyncService {
 			// rather than text: download the blob, drop it in the recipient's
 			// Files, and share it into the room. Talk generates its own
 			// comment for the share, so there's nothing further to post.
-			// Peers reference the blob from `fileId` and often omit
-			// `mediaUrl` entirely, or fill it with a base64 data URI meant for
-			// direct rendering. Prefer whichever field actually holds a
-			// w3ds://file URI, which is the only thing we can dereference.
 			$mediaUrl = $this->pickAttachmentUri($data);
-			if (in_array($messageType, ['file', 'image'], true) && $mediaUrl !== null) {
+
+			// A resolvable `mediaUrl` is what makes this an attachment, not
+			// the declared `type`. The schema's enum is advisory about
+			// rendering, and senders get it wrong in both directions: some
+			// leave `type` at its `text` default while filling `mediaUrl`,
+			// which previously posted the URI as a line of text and dropped
+			// the file. Requiring both is what kept attachments composed
+			// elsewhere from appearing. A `system` message is excluded: those
+			// are membership notices, never user content.
+			if ($mediaUrl !== null && $messageType !== 'system') {
 				// `content` on an attachment envelope is the sender's caption
 				// when they wrote one, and the bare filename otherwise.
 				// pullAttachment() drops it when it merely repeats the
@@ -1456,17 +1467,43 @@ class ChatSyncService {
 	/**
 	 * Pick the dereferenceable attachment URI out of a Message envelope.
 	 *
-	 * Platforms disagree about where the blob reference lives. The reference
-	 * implementation writes the `w3ds://file` URI to `fileId` and uses
-	 * `mediaUrl` for a base64 data URI it can render inline, when it fills it
-	 * at all. We write both. A data URI is useless to us (Talk needs real
-	 * bytes in the recipient's Files), so take the first field that actually
-	 * carries a w3ds://file URI rather than trusting either name.
+	 * The Message schema declares exactly one attachment field, `mediaUrl`,
+	 * and forbids additional properties, so `mediaUrl` is the only reference a
+	 * conforming platform can send. `fileId` is an extension we and some peers
+	 * also write; it is checked first only because when both are present it is
+	 * the one guaranteed to hold a w3ds:// URI.
+	 *
+	 * `mediaUrl` is typed `format: uri`, which admits three things in
+	 * practice: a `w3ds://file` reference, a plain https URL to the blob, and
+	 * a base64 `data:` URI. Only the first was previously accepted, so an
+	 * attachment sent from a platform that fills `mediaUrl` the other two ways
+	 * resolved to nothing and the message arrived as bare text. All three are
+	 * dereferenceable, so all three are returned here and the caller decides
+	 * how to fetch the bytes.
 	 */
 	private function pickAttachmentUri(array $data): ?string {
-		foreach (['fileId', 'mediaUrl'] as $field) {
+		$fields = ['fileId', 'mediaUrl'];
+
+		// A w3ds:// reference wins wherever it appears. It is the only form
+		// that carries the file's real name and MIME type, and a sender that
+		// supplies one alongside a plain URL means the URL as a rendering
+		// convenience, not as the better reference.
+		foreach ($fields as $field) {
 			$value = $data[$field] ?? null;
 			if (is_string($value) && str_starts_with($value, 'w3ds://file')) {
+				return $value;
+			}
+		}
+
+		// Otherwise take whatever we can actually fetch.
+		foreach ($fields as $field) {
+			$value = $data[$field] ?? null;
+			if (!is_string($value) || $value === '') {
+				continue;
+			}
+			if (str_starts_with($value, 'data:')
+				|| str_starts_with($value, 'http://')
+				|| str_starts_with($value, 'https://')) {
 				return $value;
 			}
 		}
