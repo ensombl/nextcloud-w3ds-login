@@ -553,6 +553,28 @@ class ChatSyncService {
 			return;
 		}
 
+		// Long-lived inbound-mirror gate, the message-level counterpart of the
+		// one in pushChat().
+		//
+		// A message we ingested from a peer is displayed here as an ordinary
+		// Talk comment, and Talk cannot express that it originated elsewhere:
+		// a forward's attribution is a line of text we prepended, and an
+		// inbound attachment becomes a real local file share. Both therefore
+		// look exactly like something this user just wrote, so every later
+		// listener fire or concurrent poller replicated them back to the
+		// eVault as new envelopes -- content this instance is only mirroring
+		// for display, stored a second time under our own identity.
+		//
+		// The guards above cannot cover this. The sync lock is TTL-bounded,
+		// and the inbound-post flag lives in a cache that degrades to a
+		// per-request store when no distributed cache is configured, which is
+		// the default. The `origin` column is durable and survives request
+		// boundaries, which is exactly what this needs.
+		if ($this->idMappingMapper->getOrigin('message', $localId) === 'inbound') {
+			$this->logger->info('[W3DS Sync] pushMessage skip: inbound mirror', ['localId' => $localId]);
+			return;
+		}
+
 		// If this message is being posted by handleInboundMessage right now,
 		// skip -- otherwise we'd ping-pong the message we just received.
 		if ($this->isInboundPostActive($ncUid, $roomToken)) {
@@ -985,11 +1007,19 @@ class ChatSyncService {
 				if ($share !== null) {
 					// Map the envelope to the share so the same attachment is
 					// not re-materialised on the next poll.
+					//
+					// Recorded as `inbound`: this share is a mirror of someone
+					// else's envelope, and pushMessageClaimed() refuses to
+					// replicate a mirror back out. Without that marking the
+					// comment Talk generates for the share reads as ordinary
+					// local content and is written to the eVault as a second,
+					// duplicate envelope.
 					$this->idMappingMapper->storeMapping(
 						'message',
 						'share:' . $share->getId(),
 						$globalId,
 						$ownerW3id,
+						'inbound',
 					);
 					$this->cache->set($sigKey, 'share:' . $share->getId(), self::MESSAGE_SIG_CACHE_TTL);
 					$this->rememberMessageSignature($signature, 'share:' . $share->getId(), $ownerW3id);
@@ -1029,7 +1059,13 @@ class ChatSyncService {
 			}
 
 			$this->setSyncLock('message', $localMessageId);
-			$this->idMappingMapper->storeMapping('message', $localMessageId, $globalId, $ownerW3id);
+			// `inbound` marks this comment as a mirror of a remote envelope,
+			// durably. The sync lock above expires in seconds and the
+			// in-memory guard degrades to a per-request store without Redis,
+			// so neither survives long enough to stop a later listener fire or
+			// a concurrent poller from pushing this same message back out as a
+			// fresh envelope.
+			$this->idMappingMapper->storeMapping('message', $localMessageId, $globalId, $ownerW3id, 'inbound');
 			$this->cache->set($sigKey, $localMessageId, self::MESSAGE_SIG_CACHE_TTL);
 			$this->rememberMessageSignature($signature, $localMessageId, $ownerW3id);
 		} catch (\Throwable $e) {
@@ -1050,6 +1086,10 @@ class ChatSyncService {
 	 * own id. Mapping the comment to the same envelope means the ordinary
 	 * `getGlobalId('message', $localId)` check recognises it, so the echo is
 	 * suppressed without re-deriving anything.
+	 *
+	 * Recorded as `inbound`, matching the share row it inherits from: the
+	 * comment is a mirror of a remote envelope, and marking it as local would
+	 * invite the outbound path to replicate it back out.
 	 *
 	 * Best effort: the share mapping alone already stops the loopback, and
 	 * this is only a shortcut for later events on the same comment.
