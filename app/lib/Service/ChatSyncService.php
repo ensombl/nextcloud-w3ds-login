@@ -19,7 +19,17 @@ class ChatSyncService {
 	private const SYNC_LOCK_PREFIX = 'w3ds_sync_lock_';
 	private const SYNC_LOCK_TTL = 10;
 	private const INBOUND_POST_LOCK_PREFIX = 'w3ds_inbound_post_';
-	private const INBOUND_POST_LOCK_TTL = 10;
+	/**
+	 * How long the "an inbound post is in flight" guard lives.
+	 *
+	 * It has to outlast the work it guards. Materialising an attachment means
+	 * dereferencing the file envelope, downloading up to the protocol's
+	 * 250 MB, writing it into the recipient's Files and sharing it into the
+	 * room -- all before Talk fires the event this guard is meant to suppress.
+	 * At 10s the guard expired mid-download on any sizeable file, and the
+	 * resulting share comment was pushed back out as a new message.
+	 */
+	private const INBOUND_POST_LOCK_TTL = 600;
 	private const MESSAGE_SIG_CACHE_PREFIX = 'w3ds_msg_sig_';
 	private const MESSAGE_SIG_CACHE_TTL = 86400; // 24h — enough to span a typical poll window
 	/**
@@ -486,6 +496,33 @@ class ChatSyncService {
 			return;
 		}
 
+		// A file share we materialised from an inbound envelope must never be
+		// pushed back out. Talk generates its own comment for a room share,
+		// and that comment is what reaches this listener -- but the inbound
+		// path only ever recorded the *share* (`share:<id>`), so the comment
+		// looked like a brand new local message and was replicated to the
+		// eVault as a second, spurious envelope.
+		//
+		// The comment carries the share id in its parameters, which is the
+		// join between the two: if that share is already mapped to an
+		// envelope, this comment is the echo of an inbound attachment.
+		//
+		// Checked against the mapping table rather than the in-memory guard
+		// above, because that guard lives in a cache that degrades to a
+		// per-request store without Redis, and because a large attachment can
+		// take longer to download than the guard's 10s TTL -- by which point
+		// it has expired and stops suppressing anything.
+		if (($messageData['verb'] ?? '') === AttachmentSyncService::TALK_SHARE_VERB) {
+			$shareId = $this->attachmentSync->extractShareId((string)($messageData['message'] ?? ''));
+			if ($shareId !== null
+				&& $this->idMappingMapper->getGlobalId('message', 'share:' . $shareId) !== null) {
+				// Record the comment against the same envelope so subsequent
+				// events on it resolve immediately, without re-parsing.
+				$this->adoptInboundShareComment($shareId, $localId, $w3id);
+				return;
+			}
+		}
+
 		// Resolve (or auto-create) the chat's global ID
 		$chatGlobalId = $this->ensureChatSynced($ncUid, $roomToken);
 		if ($chatGlobalId === null) {
@@ -863,6 +900,37 @@ class ChatSyncService {
 			]);
 		} finally {
 			$this->endInboundPost($senderUid, $roomToken);
+		}
+	}
+
+	/**
+	 * Point a share comment at the envelope its share already maps to.
+	 *
+	 * An inbound attachment is recorded against the share Talk created
+	 * (`share:<id>`), but the comment Talk generates for that share has its
+	 * own id. Mapping the comment to the same envelope means the ordinary
+	 * `getGlobalId('message', $localId)` check recognises it, so the echo is
+	 * suppressed without re-deriving anything.
+	 *
+	 * Best effort: the share mapping alone already stops the loopback, and
+	 * this is only a shortcut for later events on the same comment.
+	 */
+	private function adoptInboundShareComment(string $shareId, string $localId, string $w3id): void {
+		try {
+			$globalId = $this->idMappingMapper->getGlobalId('message', 'share:' . $shareId);
+			if ($globalId === null) {
+				return;
+			}
+
+			if ($this->idMappingMapper->getGlobalId('message', $localId) !== null) {
+				return;
+			}
+
+			$this->idMappingMapper->storeMapping('message', $localId, $globalId, $w3id, 'inbound');
+		} catch (\Throwable) {
+			// The (entity_type, global_id) index already holds the share row,
+			// so a collision here is expected on some backends and harmless:
+			// the share mapping is what actually suppresses the loopback.
 		}
 	}
 
