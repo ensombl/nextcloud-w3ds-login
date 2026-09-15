@@ -9,6 +9,15 @@ Entries below are reconstructed from commit history.
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-09-15
+
+### Changed
+
+- Renamed the app to W3DS Connector and refreshed its App Store metadata and
+  screenshots.
+- Removed an unsupported public-certificate input from the App Store publishing
+  workflow.
+
 ## [0.7.0] - 2026-09-10
 
 ### Fixed
