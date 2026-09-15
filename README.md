@@ -1,4 +1,4 @@
-# Nextcloud W3DS Login
+# Nextcloud W3DS Connector
 
 Passwordless Nextcloud login via the [W3DS](https://w3ds.metastate.foundation) decentralized identity protocol, plus optional bidirectional sync of Nextcloud Talk chats to/from user eVaults.
 

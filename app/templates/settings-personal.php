@@ -18,7 +18,7 @@ $unlinkUrl = $_['unlinkUrl'];
      data-link-start-url="<?php p($linkStartUrl); ?>"
      data-unlink-url="<?php p($unlinkUrl); ?>"
      data-request-token="<?php p($_['requesttoken']); ?>">
-    <h2>W3DS Login</h2>
+    <h2>W3DS Connector</h2>
 
     <div id="w3ds-settings-content">
         <?php if ($linkedW3id): ?>
