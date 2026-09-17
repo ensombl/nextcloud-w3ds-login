@@ -10,6 +10,8 @@ use OCA\W3dsLogin\Db\W3dsMappingMapper;
 use OCP\AppFramework\Db\DoesNotExistException;
 use OCP\ICache;
 use OCP\ICacheFactory;
+use OCP\IUserManager;
+use OCP\IUserSession;
 use Psr\Log\LoggerInterface;
 
 class ChatSyncService {
@@ -92,6 +94,8 @@ class ChatSyncService {
 		private LoggerInterface $logger,
 		private MentionTranslator $mentionTranslator,
 		private AttachmentSyncService $attachmentSync,
+		private IUserManager $userManager,
+		private IUserSession $userSession,
 	) {
 		$this->cache = $cacheFactory->createDistributed(Application::APP_ID);
 	}
@@ -945,7 +949,7 @@ class ChatSyncService {
 				// outbound listener that comment is ours: the mapping below
 				// cannot, because the share ID it keys on does not exist
 				// until this call returns.
-				$share = $this->duringIngest(fn () => $this->attachmentSync->pullAttachment(
+				$share = $this->duringIngest($senderUid, fn () => $this->attachmentSync->pullAttachment(
 					$mediaUrl,
 					$senderUid,
 					$roomToken,
@@ -994,7 +998,7 @@ class ChatSyncService {
 			// Same reasoning as the share above: sendMessage() raises the
 			// listener's event before it returns the comment ID we would
 			// otherwise mark as inbound.
-			$localMessageId = $this->duringIngest(fn () => $this->postTalkMessage(
+			$localMessageId = $this->duringIngest($senderUid, fn () => $this->postTalkMessage(
 				$roomToken,
 				$senderUid,
 				$content,
@@ -1883,15 +1887,52 @@ class ChatSyncService {
 	 * share -- must happen inside this wrapper, so the outbound listener can
 	 * recognise the resulting event as ours and ignore it.
 	 *
+	 * The wrapper also assumes the sender's identity for the duration of the
+	 * write, because Talk asks two different questions depending on what is
+	 * being written. A chat message takes the author as an argument, so it is
+	 * attributed correctly whoever is logged in. A file share does not: Talk
+	 * writes its own "shared a file" message from a listener we never call,
+	 * and works out the author from whoever is logged in at the time. Inbound
+	 * sync runs from cron and from a webhook, and neither has anybody logged
+	 * in, so every attachment received from another platform was attributed to
+	 * a guest.
+	 *
+	 * Both concerns are raised and dropped together on purpose. Separating
+	 * them would allow a later change to keep one and lose the other, and the
+	 * failure that produces -- a mirrored message treated as something this
+	 * user just wrote -- is how an inbound attachment once got replicated back
+	 * out to everyone in the room.
+	 *
 	 * @template T
+	 * @param string $senderUid The person the write should be attributed to.
 	 * @param callable(): T $write
 	 * @return T
 	 */
-	private function duringIngest(callable $write): mixed {
+	private function duringIngest(string $senderUid, callable $write): mixed {
 		$this->ingestDepth++;
+		$previousUser = $this->userSession->getUser();
+		$sender = $this->userManager->get($senderUid);
+
+		if ($sender !== null) {
+			$this->userSession->setUser($sender);
+		}
+
 		try {
 			return $write();
 		} finally {
+			// Always restored, including when the write throws: one run
+			// ingests many packets in sequence, and leaving a sender in place
+			// would attribute every later attachment in that run to the wrong
+			// person.
+			//
+			// Restored to whoever was there before rather than to nobody.
+			// Today both callers start with an empty session, so the two are
+			// equivalent; this costs one variable and stays correct if inbound
+			// sync is ever reached from a request that does have a user.
+			if ($sender !== null) {
+				$this->userSession->setUser($previousUser);
+			}
+
 			$this->ingestDepth--;
 		}
 	}

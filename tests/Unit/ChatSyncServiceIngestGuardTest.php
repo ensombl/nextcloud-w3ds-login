@@ -6,6 +6,9 @@ namespace OCA\W3dsLogin\Tests\Unit;
 
 use OCA\W3dsLogin\Listener\MessageSentListener;
 use OCA\W3dsLogin\Service\ChatSyncService;
+use OCP\IUser;
+use OCP\IUserManager;
+use OCP\IUserSession;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\NullLogger;
 
@@ -36,8 +39,27 @@ use Psr\Log\NullLogger;
  * ordering rather than asserting a constant.
  */
 class ChatSyncServiceIngestGuardTest extends TestCase {
-	private function service(): ChatSyncService {
-		return (new \ReflectionClass(ChatSyncService::class))->newInstanceWithoutConstructor();
+	private const SENDER = 'alice';
+
+	/**
+	 * @param IUser|null $sender Who the ingest is attributed to, if resolvable.
+	 */
+	private function service(?IUser $sender = null, ?IUserSession $session = null): ChatSyncService {
+		$service = (new \ReflectionClass(ChatSyncService::class))->newInstanceWithoutConstructor();
+
+		$users = $this->createMock(IUserManager::class);
+		$users->method('get')->willReturn($sender);
+
+		foreach ([
+			'userManager' => $users,
+			'userSession' => $session ?? $this->createMock(IUserSession::class),
+		] as $name => $value) {
+			$prop = new \ReflectionProperty(ChatSyncService::class, $name);
+			$prop->setAccessible(true);
+			$prop->setValue($service, $value);
+		}
+
+		return $service;
 	}
 
 	/**
@@ -48,7 +70,7 @@ class ChatSyncServiceIngestGuardTest extends TestCase {
 	private function duringIngest(ChatSyncService $service, callable $write): void {
 		$method = new \ReflectionMethod(ChatSyncService::class, 'duringIngest');
 		$method->setAccessible(true);
-		$method->invoke($service, $write);
+		$method->invoke($service, self::SENDER, $write);
 	}
 
 	/**
@@ -172,6 +194,152 @@ class ChatSyncServiceIngestGuardTest extends TestCase {
 			$seenByTypingRequest,
 			'a person typing elsewhere must still reach the outbound path',
 		);
+	}
+
+	/**
+	 * A user session that records what it was told, so these tests can watch
+	 * identity being taken and given back.
+	 *
+	 * @param list<string> $log Receives each uid the session was set to, with
+	 *                          '(nobody)' for a clear.
+	 */
+	private function recordingSession(array &$log, ?IUser $initial = null): IUserSession {
+		$current = $initial;
+
+		$session = $this->createMock(IUserSession::class);
+		$session->method('getUser')->willReturnCallback(
+			static function () use (&$current): ?IUser {
+				return $current;
+			},
+		);
+
+		$session->method('setUser')->willReturnCallback(
+			static function (?IUser $user) use (&$current, &$log): void {
+				$current = $user;
+				$log[] = $user?->getUID() ?? '(nobody)';
+			},
+		);
+
+		return $session;
+	}
+
+	private function user(string $uid): IUser {
+		$user = $this->createMock(IUser::class);
+		$user->method('getUID')->willReturn($uid);
+
+		return $user;
+	}
+
+	/**
+	 * Talk attributes a file share to whoever is logged in, because it writes
+	 * that message itself from a listener we never call. Inbound sync runs
+	 * from cron and from a webhook, where nobody is, so every attachment from
+	 * another platform was credited to a guest.
+	 */
+	public function testTheSenderIsAssumedForTheDurationOfTheWrite(): void {
+		$log = [];
+		$session = $this->recordingSession($log);
+		$service = $this->service($this->user(self::SENDER), $session);
+
+		$duringWrite = null;
+		$this->duringIngest($service, static function () use ($session, &$duringWrite): void {
+			$duringWrite = $session->getUser()?->getUID();
+		});
+
+		$this->assertSame(self::SENDER, $duringWrite, 'Talk must see the sender while it writes');
+	}
+
+	/**
+	 * Identity is borrowed, not kept. One run ingests many packets in
+	 * sequence, so a sender left in place would be credited with every later
+	 * attachment in that run.
+	 */
+	public function testTheSessionIsHandedBackAfterTheWrite(): void {
+		$log = [];
+		$service = $this->service($this->user(self::SENDER), $this->recordingSession($log));
+
+		$this->duringIngest($service, static function (): void {
+		});
+
+		$this->assertSame([self::SENDER, '(nobody)'], $log);
+	}
+
+	/**
+	 * The case that makes this dangerous rather than merely wrong: a packet
+	 * that throws must not leave its sender behind for the next one.
+	 */
+	public function testAFailedWriteStillHandsTheSessionBack(): void {
+		$log = [];
+		$session = $this->recordingSession($log);
+		$service = $this->service($this->user(self::SENDER), $session);
+
+		try {
+			$this->duringIngest($service, static function (): void {
+				throw new \RuntimeException('eVault unreachable mid-download');
+			});
+			$this->fail('the exception should propagate');
+		} catch (\RuntimeException) {
+			// expected
+		}
+
+		$this->assertNull($session->getUser(), 'a failed packet must not leak its sender');
+	}
+
+	/**
+	 * Ingesting two packets in a row must credit each to its own sender. This
+	 * is the shape of a real cron run, where one process drains a page of
+	 * packets one after another.
+	 */
+	public function testConsecutivePacketsAreAttributedToTheirOwnSenders(): void {
+		$log = [];
+		$session = $this->recordingSession($log);
+
+		$seen = [];
+		foreach (['alice', 'bob'] as $uid) {
+			$service = $this->service($this->user($uid), $session);
+			$this->duringIngest($service, static function () use ($session, &$seen): void {
+				$seen[] = $session->getUser()?->getUID();
+			});
+		}
+
+		$this->assertSame(['alice', 'bob'], $seen);
+	}
+
+	/**
+	 * Restored to whoever was there rather than to nobody. Both callers start
+	 * with an empty session today, so this only matters if inbound sync is
+	 * ever reached from a request that has a user -- at which point clearing
+	 * it would log that person out mid-request.
+	 */
+	public function testAnExistingSessionIsRestoredRatherThanCleared(): void {
+		$log = [];
+		$browsing = $this->user('someone-already-logged-in');
+		$session = $this->recordingSession($log, $browsing);
+		$service = $this->service($this->user(self::SENDER), $session);
+
+		$this->duringIngest($service, static function (): void {
+		});
+
+		$this->assertSame('someone-already-logged-in', $session->getUser()?->getUID());
+	}
+
+	/**
+	 * A sender with no local account is ordinary: a message can arrive from
+	 * someone this instance has never provisioned. Ingest continues, since
+	 * text messages carry their author explicitly and do not depend on the
+	 * session at all.
+	 */
+	public function testAnUnknownSenderLeavesTheSessionUntouched(): void {
+		$log = [];
+		$service = $this->service(null, $this->recordingSession($log));
+
+		$ran = false;
+		$this->duringIngest($service, static function () use (&$ran): void {
+			$ran = true;
+		});
+
+		$this->assertTrue($ran, 'ingest must not be abandoned for an unknown sender');
+		$this->assertSame([], $log, 'nothing to assume, so nothing to restore');
 	}
 
 	/**
