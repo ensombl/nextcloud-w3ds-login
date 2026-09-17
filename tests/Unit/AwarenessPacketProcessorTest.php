@@ -29,8 +29,13 @@ class AwarenessPacketProcessorTest extends TestCase {
 	 *
 	 * @param list<string> $claimed Receives the keys that were claimed.
 	 */
-	private function mapper(array &$claimed): IdMappingMapper {
+	private function mapper(array &$claimed, bool $chatIsKnown = true): IdMappingMapper {
 		$mapper = $this->createMock(IdMappingMapper::class);
+
+		// A message is only ours if its conversation already exists here.
+		$mapper->method('getLocalId')->willReturnCallback(
+			static fn (string $type, string $id): ?string => $chatIsKnown ? 'room-token' : null,
+		);
 
 		$mapper->method('tryClaim')->willReturnCallback(
 			static function (string $type, string $key) use (&$claimed): bool {
@@ -55,8 +60,8 @@ class AwarenessPacketProcessorTest extends TestCase {
 	/**
 	 * @param list<string> $claimed
 	 */
-	private function processor(ChatSyncService $sync, array &$claimed): AwarenessPacketProcessor {
-		return new AwarenessPacketProcessor($sync, $this->mapper($claimed), new NullLogger());
+	private function processor(ChatSyncService $sync, array &$claimed, bool $chatIsKnown = true): AwarenessPacketProcessor {
+		return new AwarenessPacketProcessor($sync, $this->mapper($claimed, $chatIsKnown), new NullLogger());
 	}
 
 	/**
@@ -191,9 +196,11 @@ class AwarenessPacketProcessorTest extends TestCase {
 	}
 
 	/**
-	 * Attachment uploads announce themselves on their own ontology. We
-	 * subscribe to it so the service does not treat the packet as undelivered,
-	 * but the message envelope referencing the blob is what puts it in a room.
+	 * Attachment uploads announce themselves on their own ontology, so we
+	 * subscribe to it and acknowledge them. The blob reaches a room through the
+	 * message envelope that references it, so the announcement itself needs no
+	 * local work -- and must not be recorded as seen, since recording it would
+	 * write a row for every upload on every platform.
 	 */
 	public function testTheFileOntologyIsSubscribedButNeedsNoLocalWork(): void {
 		$claimed = [];
@@ -203,9 +210,44 @@ class AwarenessPacketProcessorTest extends TestCase {
 		$processor = $this->processor($sync, $claimed);
 
 		$this->assertContains(AwarenessClient::FILE_ONTOLOGY, $processor->ontologies());
-		$this->assertTrue($processor->process($this->packet([
+		$this->assertFalse($processor->process($this->packet([
 			'ontology' => AwarenessClient::FILE_ONTOLOGY,
 			'data' => ['filename' => 'photo.png'],
+		])));
+		$this->assertSame([], $claimed);
+	}
+
+	/**
+	 * The reason this filter exists. Delivery is a broadcast, so most of what
+	 * arrives belongs to conversations on other platforms. Recording every one
+	 * of them wrote a row per stranger's message: a single thirty-day backfill
+	 * produced twelve thousand rows to place one message.
+	 */
+	public function testAMessageForAnUnknownConversationIsNotRecordedAsSeen(): void {
+		$claimed = [];
+		$sync = $this->createMock(ChatSyncService::class);
+		$sync->expects($this->never())->method('handleInboundMessage');
+
+		$processor = $this->processor($sync, $claimed, chatIsKnown: false);
+
+		$this->assertFalse($processor->process($this->packet()));
+		$this->assertSame([], $claimed, 'somebody else\'s conversation must leave no trace');
+	}
+
+	/**
+	 * The filter must not swallow conversations. A chat packet is examined
+	 * properly by the handler, which decides membership.
+	 */
+	public function testAChatPacketIsAlwaysExamined(): void {
+		$claimed = [];
+		$sync = $this->createMock(ChatSyncService::class);
+		$sync->expects($this->once())->method('handleInboundChat');
+
+		$processor = $this->processor($sync, $claimed, chatIsKnown: false);
+
+		$this->assertTrue($processor->process($this->packet([
+			'ontology' => ChatSyncService::CHAT_SCHEMA_ID,
+			'data' => ['participantIds' => ['@someone']],
 		])));
 	}
 

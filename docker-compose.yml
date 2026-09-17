@@ -68,16 +68,20 @@ services:
   # has no public URL. The official image ships this entrypoint for exactly
   # this purpose; it runs `cron.php` every five minutes.
   #
-  # Five minutes is Nextcloud's own interval and is far coarser than the job's
-  # 60s schedule, so expect inbound messages to take up to that long here.
-  # Production installs use a system crontab at one minute.
+  # The image's crontab runs every five minutes, which is Nextcloud's own
+  # default but four times coarser than the awareness poll's 60s schedule --
+  # so a received message could sit unfetched for five minutes while the job
+  # that would fetch it was ready the whole time. Rewritten to every minute,
+  # which is as fine as cron expresses and matches the job's own interval.
   cron:
     build:
       context: ./docker
       args:
         NEXTCLOUD_IMAGE_TAG: ${NEXTCLOUD_IMAGE_TAG:-33}
     restart: unless-stopped
-    entrypoint: /cron.sh
+    # `crond -f` runs in the foreground, so the schedule has to be rewritten
+    # before it starts rather than alongside it.
+    entrypoint: ["/bin/sh", "-c", "echo '* * * * * php -f /var/www/html/cron.php' > /var/spool/cron/crontabs/www-data && exec /cron.sh"]
     depends_on:
       app:
         condition: service_started

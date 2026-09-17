@@ -53,11 +53,17 @@ class AwarenessPacketProcessor {
 
 	/**
 	 * @param array<string, mixed> $packet
+	 * @param bool $reapply Apply the packet even if it has been applied
+	 *                      before. For catching up a person who linked after
+	 *                      their conversations were already ingested: the
+	 *                      handlers are idempotent, and the claim exists to
+	 *                      stop repeated delivery causing repeated work, not
+	 *                      to stop a deliberate re-read.
 	 * @return bool Whether the packet resulted in local work. False covers
 	 *              both "not for us" and "already applied", which the caller
 	 *              only uses for logging.
 	 */
-	public function process(array $packet): bool {
+	public function process(array $packet, bool $reapply = false): bool {
 		$ontology = AwarenessClient::ontologyOf($packet);
 		$globalId = is_string($packet['id'] ?? null) ? $packet['id'] : '';
 		$data = is_array($packet['data'] ?? null) ? $packet['data'] : [];
@@ -93,12 +99,29 @@ class AwarenessPacketProcessor {
 			return false;
 		}
 
+		// Decide whether this packet concerns us before recording that we have
+		// seen it. Delivery is a broadcast, so the overwhelming majority of
+		// what arrives belongs to conversations on other platforms: claiming
+		// those wrote a row per stranger's message, which on a busy network
+		// means thousands of rows that say only "something happened somewhere
+		// else". The claim exists to make our own work idempotent, and work we
+		// will not do needs no protection.
+		if (!$this->concernsThisInstance($ontology, $data)) {
+			return false;
+		}
+
 		// Delivery is at-least-once, so a packet can legitimately arrive
 		// twice, and the webhook and the poll can both carry the same one.
 		// Claiming the event id is what makes applying it exactly once; the
 		// unique index decides the race rather than a read-then-write.
+		//
+		// A backfill deliberately re-reads history and must not be turned away
+		// by claims the live poll made at the time. A conversation ingested
+		// before one of its participants had an account here was created
+		// without them, and only re-applying the chat adds them: the claim
+		// meant this was handled, which was true then and is not true now.
 		$eventId = AwarenessClient::eventIdOf($packet);
-		if ($eventId !== '' && !$this->claimEvent($eventId, $ownerW3id)) {
+		if ($eventId !== '' && !$this->claimEvent($eventId, $ownerW3id) && !$reapply) {
 			return false;
 		}
 
@@ -136,5 +159,33 @@ class AwarenessPacketProcessor {
 	 */
 	private function claimEvent(string $eventId, string $ownerW3id): bool {
 		return $this->idMappingMapper->tryClaim(self::EVENT_ENTITY, $eventId, $ownerW3id);
+	}
+
+	/**
+	 * Whether this packet could plausibly result in local work.
+	 *
+	 * A cheap filter, not a decision: it must never reject something we would
+	 * have acted on, and is allowed to admit things the handlers then discard.
+	 * Both branches answer from indexed local lookups, so a packet for another
+	 * platform's conversation costs one query rather than a write.
+	 *
+	 * @param array<string, mixed> $data
+	 */
+	private function concernsThisInstance(string $ontology, array $data): bool {
+		// A message belongs to exactly one conversation, and we can only place
+		// it if that conversation already exists here. The handler makes the
+		// same check; making it before the claim is what keeps the strangers
+		// out of the table.
+		if ($ontology === ChatSyncService::MESSAGE_SCHEMA_ID) {
+			$chatId = is_string($data['chatId'] ?? null) ? $data['chatId'] : '';
+
+			return $chatId !== '' && $this->idMappingMapper->getLocalId('chat', $chatId) !== null;
+		}
+
+		// Chats are rare enough to be worth the fuller examination the handler
+		// performs, which may resolve identities over the network. File
+		// announcements carry no conversation of their own and are acted on
+		// through the message that references them.
+		return $ontology === ChatSyncService::CHAT_SCHEMA_ID;
 	}
 }
