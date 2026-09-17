@@ -18,18 +18,6 @@ class ChatSyncService {
 
 	private const SYNC_LOCK_PREFIX = 'w3ds_sync_lock_';
 	private const SYNC_LOCK_TTL = 10;
-	private const INBOUND_POST_LOCK_PREFIX = 'w3ds_inbound_post_';
-	/**
-	 * How long the "an inbound post is in flight" guard lives.
-	 *
-	 * It has to outlast the work it guards. Materialising an attachment means
-	 * dereferencing the file envelope, downloading up to the protocol's
-	 * 250 MB, writing it into the recipient's Files and sharing it into the
-	 * room -- all before Talk fires the event this guard is meant to suppress.
-	 * At 10s the guard expired mid-download on any sizeable file, and the
-	 * resulting share comment was pushed back out as a new message.
-	 */
-	private const INBOUND_POST_LOCK_TTL = 600;
 	private const MESSAGE_SIG_CACHE_PREFIX = 'w3ds_msg_sig_';
 	private const MESSAGE_SIG_CACHE_TTL = 86400; // 24h — enough to span a typical poll window
 	/**
@@ -54,13 +42,6 @@ class ChatSyncService {
 	 * inbound envelope across concurrent requests.
 	 */
 	private const INGEST_CLAIM_ENTITY = 'ingest_claim';
-	/**
-	 * Entity type for the durable copy of the "inbound post in flight" guard.
-	 * The cache copy cannot be relied on: without a distributed cache
-	 * configured it is per-request, and the request that must observe the
-	 * guard is always a different one.
-	 */
-	private const INBOUND_POST_ENTITY = 'inbound_post';
 	/**
 	 * How long a claim is honoured before it is treated as abandoned.
 	 *
@@ -97,6 +78,29 @@ class ChatSyncService {
 	 * @var array<string, true>
 	 */
 	private array $primedViewers = [];
+
+	/**
+	 * Depth of the inbound ingest currently running in this process.
+	 *
+	 * Inbound and outbound are separate paths that never call each other, but
+	 * they meet inside Talk: posting an inbound message calls
+	 * ChatManager::sendMessage(), and materialising an inbound attachment calls
+	 * IShareManager::createShare(). Both raise the very same event Talk raises
+	 * when a person types, carrying nothing to say who caused it, so the
+	 * inbound path re-enters the outbound path through Talk and the message we
+	 * are only mirroring for display is written back out as a new envelope
+	 * under this user's identity.
+	 *
+	 * Those Talk calls are synchronous and in-process, so the listener always
+	 * fires inside this call stack. That makes the question "did we cause this
+	 * event?" answerable exactly, with a counter, rather than approximately,
+	 * with a lock. A counter rather than a flag because ingest nests: a
+	 * forwarded attachment materialises a share while the forward is still
+	 * being posted.
+	 *
+	 * @see isIngesting()
+	 */
+	private int $ingestDepth = 0;
 
 	public function __construct(
 		private EvaultClient $evaultClient,
@@ -575,9 +579,10 @@ class ChatSyncService {
 			return;
 		}
 
-		// If this message is being posted by handleInboundMessage right now,
-		// skip -- otherwise we'd ping-pong the message we just received.
-		if ($this->isInboundPostActive($ncUid, $roomToken)) {
+		// This event was raised by our own inbound ingest writing into Talk,
+		// not by a person typing. Exact, because the Talk call that raised it
+		// is still on the stack; see $ingestDepth.
+		if ($this->isIngesting()) {
 			return;
 		}
 
@@ -970,10 +975,6 @@ class ChatSyncService {
 			return;
 		}
 
-		// Prevent the MessageSentListener from re-pushing what we're about
-		// to post — Talk fires the event synchronously during sendMessage(),
-		// before we know the resulting local ID.
-		$this->beginInboundPost($senderUid, $roomToken);
 		try {
 			// An attachment message materialises as a real Talk file share
 			// rather than text: download the blob, drop it in the recipient's
@@ -998,12 +999,18 @@ class ChatSyncService {
 				// when they wrote one, and the bare filename otherwise.
 				// pullAttachment() drops it when it merely repeats the
 				// filename, which it only knows after dereferencing the URI.
-				$share = $this->attachmentSync->pullAttachment(
+				// Talk generates its own `object_shared` comment inside
+				// createShare(), synchronously, and raises the same event a
+				// human share raises. duringIngest() is what tells the
+				// outbound listener that comment is ours: the mapping below
+				// cannot, because the share ID it keys on does not exist
+				// until this call returns.
+				$share = $this->duringIngest(fn () => $this->attachmentSync->pullAttachment(
 					$mediaUrl,
 					$senderUid,
 					$roomToken,
 					$attributed !== '' ? $attributed : null,
-				);
+				));
 				if ($share !== null) {
 					// Map the envelope to the share so the same attachment is
 					// not re-materialised on the next poll.
@@ -1046,14 +1053,17 @@ class ChatSyncService {
 			$quotedLocalId = $this->localCommentForForward($forwardedFrom, $roomToken);
 			$content = $this->attributeForward($content, $forwardedFrom, $ownerW3id);
 
-			$localMessageId = $this->postTalkMessage(
+			// Same reasoning as the share above: sendMessage() raises the
+			// listener's event before it returns the comment ID we would
+			// otherwise mark as inbound.
+			$localMessageId = $this->duringIngest(fn () => $this->postTalkMessage(
 				$roomToken,
 				$senderUid,
 				$content,
 				$messageType,
 				is_string($data['createdAt'] ?? null) ? $data['createdAt'] : null,
 				$quotedLocalId,
-			);
+			));
 			if ($localMessageId === null) {
 				return;
 			}
@@ -1073,8 +1083,6 @@ class ChatSyncService {
 				'globalId' => $globalId,
 				'exception' => $e,
 			]);
-		} finally {
-			$this->endInboundPost($senderUid, $roomToken);
 		}
 	}
 
@@ -2287,45 +2295,35 @@ class ChatSyncService {
 		return $this->cache->get(self::SYNC_LOCK_PREFIX . $entityType . '_' . $localId) !== null;
 	}
 
-	private function inboundPostKey(string $senderUid, string $roomToken): string {
-		return self::INBOUND_POST_LOCK_PREFIX . md5($senderUid . '|' . $roomToken);
-	}
-
-	private function beginInboundPost(string $senderUid, string $roomToken): void {
-		$this->cache->set($this->inboundPostKey($senderUid, $roomToken), true, self::INBOUND_POST_LOCK_TTL);
-		// The cache alone cannot carry this. `createDistributed()` degrades to
-		// a per-request store when no distributed cache is configured, which
-		// is the default, and the request that must see this flag is a
-		// *different* one -- Talk's listener firing inside sendMessage(), or a
-		// concurrent poller. Without a durable copy the guard was silently
-		// inert on a default install, and inbound messages were re-pushed.
-		$this->idMappingMapper->tryClaim(
-			self::INBOUND_POST_ENTITY,
-			$this->inboundPostKey($senderUid, $roomToken),
-			$senderUid,
-		);
-	}
-
-	private function endInboundPost(string $senderUid, string $roomToken): void {
-		$this->cache->remove($this->inboundPostKey($senderUid, $roomToken));
-		$this->idMappingMapper->releaseClaim(
-			self::INBOUND_POST_ENTITY,
-			$this->inboundPostKey($senderUid, $roomToken),
-		);
-	}
-
-	private function isInboundPostActive(string $senderUid, string $roomToken): bool {
-		if ($this->cache->get($this->inboundPostKey($senderUid, $roomToken)) !== null) {
-			return true;
+	/**
+	 * Run a Talk write that belongs to the inbound path.
+	 *
+	 * Everything Talk may raise an event for -- posting a message, creating a
+	 * share -- must happen inside this wrapper, so the outbound listener can
+	 * recognise the resulting event as ours and ignore it.
+	 *
+	 * @template T
+	 * @param callable(): T $write
+	 * @return T
+	 */
+	private function duringIngest(callable $write): mixed {
+		$this->ingestDepth++;
+		try {
+			return $write();
+		} finally {
+			$this->ingestDepth--;
 		}
+	}
 
-		// TTL-bounded: a request that dies mid-ingest must not block outbound
-		// sync for this user and room forever.
-		return $this->idMappingMapper->hasFreshClaim(
-			self::INBOUND_POST_ENTITY,
-			$this->inboundPostKey($senderUid, $roomToken),
-			self::INBOUND_POST_LOCK_TTL,
-		);
+	/**
+	 * Whether a Talk write driven by inbound sync is running right now.
+	 *
+	 * Read by MessageSentListener: an event raised while this is true was
+	 * caused by us mirroring a remote message, not by a person typing, and
+	 * must not be pushed back out.
+	 */
+	public function isIngesting(): bool {
+		return $this->ingestDepth > 0;
 	}
 
 	// ---------------------------------------------------------------

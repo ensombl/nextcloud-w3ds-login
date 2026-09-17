@@ -126,15 +126,30 @@ class ChatSyncServiceShareLoopbackTest extends TestCase {
 	}
 
 	/**
-	 * The guard suppressing the echo must outlive the work it guards.
-	 * Downloading an attachment of up to the protocol's 250 MB, writing it
-	 * and sharing it all happens before Talk fires the event; at 10s the
-	 * guard expired mid-download and stopped suppressing anything.
+	 * The guard suppressing the echo must not be able to expire during the
+	 * work it guards. Materialising an attachment can mean downloading up to
+	 * the protocol's 250 MB before Talk fires the event, and any time-bounded
+	 * guard is a bet on that finishing first -- a bet that was lost at 10s and
+	 * is merely less likely to be lost at 600s.
+	 *
+	 * Scoping the guard to the call itself removes the bet: it is raised for
+	 * exactly as long as the write runs, however long that is. Asserted by
+	 * checking no duration is involved at all.
+	 *
+	 * @see ChatSyncServiceIngestGuardTest for the behaviour itself.
 	 */
-	public function testTheInFlightGuardOutlastsALargeDownload(): void {
-		$ttl = (int)(new \ReflectionClass(ChatSyncService::class))->getConstant('INBOUND_POST_LOCK_TTL');
+	public function testTheEchoGuardCannotExpireMidWrite(): void {
+		$reflection = new \ReflectionClass(ChatSyncService::class);
 
-		$this->assertGreaterThanOrEqual(600, $ttl);
+		$this->assertArrayNotHasKey(
+			'INBOUND_POST_LOCK_TTL',
+			$reflection->getConstants(),
+			'a TTL means the guard can expire while the write is still running',
+		);
+		$this->assertTrue(
+			$reflection->hasMethod('isIngesting'),
+			'the echo guard must be scoped to the Talk call instead',
+		);
 	}
 
 	private function adopt(IdMappingMapper $mapper, string $shareId, string $localId): void {
