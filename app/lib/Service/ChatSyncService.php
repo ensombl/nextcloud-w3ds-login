@@ -736,6 +736,25 @@ class ChatSyncService {
 			return;
 		}
 
+		// Awareness delivery is a broadcast: we are handed every chat created
+		// anywhere in the ecosystem, the overwhelming majority of which belong
+		// to people who have never heard of this server. Only conversations
+		// involving somebody linked here may become local rooms.
+		//
+		// The participant resolution below cannot make this decision, because
+		// it provisions an account for any identity it does not recognise --
+		// so asking it "can these participants be resolved?" always answers
+		// yes, and answers it by creating the very account that makes it true.
+		// Strangers' conversations therefore materialised here as rooms, with
+		// accounts for everyone in them.
+		if (!$this->involvesLinkedUser($data, $ownerW3id)) {
+			$this->logger->debug('[W3DS Sync] Inbound chat involves nobody linked here, ignoring', [
+				'globalId' => $globalId,
+			]);
+
+			return;
+		}
+
 		// Participants are named either by User profile envelope ID or by
 		// eName; resolveParticipantIdToW3id() handles both shapes.
 		//
@@ -1280,44 +1299,6 @@ class ChatSyncService {
 		);
 	}
 
-
-	/**
-	 * True when the viewer appears in the chat's `owner`, `participantIds`,
-	 * or `admins`.
-	 *
-	 * Those fields name a person either by User profile envelope ID or by
-	 * eName, and we write both shapes ourselves depending on what resolves.
-	 * Matching on a single shape drops rooms silently — the envelope
-	 * replicates fine and is then filtered out here — so accept either.
-	 */
-	private function userIsInRoom(array $parsed, string $myProfileId, string $myW3id = ''): bool {
-		$identities = [$myProfileId];
-		if ($myW3id !== '' && $myW3id !== $myProfileId) {
-			$identities[] = $myW3id;
-		}
-
-		$owner = $parsed['owner'] ?? null;
-		if (is_string($owner) && in_array($owner, $identities, true)) {
-			return true;
-		}
-
-		foreach (['participantIds', 'admins'] as $key) {
-			$arr = $parsed[$key] ?? null;
-			if (!is_array($arr)) {
-				continue;
-			}
-			foreach ($arr as $entry) {
-				if (!is_string($entry)) {
-					continue;
-				}
-				if (in_array($entry, $identities, true)) {
-					return true;
-				}
-			}
-		}
-
-		return false;
-	}
 
 	/**
 	 * Decide what an inbound chat's `name` should become as a Talk room title.
@@ -1865,6 +1846,69 @@ class ChatSyncService {
 			// Auto-provision a new Nextcloud user
 			$user = $this->userProvisioning->findOrCreateUser($w3id);
 			return $user?->getUID();
+		}
+	}
+
+	/**
+	 * Whether anyone in this chat has linked their eVault to this server.
+	 *
+	 * The question every inbound chat has to answer before it becomes a local
+	 * room, and it must be answered without side effects. Asking
+	 * {@see resolveW3idToNcUid()} instead would provision an account for each
+	 * unrecognised identity, which both answers the question wrongly and
+	 * creates the accounts that make the wrong answer look right.
+	 *
+	 * One linked participant is enough. A conversation between a linked user
+	 * and somebody who only uses another platform is exactly the case this
+	 * app exists for, and the remaining participants are provisioned
+	 * afterwards so they can be shown as senders.
+	 *
+	 * @param array<string, mixed> $data
+	 */
+	private function involvesLinkedUser(array $data, string $ownerW3id): bool {
+		// The owner is a participant by definition: this is their vault.
+		if ($this->isLinkedLocally($ownerW3id)) {
+			return true;
+		}
+
+		foreach (['participantIds', 'admins'] as $field) {
+			$references = $data[$field] ?? null;
+			if (!is_array($references)) {
+				continue;
+			}
+
+			foreach ($references as $reference) {
+				if (!is_string($reference) || $reference === '') {
+					continue;
+				}
+
+				$w3id = $this->resolveParticipantIdToW3id($reference, $ownerW3id);
+				if ($w3id !== null && $this->isLinkedLocally($w3id)) {
+					return true;
+				}
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * Whether this eName already belongs to a local account.
+	 *
+	 * Deliberately a plain lookup: unlike {@see resolveW3idToNcUid()} it
+	 * never provisions, so it can be asked about strangers safely.
+	 */
+	private function isLinkedLocally(string $w3id): bool {
+		if ($w3id === '') {
+			return false;
+		}
+
+		try {
+			$this->w3dsMappingMapper->findByW3id($w3id);
+
+			return true;
+		} catch (DoesNotExistException) {
+			return false;
 		}
 	}
 
