@@ -138,6 +138,43 @@ class ChatSyncServiceIngestGuardTest extends TestCase {
 	}
 
 	/**
+	 * The scope that makes this safe: one request's ingest must not silence
+	 * another request's genuine send.
+	 *
+	 * Nextcloud serves each request in its own process with its own service
+	 * instances, so a property set while handling an inbound packet is
+	 * invisible to the request handling somebody's keystrokes. That is exactly
+	 * what the replaced guard got wrong: it lived in a cache and a database
+	 * row, both shared across requests, so an inbound message in one room
+	 * suppressed real messages in that room for the next ten minutes.
+	 *
+	 * Two instances stand in for two concurrent requests.
+	 */
+	public function testAnIngestInOneRequestDoesNotSuppressAnotherRequestsSend(): void {
+		$receivingRequest = $this->service();
+		$typingRequest = $this->service();
+
+		$seenByTypingRequest = null;
+		$seenByReceivingRequest = null;
+
+		$this->duringIngest($receivingRequest, static function () use (
+			$receivingRequest,
+			$typingRequest,
+			&$seenByReceivingRequest,
+			&$seenByTypingRequest,
+		): void {
+			$seenByReceivingRequest = $receivingRequest->isIngesting();
+			$seenByTypingRequest = $typingRequest->isIngesting();
+		});
+
+		$this->assertTrue($seenByReceivingRequest, 'the echo of our own write must be suppressed');
+		$this->assertFalse(
+			$seenByTypingRequest,
+			'a person typing elsewhere must still reach the outbound path',
+		);
+	}
+
+	/**
 	 * Ingest nests: a forwarded attachment materialises a share while the
 	 * forward is still being posted. A boolean flag would be cleared by the
 	 * inner write and leave the outer one unguarded, so the depth has to
