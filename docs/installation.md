@@ -199,7 +199,21 @@ Chat sync also needs cron on the system scheduler:
 sudo -u www-data php occ background:cron
 ```
 
-AJAX cron only ticks when somebody loads a page, which makes catch-up unpredictable.
+That only records the *mode*. Something must actually run `cron.php`, or no
+background job ever executes and nothing inbound arrives. Confirm with:
+
+```bash
+sudo -u www-data php occ config:app:get core lastcron
+```
+
+An empty result means cron has never run. The usual crontab entry is:
+
+```
+*/5 * * * * php -f /var/www/html/cron.php
+```
+
+AJAX cron only ticks when somebody loads a page, which makes catch-up
+unpredictable.
 
 #### Settings reference
 
@@ -311,10 +325,29 @@ make cs        # PHP-CS-Fixer in dry-run mode
 
 ### 5. Watching sync activity
 
-The plugin logs every meaningful sync event with the `[W3DS Sync]` prefix:
+The plugin logs every meaningful sync event with the `[W3DS Sync]` and
+`[W3DS Awareness]` prefixes:
 
 ```bash
 make logs | grep W3DS
+```
+
+Inbound messages arrive through the `cron` service, which runs Nextcloud's
+scheduler every five minutes. That is the shortest interval the stock image
+offers, so expect up to that long for an incoming message here; production
+installs run it every minute. To pull immediately instead of waiting:
+
+```bash
+docker compose exec --user www-data app php occ background-job:execute \
+  "$(docker compose exec -T --user www-data app php occ background-job:list \
+     | grep AwarenessSyncJob | awk '{print $2}')" --force-execute
+```
+
+If nothing arrives at all, check the scheduler is alive before suspecting sync:
+
+```bash
+docker compose ps cron
+docker compose exec --user www-data app php occ config:app:get core lastcron
 ```
 
 ### 6. Wiping state without rebuilding
