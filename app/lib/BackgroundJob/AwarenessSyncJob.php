@@ -10,6 +10,7 @@ use OCA\W3dsLogin\Service\AwarenessPacketProcessor;
 use OCP\AppFramework\Utility\ITimeFactory;
 use OCP\BackgroundJob\TimedJob;
 use OCP\IConfig;
+use OCP\IURLGenerator;
 use Psr\Log\LoggerInterface;
 
 /**
@@ -55,11 +56,25 @@ class AwarenessSyncJob extends TimedJob {
 	 */
 	private const MAX_PAGES_PER_RUN = 10;
 
+	/**
+	 * How often to re-assert our webhook subscription.
+	 *
+	 * Cheap to confirm and expensive to be wrong about: without it we fall back
+	 * to whatever catch-all subscription the service reconciles for registered
+	 * platforms, which carries no shared secret, so deliveries cannot be
+	 * authenticated.
+	 */
+	private const SUBSCRIPTION_CHECK_INTERVAL = 3600;
+
+	/** When the subscription was last confirmed, as a Unix timestamp. */
+	private const SUBSCRIPTION_CHECKED_KEY = 'awareness_subscription_checked';
+
 	public function __construct(
 		ITimeFactory $time,
 		private AwarenessClient $awarenessClient,
 		private AwarenessPacketProcessor $processor,
 		private IConfig $config,
+		private IURLGenerator $urlGenerator,
 		private LoggerInterface $logger,
 	) {
 		parent::__construct($time);
@@ -77,9 +92,48 @@ class AwarenessSyncJob extends TimedJob {
 		}
 
 		try {
+			$this->ensureSubscription();
 			$this->drain();
 		} catch (\Throwable $e) {
 			$this->logger->error('[W3DS Awareness] Sync job failed', ['exception' => $e]);
+		}
+	}
+
+	/**
+	 * Keep our webhook subscription registered with the service.
+	 *
+	 * Done here rather than when credentials are saved, because a subscription
+	 * can outlive this instance's memory of it: the service may drop it, or the
+	 * credentials may have been set by hand with `occ`, which runs no such
+	 * registration step.
+	 *
+	 * Only attempted when a webhook secret is configured. A subscription
+	 * without one accepts deliveries that cannot be authenticated, and the
+	 * polling below already covers the case where nothing is pushed to us.
+	 */
+	private function ensureSubscription(): void {
+		$secret = $this->config->getAppValue(Application::APP_ID, 'awareness_webhook_secret', '');
+		if ($secret === '') {
+			return;
+		}
+
+		$checkedAt = (int)$this->config->getAppValue(Application::APP_ID, self::SUBSCRIPTION_CHECKED_KEY, '0');
+		if ($checkedAt > time() - self::SUBSCRIPTION_CHECK_INTERVAL) {
+			return;
+		}
+
+		$registered = $this->awarenessClient->ensureSubscription(
+			$this->urlGenerator->getAbsoluteURL(
+				$this->urlGenerator->linkToRoute(Application::APP_ID . '.webhook.receive'),
+			),
+			$this->processor->ontologies(),
+			$secret,
+		);
+
+		// Only record success: a failed attempt should be retried on the next
+		// tick rather than suppressed for an hour.
+		if ($registered) {
+			$this->config->setAppValue(Application::APP_ID, self::SUBSCRIPTION_CHECKED_KEY, (string)time());
 		}
 	}
 

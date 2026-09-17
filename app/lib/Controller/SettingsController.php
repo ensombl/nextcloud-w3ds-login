@@ -5,16 +5,12 @@ declare(strict_types=1);
 namespace OCA\W3dsLogin\Controller;
 
 use OCA\W3dsLogin\AppInfo\Application;
-use OCA\W3dsLogin\Service\AwarenessClient;
-use OCA\W3dsLogin\Service\AwarenessPacketProcessor;
 use OCA\W3dsLogin\Service\QrCodeService;
 use OCA\W3dsLogin\Service\UserProvisioningService;
 use OCA\W3dsLogin\Service\W3dsAuthService;
 use OCP\AppFramework\Controller;
 use OCP\AppFramework\Http;
 use OCP\AppFramework\Http\JSONResponse;
-use OCP\AppFramework\Http\RedirectResponse;
-use OCP\IConfig;
 use OCP\IRequest;
 use OCP\IURLGenerator;
 use OCP\IUserManager;
@@ -30,53 +26,9 @@ class SettingsController extends Controller {
 		private IURLGenerator $urlGenerator,
 		private IUserManager $userManager,
 		private IUserSession $userSession,
-		private IConfig $config,
-		private AwarenessClient $awarenessClient,
-		private AwarenessPacketProcessor $packetProcessor,
 		private LoggerInterface $logger,
 	) {
 		parent::__construct(Application::APP_ID, $request);
-	}
-
-	/**
-	 * Store the Awareness as a Service credentials.
-	 *
-	 * Secrets are only overwritten when a new value is supplied, so an admin
-	 * editing the URL does not have to re-enter a key they cannot read back
-	 * from the form.
-	 */
-	public function saveAwareness(): RedirectResponse {
-		$baseUrl = trim((string)$this->request->getParam('baseUrl', ''));
-		$apiKey = trim((string)$this->request->getParam('apiKey', ''));
-		$webhookSecret = trim((string)$this->request->getParam('webhookSecret', ''));
-
-		$this->config->setAppValue(Application::APP_ID, 'awareness_base_url', rtrim($baseUrl, '/'));
-
-		if ($apiKey !== '') {
-			$this->config->setAppValue(Application::APP_ID, 'awareness_api_key', $apiKey);
-		}
-		if ($webhookSecret !== '') {
-			$this->config->setAppValue(Application::APP_ID, 'awareness_webhook_secret', $webhookSecret);
-		}
-
-		// Register the subscription now rather than waiting for the next cron
-		// tick, so a misconfiguration surfaces while the admin is still looking
-		// at the page.
-		if ($this->awarenessClient->isConfigured() && $webhookSecret !== '') {
-			$this->awarenessClient->ensureSubscription(
-				$this->urlGenerator->getAbsoluteURL(
-					$this->urlGenerator->linkToRoute(Application::APP_ID . '.webhook.receive'),
-				),
-				$this->packetProcessor->ontologies(),
-				$webhookSecret,
-			);
-		}
-
-		$this->logger->info('[W3DS Awareness] Credentials updated', ['baseUrl' => $baseUrl]);
-
-		return new RedirectResponse(
-			$this->urlGenerator->linkToRoute('settings.AdminSettings.index', ['section' => 'security']),
-		);
 	}
 
 	/**

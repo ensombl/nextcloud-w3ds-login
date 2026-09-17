@@ -361,8 +361,13 @@ fields are the only ones we actually depend on cross-platform.
 ## Changes
 
 **Add.** `AwarenessClient` (packets + subscriptions). `AwarenessSyncJob`
-(TimedJob 60s, one instance cursor in appconfig). HMAC verification in
-`WebhookController`. The re-entrancy guard.
+(TimedJob 60s, one instance cursor in appconfig, and it re-asserts the webhook
+subscription hourly). HMAC verification in `WebhookController`. The re-entrancy
+guard.
+
+Configuration is `occ` only. An admin settings page was built and then dropped:
+it duplicated two `occ` commands, and the app had no admin UI before this, so
+adding one is a separate decision from moving sync onto AaaS.
 
 **Delete.**
 
@@ -460,7 +465,7 @@ Shipped in this order:
 1. **Separate the paths.** The re-entrancy guard, `origin` writes before the
    Talk calls, `isInboundPostActive` and `inbound_post` deleted. Merged on its
    own because it fixes a live leak independently of anything else.
-2. `AwarenessClient` + config + admin settings.
+2. `AwarenessClient` and its configuration.
 3. `AwarenessSyncJob` and `AwarenessPacketProcessor`, with the webhook routed
    through the same processor.
 4. Poll paths, poller JS, `InitialSyncJob` and `PullSyncJob` removed.

@@ -158,24 +158,61 @@ Strictly speaking this loosens Nextcloud's outbound SSRF guard for all apps, not
 
 Outgoing messages are written straight to the sender's own eVault, so sending works without this step. Incoming chats and messages are delivered by Awareness as a Service, which needs credentials.
 
+First, get them:
+
 1. Apply for access at the AaaS portal and wait for an administrator to approve the consumer.
 2. Issue an API key from the consumer dashboard. The plaintext key is shown exactly once.
-3. In Nextcloud, go to **Settings → Administration → Security → W3DS chat sync** and enter:
-   - **Service URL**, for example `https://aaas.w3ds.metastate.foundation`. There is no default: instances are per environment, and pointing at the wrong one fails silently.
-   - **API key**, the `aaas_…` value from step 2.
-   - **Webhook secret**, optional but recommended. Set the same value on the subscription and deliveries arrive signed; without it, anything that can reach the webhook URL is trusted, and whatever it sends is written into people's conversations.
 
-The page shows the consumer name and approval status read back from the service, so a key that was mistyped or not yet approved is visible immediately rather than presenting as "no messages ever arrive".
+Then set them on the server, from the Nextcloud install directory:
+
+```bash
+sudo -u www-data php occ config:app:set w3ds_login awareness_base_url \
+  --value="https://aaas.w3ds.metastate.foundation"
+
+sudo -u www-data php occ config:app:set w3ds_login awareness_api_key \
+  --value="aaas_your_key_here"
+```
+
+There is no default service URL. Instances are deployed per environment, and pointing at the wrong one fails silently, so it has to be stated.
+
+Optionally, set a webhook secret. Deliveries are then signed and verified; without one, anything that can reach the webhook URL is trusted, and whatever it sends is written into people's conversations:
+
+```bash
+sudo -u www-data php occ config:app:set w3ds_login awareness_webhook_secret \
+  --value="$(openssl rand -hex 32)"
+```
+
+The background job registers the subscription with that secret on its next run, so nothing further is needed. Read the values back with `config:app:get`, and confirm the key is accepted:
+
+```bash
+curl -H "Authorization: Bearer aaas_your_key_here" \
+  https://aaas.w3ds.metastate.foundation/api/me
+```
+
+A `status` of `approved` means step 1 completed. Anything else, and packets will not be delivered no matter what is configured here.
 
 Webhook delivery needs your Nextcloud to be reachable from the awareness service at `https://<your-host>/apps/w3ds_login/api/webhook`. If it is not, the background job still reads the same packets from the service's history within a minute, so an instance behind NAT works, just less promptly.
 
-Chat sync also needs cron to be running on the system scheduler:
+Chat sync also needs cron on the system scheduler:
 
 ```bash
 sudo -u www-data php occ background:cron
 ```
 
 AJAX cron only ticks when somebody loads a page, which makes catch-up unpredictable.
+
+#### Settings reference
+
+| Key | Required | Meaning |
+|---|---|---|
+| `awareness_base_url` | yes | AaaS service URL |
+| `awareness_api_key` | yes | `aaas_…` key from the consumer dashboard |
+| `awareness_webhook_secret` | no | signs and verifies pushed deliveries |
+| `registry_base_url` | no | W3DS registry; defaults to the production one |
+| `awareness_cursor` | never set by hand | the job's position in the packet stream |
+| `awareness_started_at` | never set by hand | when this instance began following the stream |
+
+The last two are written by the app. Clearing them makes the next run re-read from the point the instance was first configured, which is occasionally useful after an outage and otherwise best left alone.
 
 ### 8. Verify
 

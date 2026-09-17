@@ -58,7 +58,6 @@ Talk chat sync (requires Nextcloud Talk):
     <settings>
         <personal>OCA\W3dsLogin\Settings\PersonalSettings</personal>
         <personal-section>security</personal-section>
-        <admin>OCA\W3dsLogin\Settings\AdminSettings</admin>
     </settings>
     <collaboration>
         <plugins>

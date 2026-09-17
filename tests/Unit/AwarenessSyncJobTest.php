@@ -9,6 +9,7 @@ use OCA\W3dsLogin\Service\AwarenessClient;
 use OCA\W3dsLogin\Service\AwarenessPacketProcessor;
 use OCP\AppFramework\Utility\ITimeFactory;
 use OCP\IConfig;
+use OCP\IURLGenerator;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\NullLogger;
 
@@ -47,6 +48,7 @@ class AwarenessSyncJobTest extends TestCase {
 			$client,
 			$processor,
 			$this->config(),
+			$this->createMock(IURLGenerator::class),
 			new NullLogger(),
 		);
 	}
@@ -198,5 +200,72 @@ class AwarenessSyncJobTest extends TestCase {
 			]),
 			$processor,
 		));
+	}
+
+	/**
+	 * Credentials are set with `occ`, which runs no registration step, so the
+	 * job is what actually registers the webhook subscription. Without it we
+	 * fall back to the service's catch-all, which carries no shared secret and
+	 * therefore delivers packets we cannot authenticate.
+	 */
+	public function testTheWebhookSubscriptionIsRegisteredWhenASecretIsSet(): void {
+		$this->appConfig['awareness_webhook_secret'] = 'shared-secret';
+
+		$calls = [];
+		$client = $this->client($calls, [$this->page([], null)]);
+		$client->expects($this->once())
+			->method('ensureSubscription')
+			->with($this->anything(), $this->anything(), 'shared-secret')
+			->willReturn(true);
+
+		$this->tick($this->job($client));
+	}
+
+	/**
+	 * Re-asserting it on every tick would mean two extra HTTP calls a minute
+	 * for something that changes almost never.
+	 */
+	public function testTheSubscriptionIsNotReRegisteredOnEveryRun(): void {
+		$this->appConfig['awareness_webhook_secret'] = 'shared-secret';
+
+		$calls = [];
+		$client = $this->client($calls, [$this->page([], null), $this->page([], null)]);
+		$client->expects($this->once())->method('ensureSubscription')->willReturn(true);
+
+		$job = $this->job($client);
+		$this->tick($job);
+		$this->tick($job);
+	}
+
+	/**
+	 * A failed registration must be retried rather than suppressed for the
+	 * whole check interval, or a service that was briefly unreachable leaves
+	 * the instance unsubscribed for an hour.
+	 */
+	public function testAFailedRegistrationIsRetriedOnTheNextRun(): void {
+		$this->appConfig['awareness_webhook_secret'] = 'shared-secret';
+
+		$calls = [];
+		$client = $this->client($calls, [$this->page([], null), $this->page([], null)]);
+		$client->expects($this->exactly(2))
+			->method('ensureSubscription')
+			->willReturnOnConsecutiveCalls(false, true);
+
+		$job = $this->job($client);
+		$this->tick($job);
+		$this->tick($job);
+	}
+
+	/**
+	 * A subscription with no secret accepts deliveries that cannot be
+	 * authenticated. Polling already covers an instance nothing is pushed to,
+	 * so the safe default is to stay unsubscribed.
+	 */
+	public function testNoSubscriptionIsRegisteredWithoutASecret(): void {
+		$calls = [];
+		$client = $this->client($calls, [$this->page([], null)]);
+		$client->expects($this->never())->method('ensureSubscription');
+
+		$this->tick($this->job($client));
 	}
 }

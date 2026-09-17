@@ -31,7 +31,7 @@ Entries below are reconstructed from commit history.
 - Sending is unchanged: messages are still written to the sender's own eVault,
   and participants still receive a reference in theirs.
 - Administrators configure the awareness service URL, API key and webhook
-  secret under Settings → Administration → Security.
+  secret with `occ config:app:set`; see `docs/installation.md`.
 - Webhook deliveries are verified against the subscription secret when one is
   configured.
 
