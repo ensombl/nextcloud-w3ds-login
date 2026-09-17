@@ -6,7 +6,6 @@ namespace OCA\W3dsLogin\Controller;
 
 use OC\Authentication\Token\IProvider;
 use OCA\W3dsLogin\AppInfo\Application;
-use OCA\W3dsLogin\BackgroundJob\InitialSyncJob;
 use OCA\W3dsLogin\Service\QrCodeService;
 use OCA\W3dsLogin\Service\UserProvisioningService;
 use OCA\W3dsLogin\Service\W3dsAuthService;
@@ -18,7 +17,6 @@ use OCP\AppFramework\Http\TemplateResponse;
 use OCP\Authentication\Exceptions\InvalidTokenException;
 use OCP\Authentication\Exceptions\WipeTokenException;
 use OCP\Authentication\Token\IToken;
-use OCP\BackgroundJob\IJobList;
 use OCP\IRequest;
 use OCP\ISession;
 use OCP\IURLGenerator;
@@ -38,7 +36,6 @@ class AuthController extends Controller {
 		private IUserSession $userSession,
 		private ISession $session,
 		private IProvider $tokenProvider,
-		private IJobList $jobList,
 		private LoggerInterface $logger,
 	) {
 		parent::__construct(Application::APP_ID, $request);
@@ -194,9 +191,6 @@ class AuthController extends Controller {
 			}
 			$this->authService->markSessionComplete($sessionId, $ncUid);
 
-			// Queue initial sync now that user has a W3DS identity
-			$this->jobList->add(InitialSyncJob::class, ['ncUid' => $ncUid]);
-
 			$this->logger->info('User linked W3DS identity', [
 				'uid' => $ncUid,
 				'w3id' => $w3id,
@@ -334,9 +328,6 @@ class AuthController extends Controller {
 			// best-effort: if the session token is missing, the user simply
 			// gets the default behaviour (modal will appear). Not fatal.
 		}
-
-		// Queue initial sync of user's Talk chats to/from their eVault
-		$this->jobList->add(InitialSyncJob::class, ['ncUid' => $userId]);
 
 		$this->logger->info('W3DS login completed', ['uid' => $userId]);
 

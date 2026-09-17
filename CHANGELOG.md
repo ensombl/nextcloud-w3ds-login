@@ -9,6 +9,42 @@ Entries below are reconstructed from commit history.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-17
+
+### Fixed
+
+- Inbound messages are no longer pushed back out to the eVault. Displaying a
+  received message, and materialising a received attachment, both make Talk
+  raise the same event it raises when a person types, so messages this server
+  was only mirroring for display were replicated back out under the recipient's
+  identity and delivered to everyone in the room. Received attachments were
+  affected worst, because catch-up sync replayed the entire history of a
+  conversation on install.
+
+### Changed
+
+- Incoming chats and messages now come from Awareness as a Service instead of
+  polling each participant's eVault. A message previously arrived once per
+  participant, under a different envelope ID each time, and was reconciled
+  locally by comparing message content; it now arrives once, with the
+  identifier the protocol defines for the purpose.
+- Sending is unchanged: messages are still written to the sender's own eVault,
+  and participants still receive a reference in theirs.
+- Administrators configure the awareness service URL, API key and webhook
+  secret under Settings → Administration → Security.
+- Webhook deliveries are verified against the subscription secret when one is
+  configured.
+
+### Removed
+
+- The browser-side poller, its two endpoints, and the per-eVault polling jobs.
+- Message signature and occurrence-counting rows, and the sync cursor table.
+  These existed only to tell one message seen several times apart from a
+  message genuinely sent twice. Existing rows are cleaned up on upgrade.
+- The one-time sync queued at login. Conversations reach the eVault when a
+  message is sent or the participants change; queueing a full replay on every
+  login is what turned the echo above into a mass re-send.
+
 ## [0.7.1] - 2026-09-15
 
 ### Changed

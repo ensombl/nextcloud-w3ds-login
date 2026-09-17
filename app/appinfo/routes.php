@@ -16,14 +16,11 @@ return [
 		['name' => 'settings#linkStatus', 'url' => '/settings/link/status', 'verb' => 'GET'],
 		['name' => 'settings#unlink', 'url' => '/settings/unlink', 'verb' => 'POST'],
 
-		// eVault webhook (public, receives awareness protocol packets)
+		// Admin: Awareness as a Service credentials
+		['name' => 'settings#saveAwareness', 'url' => '/settings/awareness', 'verb' => 'POST'],
+
+		// Awareness packets pushed by AaaS (public; authenticated by the
+		// subscription secret rather than a session).
 		['name' => 'webhook#receive', 'url' => '/api/webhook', 'verb' => 'POST'],
-
-		// Per-room poll of participant eVaults (authenticated; client-driven every ~15s)
-		['name' => 'poll#pollRoom', 'url' => '/api/rooms/{token}/poll', 'verb' => 'POST'],
-
-		// Pull-sync the current user's eVault for newly-replicated chats
-		// (authenticated; client-driven from the Talk room-list view).
-		['name' => 'poll#pollUserChats', 'url' => '/api/chats/poll', 'verb' => 'POST'],
 	],
 ];

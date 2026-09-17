@@ -154,7 +154,30 @@ sudo -u www-data php occ config:system:set allow_local_remote_servers --value=tr
 
 Strictly speaking this loosens Nextcloud's outbound SSRF guard for all apps, not just this one — the trade-off is acceptable for a single-purpose server but weigh it against your threat model if this box also hosts other apps. The long-term fix lives with the registry/eVault operator: have them return a hostname.
 
-### 7. Verify
+### 7. Connect the awareness service (required for incoming chat)
+
+Outgoing messages are written straight to the sender's own eVault, so sending works without this step. Incoming chats and messages are delivered by Awareness as a Service, which needs credentials.
+
+1. Apply for access at the AaaS portal and wait for an administrator to approve the consumer.
+2. Issue an API key from the consumer dashboard. The plaintext key is shown exactly once.
+3. In Nextcloud, go to **Settings → Administration → Security → W3DS chat sync** and enter:
+   - **Service URL**, for example `https://aaas.w3ds.metastate.foundation`. There is no default: instances are per environment, and pointing at the wrong one fails silently.
+   - **API key**, the `aaas_…` value from step 2.
+   - **Webhook secret**, optional but recommended. Set the same value on the subscription and deliveries arrive signed; without it, anything that can reach the webhook URL is trusted, and whatever it sends is written into people's conversations.
+
+The page shows the consumer name and approval status read back from the service, so a key that was mistyped or not yet approved is visible immediately rather than presenting as "no messages ever arrive".
+
+Webhook delivery needs your Nextcloud to be reachable from the awareness service at `https://<your-host>/apps/w3ds_login/api/webhook`. If it is not, the background job still reads the same packets from the service's history within a minute, so an instance behind NAT works, just less promptly.
+
+Chat sync also needs cron to be running on the system scheduler:
+
+```bash
+sudo -u www-data php occ background:cron
+```
+
+AJAX cron only ticks when somebody loads a page, which makes catch-up unpredictable.
+
+### 8. Verify
 
 Open the Nextcloud login page in a browser. You should see a "Sign in with W3DS" button alongside the password form. If you don't, check `nextcloud.log` for errors and confirm the app is enabled:
 

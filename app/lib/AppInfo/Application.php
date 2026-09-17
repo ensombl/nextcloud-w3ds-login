@@ -4,11 +4,10 @@ declare(strict_types=1);
 
 namespace OCA\W3dsLogin\AppInfo;
 
-use OCA\W3dsLogin\BackgroundJob\PullSyncJob;
+use OCA\W3dsLogin\BackgroundJob\AwarenessSyncJob;
 use OCA\W3dsLogin\BackgroundJob\TentativeUserCleanupJob;
 use OCA\W3dsLogin\Listener\AttendeesAddedTentativeFlipListener;
 use OCA\W3dsLogin\Listener\AttendeesChangedListener;
-use OCA\W3dsLogin\Listener\BeforeTemplateRenderedListener;
 use OCA\W3dsLogin\Listener\MessageSentListener;
 use OCA\W3dsLogin\Listener\RoomCreatedListener;
 use OCA\W3dsLogin\Provider\W3dsLoginProvider;
@@ -18,11 +17,18 @@ use OCP\AppFramework\App;
 use OCP\AppFramework\Bootstrap\IBootContext;
 use OCP\AppFramework\Bootstrap\IBootstrap;
 use OCP\AppFramework\Bootstrap\IRegistrationContext;
-use OCP\AppFramework\Http\Events\BeforeTemplateRenderedEvent;
 use OCP\BackgroundJob\IJobList;
 
 class Application extends App implements IBootstrap {
 	public const APP_ID = 'w3ds_login';
+
+	/**
+	 * The eVault-polling job this app used to run, named as a string because
+	 * the class is gone. Installs that ran an earlier version still have the
+	 * row in oc_jobs, and it has to be cleared or Nextcloud logs a missing
+	 * class on every cron tick.
+	 */
+	private const RETIRED_PULL_SYNC_JOB = 'OCA\\W3dsLogin\\BackgroundJob\\PullSyncJob';
 
 	// Talk event classes (may vary by Talk version)
 	private const TALK_MESSAGE_SENT_EVENT = 'OCA\\Talk\\Events\\ChatMessageSentEvent';
@@ -68,18 +74,21 @@ class Application extends App implements IBootstrap {
 		// On Talk's AttendeesAddedEvent, flip a tentative-provisioned W3DS
 		// user to permanent so the cleanup job stops considering them.
 		$context->registerEventListener(self::TALK_ATTENDEES_ADDED_EVENT, AttendeesAddedTentativeFlipListener::class);
-
-		// Inject the Talk room poller script on all logged-in pages
-		$context->registerEventListener(BeforeTemplateRenderedEvent::class, BeforeTemplateRenderedListener::class);
 	}
 
 	public function boot(IBootContext $context): void {
 		$server = $context->getServerContainer();
 		/** @var IJobList $jobList */
 		$jobList = $server->get(IJobList::class);
-		if (!$jobList->has(PullSyncJob::class, null)) {
-			$jobList->add(PullSyncJob::class);
+		// Inbound sync reads one ordered packet stream from AaaS. The job it
+		// replaces polled every linked user's eVault, and through them every
+		// participant's, which is why the same message arrived once per
+		// participant and had to be reconciled by content.
+		if (!$jobList->has(AwarenessSyncJob::class, null)) {
+			$jobList->add(AwarenessSyncJob::class);
 		}
+		$jobList->remove(self::RETIRED_PULL_SYNC_JOB);
+
 		if (!$jobList->has(TentativeUserCleanupJob::class, null)) {
 			$jobList->add(TentativeUserCleanupJob::class);
 		}
