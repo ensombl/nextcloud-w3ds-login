@@ -9,7 +9,7 @@ Entries below are reconstructed from commit history.
 
 ## [Unreleased]
 
-## [0.8.0] - 2026-09-17
+## [0.7.2] - 2026-09-17
 
 ### Fixed
 

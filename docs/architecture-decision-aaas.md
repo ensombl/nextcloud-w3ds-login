@@ -1,6 +1,6 @@
 # Architecture: inbound sync via Awareness as a Service
 
-Status: **implemented** in 0.8.0.
+Status: **implemented** in 0.7.2.
 
 ## Decision
 
