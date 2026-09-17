@@ -1,6 +1,6 @@
 # Architecture: inbound sync via Awareness as a Service
 
-Status: **proposed, not implemented.**
+Status: **implemented** in 0.8.0.
 
 ## Decision
 
@@ -402,9 +402,10 @@ claims. The outbound write path, its ACL, and `fanOutReference`.
   envelope concurrently. Mutual exclusion with a TTL, released on completion.
   It answers "is someone ingesting this right now?", **not** "was this already
   processed?" — different questions, different rows.
-- **Add `event`** — processed `eventId` values, as the protocol requires. This
-  answers "have I applied this delivery?" under at-least-once delivery.
-  Sweepable after the 24h retry window, unlike the `message` mapping.
+- **Add `awareness_event`** — claimed `eventId` values, as the protocol
+  requires. This answers "have I applied this delivery?" under at-least-once
+  delivery, and the unique index decides the race rather than a read-then-write.
+  Released on failure so a transient error is retried on redelivery.
 - **Drop `inbound_post`** — replaced by the depth counter.
 - **Drop `message_sig`, `message_occ`** — they exist because per-vault *listing*
   surfaced the same message once per participant. References still sit in peers'
@@ -454,34 +455,58 @@ Verified against the design, all from #31/#33:
 
 ## Sequence
 
-1. **Separate the paths.** Add the re-entrancy guard, move `origin` writes
-   before the Talk calls, delete `isInboundPostActive` and `inbound_post`. Ship
-   the four tests above. This alone closes the live image leak and is the only
-   step fixing a bug users hit today. **Merge on its own, before any AaaS work.**
+Shipped in this order:
+
+1. **Separate the paths.** The re-entrancy guard, `origin` writes before the
+   Talk calls, `isInboundPostActive` and `inbound_post` deleted. Merged on its
+   own because it fixes a live leak independently of anything else.
 2. `AwarenessClient` + config + admin settings.
-3. `AwarenessSyncJob` alongside existing paths, flagged, to confirm one packet
-   per message on live traffic.
-4. Cut over: delete poll paths, poller JS, `InitialSyncJob`.
-5. Delete the signature machinery; re-verify the echo stays suppressed.
-6. Migration dropping `w3ds_sync_cursors` and sweeping `message_sig` /
-   `message_occ` / `inbound_post`. Update docs, changelog, tests.
+3. `AwarenessSyncJob` and `AwarenessPacketProcessor`, with the webhook routed
+   through the same processor.
+4. Poll paths, poller JS, `InitialSyncJob` and `PullSyncJob` removed.
+5. Signature machinery removed.
+6. Migration `Version000800` drops `w3ds_sync_cursors` and sweeps
+   `message_sig` / `message_occ` / `inbound_post`.
+
+### Verified against the live service
+
+Run against `https://aaas.w3ds.metastate.foundation` on a real Nextcloud 33:
+
+- Ontology filter and cursor paging work; consecutive pages do not overlap.
+- 2000 packets consumed, each claimed exactly once. Replaying the same window
+  after rewinding the cursor added **zero** rows, so at-least-once delivery is
+  handled.
+- Webhook accepts a correct signature, rejects a forged one, a missing one, and
+  a tampered body.
+- Migration leaves exactly three tables; `w3ds_sync_cursors` is gone.
+- `AwarenessSyncJob` is registered and `PullSyncJob` is not.
+
+One bug was found this way and only this way: the job stored no cursor on a
+quiet poll, and re-derived its starting timestamp as "now" each run, so packets
+arriving between two runs were never requested. The starting point is now
+recorded once, with a test driving that case.
 
 ## Open questions
 
-1. Do we have an approved AaaS consumer and API key?
-2. What base URL, for the instance we will actually point at?
-3. Does one logical message yield exactly one packet? Decides step 5.
+1. ~~Do we have an approved AaaS consumer and API key?~~ Yes, verified against
+   the live service.
+2. ~~What base URL?~~ `https://aaas.w3ds.metastate.foundation`, configured per
+   instance rather than defaulted.
+3. Does one logical message yield exactly one packet? Still unconfirmed for the
+   reference case, but no longer load-bearing: dedup is by `eventId` as the
+   protocol specifies, not by content.
 4. Confirm the fan-out stays. The adapter docs say "may call `storeReference`";
    if a future version drops it for pure awareness delivery, revisit.
-5. Keep `WebhookController` as the fast path, or poll-only?
+5. ~~Keep `WebhookController` as the fast path?~~ Kept; both routes share one
+   processor.
 6. Confirm Talk dispatches `ChatMessageSentEvent` / `SystemMessageSentEvent`
-   synchronously on the target version. The guard depends on it; if any version
-   queues the event, the durable `origin` backstop carries that case.
-7. What do we do with `operation: "delete"` tombstones? Today they are ignored
-   entirely. Deleting a Talk comment on a peer's instruction has obvious abuse
-   potential, so this needs a deliberate answer, not silence.
-8. Do we handle edits? An `update` on an existing `id` should rewrite the Talk
-   comment; today it is ignored, so remote edits never appear.
+   synchronously on every supported version. The guard depends on it; the
+   durable `origin` marker covers a queued dispatch.
+7. What do we do with `operation: "delete"` tombstones? Currently logged and
+   ignored, deliberately: deleting someone's message on a remote instruction is
+   irreversible and easy to abuse.
+8. Do we handle edits? An `update` reaches `handleInboundMessage`, but it does
+   not rewrite an existing comment, so remote edits still do not appear.
 9. Later: do we PR the `Message` schema to add the attachment fields we send
    (`fileId`, `file{}`), and `Chat` for `admins`? Related: does any eVault
    validate `additionalProperties: false` on write, or is it advisory today?
