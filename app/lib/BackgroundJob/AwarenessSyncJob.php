@@ -36,6 +36,17 @@ class AwarenessSyncJob extends TimedJob {
 	private const CURSOR_KEY = 'awareness_cursor';
 
 	/**
+	 * The instant this instance started following the stream.
+	 *
+	 * Held separately from the cursor because the service only issues a cursor
+	 * alongside results: a poll that finds nothing gets none. Re-deriving the
+	 * start time as "now" on each such run would move the window forward every
+	 * minute and skip anything that arrived in between -- which is a silently
+	 * dropped message, the failure this job exists to prevent.
+	 */
+	private const STARTED_AT_KEY = 'awareness_started_at';
+
+	/**
 	 * Pages consumed per run.
 	 *
 	 * A cron tick should not turn into an unbounded walk of a shared history
@@ -80,10 +91,10 @@ class AwarenessSyncJob extends TimedJob {
 			$result = $this->awarenessClient->fetchPackets(
 				$cursor !== '' ? $cursor : null,
 				$this->processor->ontologies(),
-				// Only on the very first run, and only from now: a fresh
-				// install must not replay the ecosystem's entire history into
-				// people's conversations.
-				$cursor === '' ? $this->startingPoint() : null,
+				// Until the service has issued a cursor, ask from the moment
+				// this instance was first configured -- fixed, so that nothing
+				// which arrives between two runs falls through the gap.
+				$cursor === '' ? $this->startedAt() : null,
 			);
 
 			// A failed read is not an empty one. Leaving the cursor where it
@@ -115,14 +126,20 @@ class AwarenessSyncJob extends TimedJob {
 	}
 
 	/**
-	 * Where a first-time poll starts.
+	 * When this instance began following the stream, recorded once.
 	 *
 	 * Deliberately "now", not "the beginning". Backfilling history is a
 	 * separate, explicit decision: replaying it implicitly on install is what
 	 * turned an echo bug into every attachment a user had ever received being
 	 * re-sent to everyone they had ever talked to.
 	 */
-	private function startingPoint(): string {
-		return gmdate('Y-m-d\TH:i:s\Z');
+	private function startedAt(): string {
+		$startedAt = $this->config->getAppValue(Application::APP_ID, self::STARTED_AT_KEY, '');
+		if ($startedAt === '') {
+			$startedAt = gmdate('Y-m-d\TH:i:s\Z');
+			$this->config->setAppValue(Application::APP_ID, self::STARTED_AT_KEY, $startedAt);
+		}
+
+		return $startedAt;
 	}
 }
