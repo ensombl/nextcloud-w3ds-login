@@ -31,6 +31,19 @@ class MessageSentListener implements IEventListener {
 	}
 
 	public function handle(Event $event): void {
+		// Outbound exists to replicate what a person typed. Talk raises this
+		// same event when inbound sync writes a mirrored message or shares a
+		// materialised attachment into a room, and the event itself carries
+		// nothing to tell the two apart -- so an inbound message would be
+		// written straight back out as a new envelope under this user's
+		// identity, and fanned out to every participant.
+		//
+		// The Talk call that raised it is still on our stack, so this is an
+		// exact answer rather than a lock that might have expired.
+		if ($this->chatSyncService->isIngesting()) {
+			return;
+		}
+
 		$eventClass = get_class($event);
 		$this->logger->info('[W3DS Sync] MessageSentListener triggered', [
 			'eventClass' => $eventClass,

@@ -154,7 +154,81 @@ sudo -u www-data php occ config:system:set allow_local_remote_servers --value=tr
 
 Strictly speaking this loosens Nextcloud's outbound SSRF guard for all apps, not just this one — the trade-off is acceptable for a single-purpose server but weigh it against your threat model if this box also hosts other apps. The long-term fix lives with the registry/eVault operator: have them return a hostname.
 
-### 7. Verify
+### 7. Connect the awareness service (required for incoming chat)
+
+Outgoing messages are written straight to the sender's own eVault, so sending works without this step. Incoming chats and messages are delivered by Awareness as a Service, which needs credentials.
+
+First, get them:
+
+1. Apply for access at the AaaS portal and wait for an administrator to approve the consumer.
+2. Issue an API key from the consumer dashboard. The plaintext key is shown exactly once.
+
+Then set them on the server, from the Nextcloud install directory:
+
+```bash
+sudo -u www-data php occ config:app:set w3ds_login awareness_base_url \
+  --value="https://aaas.w3ds.metastate.foundation"
+
+sudo -u www-data php occ config:app:set w3ds_login awareness_api_key \
+  --value="aaas_your_key_here"
+```
+
+There is no default service URL. Instances are deployed per environment, and pointing at the wrong one fails silently, so it has to be stated.
+
+Optionally, set a webhook secret. Deliveries are then signed and verified; without one, anything that can reach the webhook URL is trusted, and whatever it sends is written into people's conversations:
+
+```bash
+sudo -u www-data php occ config:app:set w3ds_login awareness_webhook_secret \
+  --value="$(openssl rand -hex 32)"
+```
+
+The background job registers the subscription with that secret on its next run, so nothing further is needed. Read the values back with `config:app:get`, and confirm the key is accepted:
+
+```bash
+curl -H "Authorization: Bearer aaas_your_key_here" \
+  https://aaas.w3ds.metastate.foundation/api/me
+```
+
+A `status` of `approved` means step 1 completed. Anything else, and packets will not be delivered no matter what is configured here.
+
+Webhook delivery needs your Nextcloud to be reachable from the awareness service at `https://<your-host>/apps/w3ds_login/api/webhook`. If it is not, the background job still reads the same packets from the service's history within a minute, so an instance behind NAT works, just less promptly.
+
+Chat sync also needs cron on the system scheduler:
+
+```bash
+sudo -u www-data php occ background:cron
+```
+
+That only records the *mode*. Something must actually run `cron.php`, or no
+background job ever executes and nothing inbound arrives. Confirm with:
+
+```bash
+sudo -u www-data php occ config:app:get core lastcron
+```
+
+An empty result means cron has never run. The usual crontab entry is:
+
+```
+*/5 * * * * php -f /var/www/html/cron.php
+```
+
+AJAX cron only ticks when somebody loads a page, which makes catch-up
+unpredictable.
+
+#### Settings reference
+
+| Key | Required | Meaning |
+|---|---|---|
+| `awareness_base_url` | yes | AaaS service URL |
+| `awareness_api_key` | yes | `aaas_…` key from the consumer dashboard |
+| `awareness_webhook_secret` | no | signs and verifies pushed deliveries |
+| `registry_base_url` | no | W3DS registry; defaults to the production one |
+| `awareness_cursor` | never set by hand | the job's position in the packet stream |
+| `awareness_started_at` | never set by hand | when this instance began following the stream |
+
+The last two are written by the app. Clearing them makes the next run re-read from the point the instance was first configured, which is occasionally useful after an outage and otherwise best left alone.
+
+### 8. Verify
 
 Open the Nextcloud login page in a browser. You should see a "Sign in with W3DS" button alongside the password form. If you don't, check `nextcloud.log` for errors and confirm the app is enabled:
 
@@ -251,10 +325,29 @@ make cs        # PHP-CS-Fixer in dry-run mode
 
 ### 5. Watching sync activity
 
-The plugin logs every meaningful sync event with the `[W3DS Sync]` prefix:
+The plugin logs every meaningful sync event with the `[W3DS Sync]` and
+`[W3DS Awareness]` prefixes:
 
 ```bash
 make logs | grep W3DS
+```
+
+Inbound messages arrive through the `cron` service, which runs Nextcloud's
+scheduler every five minutes. That is the shortest interval the stock image
+offers, so expect up to that long for an incoming message here; production
+installs run it every minute. To pull immediately instead of waiting:
+
+```bash
+docker compose exec --user www-data app php occ background-job:execute \
+  "$(docker compose exec -T --user www-data app php occ background-job:list \
+     | grep AwarenessSyncJob | awk '{print $2}')" --force-execute
+```
+
+If nothing arrives at all, check the scheduler is alive before suspecting sync:
+
+```bash
+docker compose ps cron
+docker compose exec --user www-data app php occ config:app:get core lastcron
 ```
 
 ### 6. Wiping state without rebuilding

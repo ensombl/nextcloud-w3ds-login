@@ -6,8 +6,10 @@ dev:
 down:
 	docker compose down
 
+# Both services matter: `app` serves requests, `cron` runs the awareness poll
+# that inbound chat depends on.
 logs:
-	docker compose logs -f app
+	docker compose logs -f app cron
 
 occ:
 	docker compose exec --user www-data app php occ $(CMD)

@@ -10,14 +10,15 @@ There are three external systems the plugin talks to:
 
 - **The user's wallet app**. Holds the private key. Signs login challenges and approves chat sync.
 - **The W3DS Registry**. Maps a W3ID like `@alice` to the URL of that user's eVault. Also issues a platform certification token so eVaults trust requests coming from this Nextcloud instance.
-- **The user's eVault**. A GraphQL service that stores MetaEnvelopes (typed structured records). For chat sync we use two schemas: `Chat` and `Message`. The eVault also fans out webhooks to other platforms when something changes.
+- **The user's eVault**. A GraphQL service that stores MetaEnvelopes (typed structured records). For chat sync we use two schemas: `Chat` and `Message`. Every write also commits an awareness event beside the data.
+- **Awareness as a Service (AaaS)**. The single fanout point for those events. It holds a queryable history and delivers to the platforms that subscribe, which is how this plugin learns that anything happened.
 
 Inside Nextcloud, the plugin adds:
 
 - A login provider that drops a "Sign in with W3DS" button on the login page.
 - Talk event listeners that push outbound chat changes to the user's eVault.
-- A webhook endpoint at `/apps/w3ds_login/api/webhook` that receives inbound notifications from eVaults.
-- A frontend poller that hits the per-room poll endpoint every 15 seconds while a chat is open. This is what makes inbound messages feel real-time without depending on cron.
+- A webhook endpoint at `/apps/w3ds_login/api/webhook` that receives awareness packets pushed by AaaS.
+- A background job that reads the same packets from the AaaS history, so a missed delivery is caught up rather than lost.
 - Background jobs that backfill on first link and run a slower pull sync every 15 minutes as a safety net.
 
 ## Login flow
@@ -58,29 +59,27 @@ A few notes on this flow:
 
 ## Chat sync, the high-level shape
 
-The protocol assumes every participant of a chat owns a copy of the chat (and its messages) in their own eVault. Messages live across many replicas. Each replica has its own MetaEnvelope id but the same logical content. When something changes in one replica, that eVault sends webhooks to every other participant's eVault, and they push to the platforms those users are connected to.
-
-So when a user sends a message in Nextcloud Talk:
+The protocol gives every participant of a chat a copy in their own eVault: the author holds the message envelope, everyone else holds a reference to it. So when a user sends a message in Nextcloud Talk:
 
 1. Talk fires a `ChatMessageSentEvent`.
 2. Our `MessageSentListener` catches it and calls `ChatSyncService::pushMessage`, inline. We don't queue this because Nextcloud cron only runs every 5 minutes and that's way too slow for chat. The listener does add ~1 to 2 seconds to the Talk HTTP response which is the price for not being slow.
-3. `pushMessage` resolves the user's eVault URL via the Registry, then writes a Message MetaEnvelope.
-4. The user's own eVault then fans out the change to other participants' eVaults via the W3DS awareness protocol.
-5. Those eVaults POST our webhook endpoint, which posts the inbound message into the matching local Talk room.
+3. `pushMessage` resolves the user's eVault URL via the Registry, then writes a Message MetaEnvelope and a reference into each participant's vault.
+4. That write commits an awareness event alongside the data. The eVault hands it to AaaS, which delivers it to every subscribed platform except the one that made the write.
 
-Inbound from another platform is the mirror image of this:
+Inbound is the mirror image, and it is where the architecture changed. We do not read anyone's eVault to discover messages; we are told:
 
 ```mermaid
 sequenceDiagram
     participant Other as Other W3DS platform
     participant E as Sender's eVault
-    participant Pe as Participant's eVault
+    participant A as AaaS
     participant NC as Nextcloud (this plugin)
     participant Talk as Nextcloud Talk
 
     Other->>E: New message MetaEnvelope created
-    E->>Pe: Awareness webhook (replicate to participants)
-    Pe->>NC: POST /apps/w3ds_login/api/webhook
+    E->>A: Awareness event (committed with the write)
+    A->>NC: POST /apps/w3ds_login/api/webhook
+    NC->>NC: Claim the event id (applied at most once)
     NC->>NC: Look up local Talk room for this chat
     NC->>NC: Resolve sender envelope id to NC user
     NC->>Talk: ChatManager::sendMessage as that user
@@ -88,45 +87,44 @@ sequenceDiagram
     NC->>NC: Store id mapping (local <-> global)
 ```
 
-## Three sync paths, one service
+Reading one stream instead of many vaults is what removed the hardest problem in this plugin. Polling per participant returned the same logical message once per participant, each under a different envelope id, so the app had to decide by comparing message content whether two sightings were one message or someone genuinely saying "ok" twice. A packet carries an `eventId` that answers this exactly.
 
-Everything routes through `ChatSyncService`. There are three ways data flows in or out, and they all share the same anti-ping-pong machinery so a webhook doesn't trigger an outbound listener that triggers another webhook.
+## Two paths, one service
+
+Everything routes through `ChatSyncService`, and the two directions have one job each.
 
 ```mermaid
 flowchart TB
-    subgraph Outbound paths
-        L1[MessageSentListener<br/>fires inline]
-        L2[RoomCreatedListener<br/>fires inline]
-        L3[AttendeesChangedListener<br/>fires inline]
-        IS[InitialSyncJob<br/>queued on first login]
+    subgraph Outbound["Outbound — human input only"]
+        L1[MessageSentListener]
+        L2[RoomCreatedListener]
+        L3[AttendeesChangedListener]
     end
 
-    subgraph Inbound paths
-        WH[WebhookController<br/>eVault awareness packet]
-        PR[PollController<br/>browser hits every 15s<br/>while chat is open]
-        PS[PullSyncJob<br/>TimedJob, every 15 min]
+    subgraph Inbound["Inbound — display only"]
+        WH[WebhookController<br/>pushed by AaaS, sub-second]
+        AJ[AwarenessSyncJob<br/>reads the history, every 60s]
     end
 
     L1 --> CSS[ChatSyncService]
     L2 --> CSS
     L3 --> CSS
-    IS --> CSS
-    WH --> CSS
-    PR --> CSS
-    PS --> CSS
+    WH --> APP[AwarenessPacketProcessor]
+    AJ --> APP
+    APP --> CSS
 
     CSS --> EV[EvaultClient<br/>GraphQL]
     CSS --> Talk[Talk Manager + ChatManager]
-    CSS --> DB[(id_mappings<br/>sync_cursors)]
+    CSS --> DB[(id_mappings)]
     EV --> R[W3DS Registry]
-    EV --> Vaults[eVaults]
 ```
 
-Why three inbound paths instead of one? Each covers a different failure mode:
+Both inbound routes carry the same packets and go through the same processor, so the same event arriving twice is expected rather than a bug:
 
-- **Webhooks** are the fast path. Sub-second latency when they work. But they get dropped if Nextcloud is down, if there's a network blip, or if a participant joined the chat after a message was sent.
-- **The per-room poller** makes the chat feel live. The browser pings `/api/rooms/{token}/poll` every 15 seconds while a chat is open. The handler walks every linked participant of that room, fetches recent messages from each of their eVaults filtered by `chatId`, and posts anything new into the local Talk room. This is also the reason the cross-replica dedup signature exists, since each eVault holds a separate copy of the same logical message.
-- **The pull sync job** is the slow safety net. Runs every 15 minutes via Nextcloud cron. Walks every linked user's eVault from where it left off (cursors are in `oc_w3ds_login_sync_cursors`) and catches anything the other two paths missed.
+- **The webhook** is the fast path, sub-second, and needs a publicly reachable URL. Verified against the subscription secret when one is configured.
+- **The job** reads the same history from a stored cursor. It is the backstop after downtime, and the whole inbound path on an instance AaaS cannot reach.
+
+Delivery is at-least-once by design, so the processor claims each `eventId` once before applying it. Note that it deduplicates on the event, never on the MetaEnvelope id: a create and its later edits share that id, so keying on it would silently discard every edit.
 
 ## Schema mapping
 
@@ -146,26 +144,41 @@ The plugin maps Talk's data model to the W3DS Chat and Message schemas. The mapp
 
 The reason participantIds are profile envelope ids and not raw W3IDs is that the W3DS protocol expects entity references to be addressable as MetaEnvelope ids on the owning eVault. The plugin caches the W3ID to envelope id mapping in both directions so reverse lookups during inbound handling don't need an extra Registry hit.
 
-## Anti ping-pong
+## Keeping the two directions apart
 
-The dangerous case: a webhook delivers a message, we post it into Talk, Talk fires `ChatMessageSentEvent`, our listener pushes it back to the user's eVault, which fans out, which comes back as another webhook. Without protection this is an infinite loop.
+The dangerous case: a packet delivers a message, we post it into Talk for display, Talk fires the same event it fires when a person types, our listener treats it as local input and pushes it back out as a new envelope under the recipient's identity, delivered to everyone in the room.
 
-Three defenses, all in `ChatSyncService`:
+Both halves are correct on their own. Inbound *must* call `ChatManager::sendMessage`, because that is the only way to put a message in a room; outbound *must* listen for that event, because that is how a typed message is detected. The event simply carries nothing to say who caused it.
 
-1. **Sync locks**. When inbound creates a local entity (chat or message), we set a 10-second lock keyed on the local id. Outbound pushes check the lock first and bail.
-2. **Inbound-post locks**. The `MessageSentListener` runs synchronously inside the call to `ChatManager::sendMessage`. So we set a sender-and-room scoped lock immediately before posting an inbound message, and the listener checks that lock and returns early. This is independent of the message-id sync lock because we don't know the local message id until after `sendMessage` returns.
-3. **Cross-replica dedup**. The polling path can pull the same logical message from multiple participants' eVaults under different global ids. We compute a content signature (`md5(senderUid + chatGlobalId + content)`) and stash it in cache for 24 hours. When a second replica of the same message arrives, we record its id in the mapping table but skip posting it to Talk.
+Since `sendMessage()` and `createShare()` are synchronous, the listener always fires inside our own call stack, so the question is answerable exactly rather than approximately:
+
+- `ChatSyncService` counts how deep it is inside an inbound Talk write.
+- `MessageSentListener` returns immediately when that depth is non-zero.
+
+A counter rather than a flag because ingest nests: a forwarded attachment materialises a share while the forward is still being posted.
+
+This replaced four guards that all read state written *after* the call that raised the event — the share mapping, the inbound origin marker, and two locks — so each was blind at the only moment it mattered. One of them was also keyed on the original sender's account while the echo is pushed under the recipient's, so it never matched for a message from another person, which is the ordinary case.
+
+Two durable backstops remain, for events raised outside our stack:
+
+- **Origin marking**. Inbound-created rows in `id_mappings` are marked `inbound`, and outbound refuses to replicate a mirror.
+- **Share adoption**. An inbound attachment records the Talk share it created, so the comment Talk generates for that share is recognised rather than treated as new content.
 
 ## Database
 
-Two app-owned tables on top of Nextcloud's standard ones:
+Three app-owned tables on top of Nextcloud's standard ones:
 
 - `oc_w3ds_login_mappings`. NC UID to W3ID. Created at first login or first link.
-- `oc_w3ds_login_id_mappings`. Local Talk id (room token or comment id) to global eVault MetaEnvelope id. Indexed by both directions.
-- `oc_w3ds_login_sync_cursors`. Pagination cursor per user per schema, used by `PullSyncJob` so we don't refetch the whole eVault every run.
+- `oc_w3ds_login_id_mappings`. Local Talk id (room token or comment id) to global eVault MetaEnvelope id, indexed both ways, plus the short-lived claim rows used for ingest locking and event deduplication.
+- `oc_w3ds_login_tentative_users`. Accounts provisioned for someone who has not signed in yet, swept on a timer.
+
+No message content is stored. Bodies live in the eVault, attachments land in the recipient's Files as ordinary files, and these tables hold only the correspondence between local and global identifiers. That correspondence is genuinely local knowledge: Talk knows nothing of eVaults, and a packet knows nothing of Talk, so without it every arriving message would look new and be posted a second time.
+
+The AaaS cursor is a single value in appconfig. A position per user per ontology existed because there was a separate read per user per ontology; one stream needs one bookmark.
 
 ## What can go wrong
 
 - **Talk read fails during a participant change**. The `AttendeesChangedListener` re-pushes the chat by reading the live participant list from Talk. If `ParticipantService::getParticipantsForRoom` throws (which happens during certain Talk lifecycle events), the read returns an empty list, and without protection the chat in eVault would get overwritten with just the owner. The fix is in `pushChat`: if we already have an eVault id for this chat AND the local read returned zero participants, we abort the update.
-- **Webhook bursts**. Cross-replica messages can arrive at the webhook endpoint nearly simultaneously. The dedup signature makes this safe but the side effect is that only one of them will be posted to Talk. This is intentional.
+- **Duplicate deliveries**. The same event can arrive by webhook and by the polling job, or be resent after a timeout. This is the protocol working as specified, and the event claim makes it harmless.
+- **No AaaS credentials**. Sending still works, because that writes to the sender's own eVault. Nothing arrives from other platforms until the service is configured with `occ` (see installation.md).
 - **Talk not installed**. Every Talk-touching code path is guarded by `class_exists`. The plugin still works for login if Talk isn't there. Sync code paths just no-op.

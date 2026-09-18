@@ -10,6 +10,8 @@ use OCA\W3dsLogin\Db\W3dsMappingMapper;
 use OCP\AppFramework\Db\DoesNotExistException;
 use OCP\ICache;
 use OCP\ICacheFactory;
+use OCP\IUserManager;
+use OCP\IUserSession;
 use Psr\Log\LoggerInterface;
 
 class ChatSyncService {
@@ -18,49 +20,11 @@ class ChatSyncService {
 
 	private const SYNC_LOCK_PREFIX = 'w3ds_sync_lock_';
 	private const SYNC_LOCK_TTL = 10;
-	private const INBOUND_POST_LOCK_PREFIX = 'w3ds_inbound_post_';
-	/**
-	 * How long the "an inbound post is in flight" guard lives.
-	 *
-	 * It has to outlast the work it guards. Materialising an attachment means
-	 * dereferencing the file envelope, downloading up to the protocol's
-	 * 250 MB, writing it into the recipient's Files and sharing it into the
-	 * room -- all before Talk fires the event this guard is meant to suppress.
-	 * At 10s the guard expired mid-download on any sizeable file, and the
-	 * resulting share comment was pushed back out as a new message.
-	 */
-	private const INBOUND_POST_LOCK_TTL = 600;
-	private const MESSAGE_SIG_CACHE_PREFIX = 'w3ds_msg_sig_';
-	private const MESSAGE_SIG_CACHE_TTL = 86400; // 24h — enough to span a typical poll window
-	/**
-	 * Entity type under which cross-replica message signatures are persisted
-	 * in the mapping table. Distinct from 'message' so a signature can never
-	 * be mistaken for an envelope ID.
-	 */
-	private const MESSAGE_SIG_ENTITY = 'message_sig';
-	/**
-	 * Prefix marking an occurrence-numbering row, which records "this
-	 * envelope, from this vault, is the Nth copy of this exact text". Keeps
-	 * those rows distinguishable from the identity rows that share the table.
-	 */
-	private const MESSAGE_OCCURRENCE_PREFIX = 'occ|';
-	/**
-	 * Entity type for occurrence-numbering rows. Separate from the identity
-	 * rows so counting occurrences never scans them.
-	 */
-	private const MESSAGE_OCC_ENTITY = 'message_occ';
 	/**
 	 * Entity type for the short-lived row that serialises ingest of a single
 	 * inbound envelope across concurrent requests.
 	 */
 	private const INGEST_CLAIM_ENTITY = 'ingest_claim';
-	/**
-	 * Entity type for the durable copy of the "inbound post in flight" guard.
-	 * The cache copy cannot be relied on: without a distributed cache
-	 * configured it is per-request, and the request that must observe the
-	 * guard is always a different one.
-	 */
-	private const INBOUND_POST_ENTITY = 'inbound_post';
 	/**
 	 * How long a claim is honoured before it is treated as abandoned.
 	 *
@@ -98,6 +62,29 @@ class ChatSyncService {
 	 */
 	private array $primedViewers = [];
 
+	/**
+	 * Depth of the inbound ingest currently running in this process.
+	 *
+	 * Inbound and outbound are separate paths that never call each other, but
+	 * they meet inside Talk: posting an inbound message calls
+	 * ChatManager::sendMessage(), and materialising an inbound attachment calls
+	 * IShareManager::createShare(). Both raise the very same event Talk raises
+	 * when a person types, carrying nothing to say who caused it, so the
+	 * inbound path re-enters the outbound path through Talk and the message we
+	 * are only mirroring for display is written back out as a new envelope
+	 * under this user's identity.
+	 *
+	 * Those Talk calls are synchronous and in-process, so the listener always
+	 * fires inside this call stack. That makes the question "did we cause this
+	 * event?" answerable exactly, with a counter, rather than approximately,
+	 * with a lock. A counter rather than a flag because ingest nests: a
+	 * forwarded attachment materialises a share while the forward is still
+	 * being posted.
+	 *
+	 * @see isIngesting()
+	 */
+	private int $ingestDepth = 0;
+
 	public function __construct(
 		private EvaultClient $evaultClient,
 		private IdMappingMapper $idMappingMapper,
@@ -107,6 +94,8 @@ class ChatSyncService {
 		private LoggerInterface $logger,
 		private MentionTranslator $mentionTranslator,
 		private AttachmentSyncService $attachmentSync,
+		private IUserManager $userManager,
+		private IUserSession $userSession,
 	) {
 		$this->cache = $cacheFactory->createDistributed(Application::APP_ID);
 	}
@@ -575,9 +564,10 @@ class ChatSyncService {
 			return;
 		}
 
-		// If this message is being posted by handleInboundMessage right now,
-		// skip -- otherwise we'd ping-pong the message we just received.
-		if ($this->isInboundPostActive($ncUid, $roomToken)) {
+		// This event was raised by our own inbound ingest writing into Talk,
+		// not by a person typing. Exact, because the Talk call that raised it
+		// is still on the stack; see $ingestDepth.
+		if ($this->isIngesting()) {
 			return;
 		}
 
@@ -743,6 +733,25 @@ class ChatSyncService {
 		$existingLocalId = $this->idMappingMapper->getLocalId('chat', $globalId);
 		if ($existingLocalId !== null) {
 			$this->updateLocalChat($existingLocalId, $data, $ownerW3id);
+			return;
+		}
+
+		// Awareness delivery is a broadcast: we are handed every chat created
+		// anywhere in the ecosystem, the overwhelming majority of which belong
+		// to people who have never heard of this server. Only conversations
+		// involving somebody linked here may become local rooms.
+		//
+		// The participant resolution below cannot make this decision, because
+		// it provisions an account for any identity it does not recognise --
+		// so asking it "can these participants be resolved?" always answers
+		// yes, and answers it by creating the very account that makes it true.
+		// Strangers' conversations therefore materialised here as rooms, with
+		// accounts for everyone in them.
+		if (!$this->involvesLinkedUser($data, $ownerW3id)) {
+			$this->logger->debug('[W3DS Sync] Inbound chat involves nobody linked here, ignoring', [
+				'globalId' => $globalId,
+			]);
+
 			return;
 		}
 
@@ -929,51 +938,6 @@ class ChatSyncService {
 		[$data, $rawContent, $content, $messageType, $forwardedFrom]
 			= $this->resolveForwardedMessage($data, $rawContent, $content, $messageType);
 
-		// Cross-replica dedup. See messageIdentitySignature() for why the
-		// outer envelope ID cannot be used directly and how a genuine repeat
-		// ("ok" twice) is kept distinct from a replica of one message.
-		$signature = $this->messageIdentitySignature(
-			$senderUid,
-			$chatGlobalId,
-			$data,
-			$rawContent,
-			$ownerW3id,
-			$globalId,
-		);
-		$sigKey = self::MESSAGE_SIG_CACHE_PREFIX . $signature;
-
-		// The signature has to outlive the request. `createDistributed()`
-		// falls back to a per-request ArrayCache whenever no Redis or
-		// memcached is configured, which is the default for a single-server
-		// install -- so on those instances the cache was empty at the start of
-		// every poll and the same logical message was posted once per
-		// participant replica, and again on the next poll. That is the
-		// duplicate: a two-person chat shows everything twice.
-		//
-		// The mapping table is the durable store we already have, and its
-		// (entity_type, global_id) unique index gives us the insert-or-lose
-		// race semantics this needs. Signatures go in under their own entity
-		// type so they cannot collide with real envelope IDs.
-		$existingLocal = $this->cache->get($sigKey)
-			?? $this->idMappingMapper->getLocalId(self::MESSAGE_SIG_ENTITY, $signature);
-		if (is_string($existingLocal) && $existingLocal !== '') {
-			// Re-prime the cache so the rest of this poll skips it without a
-			// query.
-			$this->cache->set($sigKey, $existingLocal, self::MESSAGE_SIG_CACHE_TTL);
-
-			// Record this replica's mapping so future polls skip it cheaply.
-			try {
-				$this->idMappingMapper->storeMapping('message', $existingLocal, $globalId, $ownerW3id);
-			} catch (\Throwable) {
-				// Duplicate-key races are fine — one of them wins.
-			}
-			return;
-		}
-
-		// Prevent the MessageSentListener from re-pushing what we're about
-		// to post — Talk fires the event synchronously during sendMessage(),
-		// before we know the resulting local ID.
-		$this->beginInboundPost($senderUid, $roomToken);
 		try {
 			// An attachment message materialises as a real Talk file share
 			// rather than text: download the blob, drop it in the recipient's
@@ -998,12 +962,18 @@ class ChatSyncService {
 				// when they wrote one, and the bare filename otherwise.
 				// pullAttachment() drops it when it merely repeats the
 				// filename, which it only knows after dereferencing the URI.
-				$share = $this->attachmentSync->pullAttachment(
+				// Talk generates its own `object_shared` comment inside
+				// createShare(), synchronously, and raises the same event a
+				// human share raises. duringIngest() is what tells the
+				// outbound listener that comment is ours: the mapping below
+				// cannot, because the share ID it keys on does not exist
+				// until this call returns.
+				$share = $this->duringIngest($senderUid, fn () => $this->attachmentSync->pullAttachment(
 					$mediaUrl,
 					$senderUid,
 					$roomToken,
 					$attributed !== '' ? $attributed : null,
-				);
+				));
 				if ($share !== null) {
 					// Map the envelope to the share so the same attachment is
 					// not re-materialised on the next poll.
@@ -1021,8 +991,6 @@ class ChatSyncService {
 						$ownerW3id,
 						'inbound',
 					);
-					$this->cache->set($sigKey, 'share:' . $share->getId(), self::MESSAGE_SIG_CACHE_TTL);
-					$this->rememberMessageSignature($signature, 'share:' . $share->getId(), $ownerW3id);
 					return;
 				}
 
@@ -1046,14 +1014,17 @@ class ChatSyncService {
 			$quotedLocalId = $this->localCommentForForward($forwardedFrom, $roomToken);
 			$content = $this->attributeForward($content, $forwardedFrom, $ownerW3id);
 
-			$localMessageId = $this->postTalkMessage(
+			// Same reasoning as the share above: sendMessage() raises the
+			// listener's event before it returns the comment ID we would
+			// otherwise mark as inbound.
+			$localMessageId = $this->duringIngest($senderUid, fn () => $this->postTalkMessage(
 				$roomToken,
 				$senderUid,
 				$content,
 				$messageType,
 				is_string($data['createdAt'] ?? null) ? $data['createdAt'] : null,
 				$quotedLocalId,
-			);
+			));
 			if ($localMessageId === null) {
 				return;
 			}
@@ -1066,15 +1037,11 @@ class ChatSyncService {
 			// a concurrent poller from pushing this same message back out as a
 			// fresh envelope.
 			$this->idMappingMapper->storeMapping('message', $localMessageId, $globalId, $ownerW3id, 'inbound');
-			$this->cache->set($sigKey, $localMessageId, self::MESSAGE_SIG_CACHE_TTL);
-			$this->rememberMessageSignature($signature, $localMessageId, $ownerW3id);
 		} catch (\Throwable $e) {
 			$this->logger->error('Failed to create local message from webhook', [
 				'globalId' => $globalId,
 				'exception' => $e,
 			]);
-		} finally {
-			$this->endInboundPost($senderUid, $roomToken);
 		}
 	}
 
@@ -1332,399 +1299,6 @@ class ChatSyncService {
 		);
 	}
 
-	/**
-	 * Persist a message signature so the next request still recognises this
-	 * message as already posted.
-	 *
-	 * The in-memory cache cannot be relied on: without Redis or memcached
-	 * configured, `createDistributed()` hands back a per-request ArrayCache,
-	 * so the signature is gone by the next poll and every replica of the same
-	 * logical message posts again.
-	 *
-	 * Best effort. A losing insert race means another request recorded the
-	 * same signature first, which is the outcome we wanted anyway.
-	 */
-	private function rememberMessageSignature(string $signature, string $localId, string $ownerW3id): void {
-		try {
-			$this->idMappingMapper->storeMapping(
-				self::MESSAGE_SIG_ENTITY,
-				$localId,
-				$signature,
-				$ownerW3id,
-			);
-		} catch (\Throwable) {
-			// Unique-index collision: someone else already recorded it.
-		}
-	}
-
-	/**
-	 * Build the cross-replica identity key for an inbound message.
-	 *
-	 * The problem this solves: one logical message is readable from several
-	 * eVaults. The envelope lives in the owner's vault, and every other
-	 * participant's vault holds a `reference` pointer to it, so polling each
-	 * participant surfaces the same message repeatedly. Posting on each sight
-	 * of it is what made messages appear twice.
-	 *
-	 * Identity is therefore taken from the envelope itself wherever possible:
-	 *
-	 * 1. The sender-assigned inner `id`. The Message schema requires it, and
-	 *    it is a genuine per-message identity that survives replication. This
-	 *    is exact: two real messages with identical text always carry
-	 *    different ids, so nothing is ever wrongly collapsed.
-	 *
-	 * 2. Failing that, the envelope's own global ID *qualified by the vault it
-	 *    came from*. In practice no peer mapping writes `id` (the reference
-	 *    adapter's mappings simply do not emit one), so this is the live path.
-	 *    An envelope ID is stable per vault, so re-polling the same vault
-	 *    recognises the message, while a different vault's copy is a distinct
-	 *    key -- which is exactly the case (3) exists to close.
-	 *
-	 * 3. A content signature, used *only* to link the copies found in
-	 *    different vaults back to one another. This is the fuzzy step, so it
-	 *    must not swallow a genuine repeat: a user really can send "ok" twice.
-	 *    Content plus timestamp is not enough on its own, because platforms
-	 *    re-stamp `createdAt` on replication, and two quick "ok"s can share a
-	 *    whole-second timestamp.
-	 *
-	 *    So the content key is *occurrence-numbered*: the Nth identical
-	 *    message from a given vault gets ordinal N. The first "ok" from
-	 *    Meshenger matches the first "ok" seen elsewhere, the second matches
-	 *    the second, and a real repeat is never folded into its predecessor.
-	 *    Numbering is per source vault, so replicas of one message (one per
-	 *    vault) all receive the same ordinal.
-	 *
-	 * @param string $ownerW3id The vault this envelope was read from
-	 * @param string $globalId The envelope's ID within that vault
-	 */
-	private function messageIdentitySignature(
-		string $senderUid,
-		string $chatGlobalId,
-		array $data,
-		string $content,
-		string $ownerW3id = '',
-		string $globalId = '',
-	): string {
-		$innerId = $data['id'] ?? null;
-		if (is_string($innerId) && $innerId !== '') {
-			return md5('id|' . $chatGlobalId . '|' . $innerId);
-		}
-
-		$createdAt = $data['createdAt'] ?? '';
-		$createdAt = is_string($createdAt) ? $createdAt : '';
-
-		// The content key, shared by every copy of this message regardless of
-		// which vault it was read from. Timestamp is deliberately excluded:
-		// platforms re-stamp it on replication, so including it would stop
-		// copies of one message from matching at all.
-		$contentKey = md5($senderUid . '|' . $chatGlobalId . '|' . $content);
-
-		// Without a source vault there is nothing to number occurrences
-		// against, so fall back to the old timestamp-qualified key.
-		if ($ownerW3id === '' || $globalId === '') {
-			return md5($contentKey . '|' . $createdAt);
-		}
-
-		// Which occurrence of this exact text, from this exact vault, is this?
-		//
-		// Row layout matters here, because the table carries unique indexes on
-		// both (entity_type, local_id) and (entity_type, global_id). The
-		// envelope ID goes in `local_id`, unique because an envelope is only
-		// numbered once. The prefixed ordinal goes in `global_id`, unique
-		// because a given (text, vault) pair has exactly one Nth occurrence.
-		// Putting the bare ordinal in `local_id` would collide the moment two
-		// different messages both wanted to be occurrence 0.
-		//
-		// Recording the envelope means a re-poll resolves to the ordinal it
-		// was already given rather than allocating a fresh one, so the count
-		// is stable instead of growing on every poll.
-		$occurrencePrefix = self::MESSAGE_OCCURRENCE_PREFIX . $contentKey . '|' . md5($ownerW3id) . '|';
-
-		$existing = $this->idMappingMapper->getGlobalId(self::MESSAGE_OCC_ENTITY, $globalId);
-		if (is_string($existing) && str_starts_with($existing, $occurrencePrefix)) {
-			return md5($contentKey . '|#' . substr($existing, strlen($occurrencePrefix)));
-		}
-
-		$ordinal = $this->idMappingMapper->countByGlobalIdPrefix(
-			self::MESSAGE_OCC_ENTITY,
-			$occurrencePrefix,
-		);
-
-		try {
-			$this->idMappingMapper->storeMapping(
-				self::MESSAGE_OCC_ENTITY,
-				$globalId,
-				$occurrencePrefix . $ordinal,
-				$ownerW3id,
-			);
-		} catch (\Throwable) {
-			// Another request numbered this envelope, or claimed this ordinal,
-			// first. Re-read to adopt whatever it decided so both requests
-			// agree; if that read finds nothing, fall through with the ordinal
-			// we computed.
-			$settled = $this->idMappingMapper->getGlobalId(self::MESSAGE_OCC_ENTITY, $globalId);
-			if (is_string($settled) && str_starts_with($settled, $occurrencePrefix)) {
-				$ordinal = (int)substr($settled, strlen($occurrencePrefix));
-			}
-		}
-
-		return md5($contentKey . '|#' . $ordinal);
-	}
-
-	// ---------------------------------------------------------------
-	// Pull sync: Fetch from eVault on schedule
-	// ---------------------------------------------------------------
-
-	/**
-	 * Poll all participants' eVaults for new messages in a specific Talk room.
-	 * Driven by the frontend every ~15s while a room is open.
-	 *
-	 * @return int Number of new messages synced into Talk
-	 */
-	public function pollRoom(string $roomToken): int {
-		if (!$this->isTalkAvailable()) {
-			return 0;
-		}
-
-		$chatGlobalId = $this->idMappingMapper->getGlobalId('chat', $roomToken);
-		if ($chatGlobalId === null) {
-			// Chat has never been synced outbound; nothing to correlate against
-			return 0;
-		}
-
-		// Collect the W3IDs of all linked participants of the room
-		$participantW3ids = [];
-		try {
-			$manager = \OCP\Server::get(\OCA\Talk\Manager::class);
-			$room = $manager->getRoomByToken($roomToken);
-			$participantService = \OCP\Server::get(\OCA\Talk\Service\ParticipantService::class);
-			foreach ($participantService->getParticipantsForRoom($room) as $p) {
-				if ($p->getAttendee()->getActorType() !== 'users') {
-					continue;
-				}
-				$uid = $p->getAttendee()->getActorId();
-				$w3id = $this->userProvisioning->getLinkedW3id($uid);
-				if ($w3id !== null && !in_array($w3id, $participantW3ids, true)) {
-					$participantW3ids[] = $w3id;
-				}
-			}
-		} catch (\Throwable $e) {
-			$this->logger->warning('[W3DS Sync] pollRoom: failed to collect participants', [
-				'roomToken' => $roomToken,
-				'exception' => $e->getMessage(),
-			]);
-			return 0;
-		}
-
-		// Prime the envelope-id → W3ID reverse cache for every linked
-		// participant. Inbound senderIds on messages are profile envelope
-		// UUIDs; without this priming, handleInboundMessage would be unable
-		// to reverse-resolve them and would silently drop every message.
-		foreach ($participantW3ids as $w3id) {
-			$this->evaultClient->getProfileEnvelopeId($w3id);
-		}
-
-		$newCount = 0;
-		foreach ($participantW3ids as $w3id) {
-			try {
-				// Fetch Message envelopes for this chat from the participant's
-				// eVault, following the cursor to the end.
-				//
-				// This used to request a single fixed page of 50 with no
-				// cursor and no ordering. The eVault does not promise
-				// newest-first, so in any room with more than a page of
-				// messages per participant the newest ones could sit beyond
-				// the first page and never be seen — messages sent today
-				// missing while older ones synced fine. Walking the pages
-				// removes the dependency on result ordering entirely.
-				$after = null;
-				$pages = 0;
-
-				do {
-					$result = $this->evaultClient->fetchMetaEnvelopes(
-						$w3id,
-						self::MESSAGE_SCHEMA_ID,
-						self::POLL_PAGE_SIZE,
-						$after,
-						[
-							'term' => $chatGlobalId,
-							'fields' => ['chatId'],
-							'mode' => 'EXACT',
-						],
-					);
-
-					foreach (($result['edges'] ?? []) as $edge) {
-						$node = $edge['node'] ?? [];
-						$globalId = $node['id'] ?? '';
-						$data = $node['parsed'] ?? [];
-						if ($globalId === '' || empty($data)) {
-							continue;
-						}
-						if ($this->idMappingMapper->getLocalId('message', $globalId) !== null) {
-							continue; // already synced
-						}
-						$this->handleInboundMessage($globalId, $w3id, $data);
-						// Only count as synced if the mapping now exists —
-						// handleInboundMessage returns void and may skip silently.
-						if ($this->idMappingMapper->getLocalId('message', $globalId) !== null) {
-							$newCount++;
-						}
-					}
-
-					$pageInfo = $result['pageInfo'] ?? [];
-					$after = ($pageInfo['hasNextPage'] ?? false) === true
-						? ($pageInfo['endCursor'] ?? null)
-						: null;
-					$pages++;
-
-					// Bound the work per poll so one very deep room cannot
-					// monopolise a cron run. The next poll resumes from the
-					// start and skips already-mapped messages cheaply.
-					if ($pages >= self::POLL_MAX_PAGES && $after !== null) {
-						$this->logger->info('[W3DS Sync] pollRoom: page budget reached, deferring rest', [
-							'roomToken' => $roomToken,
-							'w3id' => $w3id,
-							'pages' => $pages,
-						]);
-						break;
-					}
-				} while ($after !== null);
-			} catch (\Throwable $e) {
-				$this->logger->warning('[W3DS Sync] pollRoom: fetch failed for participant', [
-					'roomToken' => $roomToken,
-					'w3id' => $w3id,
-					'exception' => $e->getMessage(),
-				]);
-			}
-		}
-
-		if ($newCount > 0) {
-			$this->logger->info('[W3DS Sync] pollRoom synced new messages', [
-				'roomToken' => $roomToken,
-				'newCount' => $newCount,
-				'participantCount' => count($participantW3ids),
-			]);
-		}
-
-		return $newCount;
-	}
-
-	/**
-	 * Pull sync all chats and messages for a given user from their own eVault.
-	 *
-	 * Uses the REST `/metaenvelopes/by-ontology/:ontology` endpoint to list
-	 * everything of a given ontology and filters client-side by membership:
-	 *   - rooms where the user's profile envelope ID or eName appears in
-	 *     `participantIds`, `admins`, or `owner`
-	 *   - messages whose `chatId` resolves to one of those accepted rooms
-	 */
-	public function pullSyncForUser(string $w3id): void {
-		// A missing profile envelope is not fatal. We also write eNames, so
-		// chats involving this user are identifiable by eName alone; bailing
-		// out here would deny pull sync to every user without a profile
-		// envelope, which is precisely the bootstrap population.
-		$myProfileId = $this->evaultClient->getProfileEnvelopeId($w3id);
-		if ($myProfileId === null) {
-			$this->logger->info('[W3DS Sync] pullSyncForUser: no profile envelope yet, matching on eName only', ['w3id' => $w3id]);
-			$myProfileId = $w3id;
-		}
-
-		// 1. Rooms — list, filter by membership (the user's profile envelope
-		// ID or eName must appear in the chat's participant / admin / owner
-		// fields), ingest.
-		$acceptedChatGlobalIds = [];
-		try {
-			$chatEnvelopes = $this->evaultClient->listMetaEnvelopesByOntology($w3id, self::CHAT_SCHEMA_ID, self::PULL_LIST_CACHE_TTL);
-			foreach ($chatEnvelopes as $env) {
-				try {
-					$globalId = (string)($env['id'] ?? '');
-					$parsed = $env['parsed'] ?? [];
-					if ($globalId === '' || !is_array($parsed) || empty($parsed)) {
-						continue;
-					}
-					if (!$this->userIsInRoom($parsed, $myProfileId, $w3id)) {
-						continue;
-					}
-					$acceptedChatGlobalIds[$globalId] = true;
-					if ($this->idMappingMapper->getLocalId('chat', $globalId) !== null) {
-						continue;
-					}
-					$this->handleInboundChat($globalId, $w3id, $parsed);
-				} catch (\Throwable $e) {
-					$this->logger->warning('[W3DS Sync] pullSyncForUser: chat envelope failed', [
-						'w3id' => $w3id,
-						'globalId' => $env['id'] ?? null,
-						'exception' => $e->getMessage(),
-					]);
-				}
-			}
-		} catch (\Throwable $e) {
-			$this->logger->warning('[W3DS Sync] pullSyncForUser: chat list failed', [
-				'w3id' => $w3id,
-				'exception' => $e->getMessage(),
-			]);
-		}
-
-		// 2. Messages — fan out per accepted chat. Listing the message
-		// ontology on $w3id's own eVault only surfaces messages *they*
-		// authored; everyone else's messages live in their own eVaults
-		// and are only reachable via pollRoom, which iterates each Talk
-		// attendee's W3ID and pulls from there.
-		foreach (array_keys($acceptedChatGlobalIds) as $chatGlobalId) {
-			$roomToken = $this->idMappingMapper->getLocalId('chat', $chatGlobalId);
-			if ($roomToken === null) {
-				continue; // chat ingest failed above
-			}
-			try {
-				$this->pollRoom($roomToken);
-			} catch (\Throwable $e) {
-				$this->logger->warning('[W3DS Sync] pullSyncForUser: pollRoom failed', [
-					'w3id' => $w3id,
-					'chatGlobalId' => $chatGlobalId,
-					'roomToken' => $roomToken,
-					'exception' => $e->getMessage(),
-				]);
-			}
-		}
-	}
-
-	/**
-	 * True when the viewer appears in the chat's `owner`, `participantIds`,
-	 * or `admins`.
-	 *
-	 * Those fields name a person either by User profile envelope ID or by
-	 * eName, and we write both shapes ourselves depending on what resolves.
-	 * Matching on a single shape drops rooms silently — the envelope
-	 * replicates fine and is then filtered out here — so accept either.
-	 */
-	private function userIsInRoom(array $parsed, string $myProfileId, string $myW3id = ''): bool {
-		$identities = [$myProfileId];
-		if ($myW3id !== '' && $myW3id !== $myProfileId) {
-			$identities[] = $myW3id;
-		}
-
-		$owner = $parsed['owner'] ?? null;
-		if (is_string($owner) && in_array($owner, $identities, true)) {
-			return true;
-		}
-
-		foreach (['participantIds', 'admins'] as $key) {
-			$arr = $parsed[$key] ?? null;
-			if (!is_array($arr)) {
-				continue;
-			}
-			foreach ($arr as $entry) {
-				if (!is_string($entry)) {
-					continue;
-				}
-				if (in_array($entry, $identities, true)) {
-					return true;
-				}
-			}
-		}
-
-		return false;
-	}
 
 	/**
 	 * Decide what an inbound chat's `name` should become as a Talk room title.
@@ -2275,6 +1849,69 @@ class ChatSyncService {
 		}
 	}
 
+	/**
+	 * Whether anyone in this chat has linked their eVault to this server.
+	 *
+	 * The question every inbound chat has to answer before it becomes a local
+	 * room, and it must be answered without side effects. Asking
+	 * {@see resolveW3idToNcUid()} instead would provision an account for each
+	 * unrecognised identity, which both answers the question wrongly and
+	 * creates the accounts that make the wrong answer look right.
+	 *
+	 * One linked participant is enough. A conversation between a linked user
+	 * and somebody who only uses another platform is exactly the case this
+	 * app exists for, and the remaining participants are provisioned
+	 * afterwards so they can be shown as senders.
+	 *
+	 * @param array<string, mixed> $data
+	 */
+	private function involvesLinkedUser(array $data, string $ownerW3id): bool {
+		// The owner is a participant by definition: this is their vault.
+		if ($this->isLinkedLocally($ownerW3id)) {
+			return true;
+		}
+
+		foreach (['participantIds', 'admins'] as $field) {
+			$references = $data[$field] ?? null;
+			if (!is_array($references)) {
+				continue;
+			}
+
+			foreach ($references as $reference) {
+				if (!is_string($reference) || $reference === '') {
+					continue;
+				}
+
+				$w3id = $this->resolveParticipantIdToW3id($reference, $ownerW3id);
+				if ($w3id !== null && $this->isLinkedLocally($w3id)) {
+					return true;
+				}
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * Whether this eName already belongs to a local account.
+	 *
+	 * Deliberately a plain lookup: unlike {@see resolveW3idToNcUid()} it
+	 * never provisions, so it can be asked about strangers safely.
+	 */
+	private function isLinkedLocally(string $w3id): bool {
+		if ($w3id === '') {
+			return false;
+		}
+
+		try {
+			$this->w3dsMappingMapper->findByW3id($w3id);
+
+			return true;
+		} catch (DoesNotExistException) {
+			return false;
+		}
+	}
+
 	// ---------------------------------------------------------------
 	// Anti-ping-pong lock
 	// ---------------------------------------------------------------
@@ -2287,45 +1924,72 @@ class ChatSyncService {
 		return $this->cache->get(self::SYNC_LOCK_PREFIX . $entityType . '_' . $localId) !== null;
 	}
 
-	private function inboundPostKey(string $senderUid, string $roomToken): string {
-		return self::INBOUND_POST_LOCK_PREFIX . md5($senderUid . '|' . $roomToken);
-	}
+	/**
+	 * Run a Talk write that belongs to the inbound path.
+	 *
+	 * Everything Talk may raise an event for -- posting a message, creating a
+	 * share -- must happen inside this wrapper, so the outbound listener can
+	 * recognise the resulting event as ours and ignore it.
+	 *
+	 * The wrapper also assumes the sender's identity for the duration of the
+	 * write, because Talk asks two different questions depending on what is
+	 * being written. A chat message takes the author as an argument, so it is
+	 * attributed correctly whoever is logged in. A file share does not: Talk
+	 * writes its own "shared a file" message from a listener we never call,
+	 * and works out the author from whoever is logged in at the time. Inbound
+	 * sync runs from cron and from a webhook, and neither has anybody logged
+	 * in, so every attachment received from another platform was attributed to
+	 * a guest.
+	 *
+	 * Both concerns are raised and dropped together on purpose. Separating
+	 * them would allow a later change to keep one and lose the other, and the
+	 * failure that produces -- a mirrored message treated as something this
+	 * user just wrote -- is how an inbound attachment once got replicated back
+	 * out to everyone in the room.
+	 *
+	 * @template T
+	 * @param string $senderUid The person the write should be attributed to.
+	 * @param callable(): T $write
+	 * @return T
+	 */
+	private function duringIngest(string $senderUid, callable $write): mixed {
+		$this->ingestDepth++;
+		$previousUser = $this->userSession->getUser();
+		$sender = $this->userManager->get($senderUid);
 
-	private function beginInboundPost(string $senderUid, string $roomToken): void {
-		$this->cache->set($this->inboundPostKey($senderUid, $roomToken), true, self::INBOUND_POST_LOCK_TTL);
-		// The cache alone cannot carry this. `createDistributed()` degrades to
-		// a per-request store when no distributed cache is configured, which
-		// is the default, and the request that must see this flag is a
-		// *different* one -- Talk's listener firing inside sendMessage(), or a
-		// concurrent poller. Without a durable copy the guard was silently
-		// inert on a default install, and inbound messages were re-pushed.
-		$this->idMappingMapper->tryClaim(
-			self::INBOUND_POST_ENTITY,
-			$this->inboundPostKey($senderUid, $roomToken),
-			$senderUid,
-		);
-	}
-
-	private function endInboundPost(string $senderUid, string $roomToken): void {
-		$this->cache->remove($this->inboundPostKey($senderUid, $roomToken));
-		$this->idMappingMapper->releaseClaim(
-			self::INBOUND_POST_ENTITY,
-			$this->inboundPostKey($senderUid, $roomToken),
-		);
-	}
-
-	private function isInboundPostActive(string $senderUid, string $roomToken): bool {
-		if ($this->cache->get($this->inboundPostKey($senderUid, $roomToken)) !== null) {
-			return true;
+		if ($sender !== null) {
+			$this->userSession->setUser($sender);
 		}
 
-		// TTL-bounded: a request that dies mid-ingest must not block outbound
-		// sync for this user and room forever.
-		return $this->idMappingMapper->hasFreshClaim(
-			self::INBOUND_POST_ENTITY,
-			$this->inboundPostKey($senderUid, $roomToken),
-			self::INBOUND_POST_LOCK_TTL,
-		);
+		try {
+			return $write();
+		} finally {
+			// Always restored, including when the write throws: one run
+			// ingests many packets in sequence, and leaving a sender in place
+			// would attribute every later attachment in that run to the wrong
+			// person.
+			//
+			// Restored to whoever was there before rather than to nobody.
+			// Today both callers start with an empty session, so the two are
+			// equivalent; this costs one variable and stays correct if inbound
+			// sync is ever reached from a request that does have a user.
+			if ($sender !== null) {
+				$this->userSession->setUser($previousUser);
+			}
+
+			$this->ingestDepth--;
+		}
+	}
+
+	/**
+	 * Whether a Talk write driven by inbound sync is running right now.
+	 *
+	 * Read by MessageSentListener: an event raised while this is true was
+	 * caused by us mirroring a remote message, not by a person typing, and
+	 * must not be pushed back out.
+	 */
+	public function isIngesting(): bool {
+		return $this->ingestDepth > 0;
 	}
 
 	// ---------------------------------------------------------------

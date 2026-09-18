@@ -6,7 +6,7 @@ namespace OCA\W3dsLogin\Controller;
 
 use OC\Authentication\Token\IProvider;
 use OCA\W3dsLogin\AppInfo\Application;
-use OCA\W3dsLogin\BackgroundJob\InitialSyncJob;
+use OCA\W3dsLogin\BackgroundJob\AwarenessBackfillJob;
 use OCA\W3dsLogin\Service\QrCodeService;
 use OCA\W3dsLogin\Service\UserProvisioningService;
 use OCA\W3dsLogin\Service\W3dsAuthService;
@@ -36,9 +36,9 @@ class AuthController extends Controller {
 		private IURLGenerator $urlGenerator,
 		private IUserManager $userManager,
 		private IUserSession $userSession,
+		private IJobList $jobList,
 		private ISession $session,
 		private IProvider $tokenProvider,
-		private IJobList $jobList,
 		private LoggerInterface $logger,
 	) {
 		parent::__construct(Application::APP_ID, $request);
@@ -194,8 +194,10 @@ class AuthController extends Controller {
 			}
 			$this->authService->markSessionComplete($sessionId, $ncUid);
 
-			// Queue initial sync now that user has a W3DS identity
-			$this->jobList->add(InitialSyncJob::class, ['ncUid' => $ncUid]);
+			// Everything sent to this person before now sits unread in the
+			// awareness service's history: the live poll resumes from a cursor
+			// shared by the whole instance, which is already past it.
+			$this->queueBackfill($w3id);
 
 			$this->logger->info('User linked W3DS identity', [
 				'uid' => $ncUid,
@@ -220,7 +222,34 @@ class AuthController extends Controller {
 
 		$this->authService->markSessionComplete($sessionId, $user->getUID());
 
+		// Same reasoning as the linking branch above: somebody signing in for
+		// the first time has a history the instance cursor has already passed.
+		$this->queueBackfill($w3id);
+
 		return $this->corsResponse(['status' => 'ok']);
+	}
+
+	/**
+	 * Ask for this person's earlier conversations, once.
+	 *
+	 * Queued rather than run inline: it walks a month of the awareness
+	 * service's history, and the wallet is waiting on this response. The job
+	 * itself refuses to run twice for the same identity, so a retried callback
+	 * or a relink costs nothing.
+	 *
+	 * Best effort by design. Failing to schedule a backfill must not fail the
+	 * login it belongs to -- the user still gets in, and still receives
+	 * everything sent from this moment on.
+	 */
+	private function queueBackfill(string $w3id): void {
+		try {
+			$this->jobList->add(AwarenessBackfillJob::class, ['w3id' => $w3id]);
+		} catch (\Throwable $e) {
+			$this->logger->warning('Could not queue history backfill', [
+				'w3id' => $w3id,
+				'exception' => $e->getMessage(),
+			]);
+		}
 	}
 
 	private function corsResponse(mixed $data, int $status = Http::STATUS_OK): JSONResponse {
@@ -334,9 +363,6 @@ class AuthController extends Controller {
 			// best-effort: if the session token is missing, the user simply
 			// gets the default behaviour (modal will appear). Not fatal.
 		}
-
-		// Queue initial sync of user's Talk chats to/from their eVault
-		$this->jobList->add(InitialSyncJob::class, ['ncUid' => $userId]);
 
 		$this->logger->info('W3DS login completed', ['uid' => $userId]);
 
