@@ -9,6 +9,22 @@ Entries below are reconstructed from commit history.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-30
+
+### Added
+
+- Users who sign in through an identity provider with the OpenID Connect user
+  backend (`user_oidc`), for example Keycloak or Rauthy in front of the W3DS
+  OIDC connector, can now sync. The provider names their eName in the standard
+  `preferred_username` claim. The app keeps it as a hint and asks the user to
+  confirm it with one wallet scan. The link is made only if the wallet holds
+  that eName, because an identity provider's username alone is not proof.
+- The prompt can be dismissed; users can still link later from personal
+  settings. Administrators can prompt every unlinked user with
+  `occ config:app:set w3ds_login prompt_unlinked_users --value=yes`.
+- `docs/installation.md` explains how to configure `user_oidc` so user IDs are
+  the eName rather than a hash of the provider's `sub`.
+
 ## [0.7.2] - 2026-09-17
 
 ### Fixed
