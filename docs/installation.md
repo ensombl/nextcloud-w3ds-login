@@ -238,7 +238,35 @@ sudo -u www-data php occ app:list | grep w3ds
 
 If you have Talk installed and a user has linked their W3DS identity from personal settings, sending a message should appear in their eVault within a couple of seconds. The plugin logs every sync attempt at info level, so `tail -f nextcloud.log | grep W3DS` is a good way to watch what it's doing the first time.
 
+### Signing in through your identity provider (optional)
+
+If your Nextcloud already signs users in through an identity provider (Keycloak, Rauthy, Authentik…) with the [OpenID Connect user backend](https://github.com/nextcloud/user_oidc), and that IdP offers W3DS login via the [W3DS OIDC connector](https://docs.w3ds.metastate.foundation/docs/Services/OIDC-Connector), those users can sync too.
+
+The IdP replaces the connector's `sub` with its own user ID, so by default Nextcloud names these users with a 64-character hash and nothing links them to an eName. The eName does reach Nextcloud as the standard `preferred_username` claim. Configure the provider to use it:
+
+```bash
+sudo -u www-data php occ user_oidc:provider <your-idp> \
+  --scope="openid profile email" \
+  --unique-uid=0 \
+  --mapping-uid=preferred_username \
+  --mapping-email=email
+```
+
+`user_oidc` pins each account to the IdP user it was first created for, so accounts created before this keep their hashed IDs. Delete them (`occ user:delete <uid>`) and they are recreated with the eName at the next login.
+
+The IdP's username only claims an eName; it doesn't prove it. An IdP with local accounts may let anyone choose a username that looks like an eName. So the plugin never links on the claim alone. After an IdP login it remembers the eName the IdP named, and on the next page it asks the user to **scan once with their wallet**. The link is made only if the wallet holds that same eName. From then on the account syncs like one that signed in with W3DS directly. Users can dismiss the prompt and link later from **Personal settings → Security**.
+
+To also prompt users who have no eName hint (for example, users signed in with a password):
+
+```bash
+sudo -u www-data php occ config:app:set w3ds_login prompt_unlinked_users --value=yes
+```
+
 ### Troubleshooting
+
+**Users from the identity provider have 64-character hex user IDs.** `user_oidc` is still hashing the IdP's `sub`. Configure `--unique-uid=0 --mapping-uid=preferred_username`, as described in the previous section, and delete the hashed accounts.
+
+**"You signed in as @…, but this wallet holds @…".** The IdP named a different eName from the wallet that was scanned. Scan with the wallet for the eName shown. If the IdP username only looks like an eName and isn't the user's, clear the hint with `occ user:setting <uid> w3ds_login oidc_ename_hint --delete`. They can then link any wallet from personal settings; the hint returns at their next IdP login if they are still unlinked.
 
 **"Session expired" the moment the poll starts.** No shared cache — go back to step 5.
 
