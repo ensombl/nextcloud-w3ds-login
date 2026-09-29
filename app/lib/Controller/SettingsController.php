@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace OCA\W3dsLogin\Controller;
 
 use OCA\W3dsLogin\AppInfo\Application;
+use OCA\W3dsLogin\Service\LinkHintService;
 use OCA\W3dsLogin\Service\QrCodeService;
 use OCA\W3dsLogin\Service\UserProvisioningService;
 use OCA\W3dsLogin\Service\W3dsAuthService;
@@ -27,6 +28,7 @@ class SettingsController extends Controller {
 		private IUserManager $userManager,
 		private IUserSession $userSession,
 		private LoggerInterface $logger,
+		private LinkHintService $hints,
 	) {
 		parent::__construct(Application::APP_ID, $request);
 	}
@@ -111,6 +113,26 @@ class SettingsController extends Controller {
 		}
 
 		return new JSONResponse(['status' => $sessionData['status']]);
+	}
+
+	/**
+	 * Stop asking the current user to link their W3DS identity. They can
+	 * still link from their personal settings.
+	 *
+	 * @NoAdminRequired
+	 */
+	public function linkDismiss(): JSONResponse {
+		$user = $this->userSession->getUser();
+		if ($user === null) {
+			return new JSONResponse(
+				['error' => 'Not authenticated'],
+				Http::STATUS_UNAUTHORIZED,
+			);
+		}
+
+		$this->hints->dismiss($user->getUID());
+
+		return new JSONResponse(['status' => 'dismissed']);
 	}
 
 	/**
