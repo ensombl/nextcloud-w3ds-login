@@ -8,7 +8,9 @@ use OCA\W3dsLogin\BackgroundJob\AwarenessSyncJob;
 use OCA\W3dsLogin\BackgroundJob\TentativeUserCleanupJob;
 use OCA\W3dsLogin\Listener\AttendeesAddedTentativeFlipListener;
 use OCA\W3dsLogin\Listener\AttendeesChangedListener;
+use OCA\W3dsLogin\Listener\LinkPromptListener;
 use OCA\W3dsLogin\Listener\MessageSentListener;
+use OCA\W3dsLogin\Listener\OidcTokenListener;
 use OCA\W3dsLogin\Listener\RoomCreatedListener;
 use OCA\W3dsLogin\Provider\W3dsLoginProvider;
 use OCA\W3dsLogin\Service\IdentityResolver;
@@ -17,6 +19,7 @@ use OCP\AppFramework\App;
 use OCP\AppFramework\Bootstrap\IBootContext;
 use OCP\AppFramework\Bootstrap\IBootstrap;
 use OCP\AppFramework\Bootstrap\IRegistrationContext;
+use OCP\AppFramework\Http\Events\BeforeTemplateRenderedEvent;
 use OCP\BackgroundJob\IJobList;
 
 class Application extends App implements IBootstrap {
@@ -42,6 +45,9 @@ class Application extends App implements IBootstrap {
 	private const TALK_ATTENDEES_ADDED_EVENT = 'OCA\\Talk\\Events\\AttendeesAddedEvent';
 	private const TALK_ATTENDEES_REMOVED_EVENT = 'OCA\\Talk\\Events\\AttendeesRemovedEvent';
 	private const TALK_ATTENDEE_REMOVED_EVENT = 'OCA\\Talk\\Events\\AttendeeRemovedEvent';
+
+	// Raised by the OpenID Connect user backend (user_oidc) after a login.
+	private const OIDC_TOKEN_OBTAINED_EVENT = 'OCA\\UserOIDC\\Event\\UserObtainedTokenEvent';
 
 	public function __construct() {
 		parent::__construct(self::APP_ID);
@@ -74,6 +80,12 @@ class Application extends App implements IBootstrap {
 		// On Talk's AttendeesAddedEvent, flip a tentative-provisioned W3DS
 		// user to permanent so the cleanup job stops considering them.
 		$context->registerEventListener(self::TALK_ATTENDEES_ADDED_EVENT, AttendeesAddedTentativeFlipListener::class);
+
+		// Users who sign in through an identity provider instead of their
+		// wallet: note the eName it claims, and ask them to confirm it with
+		// one scan so their account can sync.
+		$context->registerEventListener(self::OIDC_TOKEN_OBTAINED_EVENT, OidcTokenListener::class);
+		$context->registerEventListener(BeforeTemplateRenderedEvent::class, LinkPromptListener::class);
 	}
 
 	public function boot(IBootContext $context): void {

@@ -15,6 +15,7 @@ return [
 		['name' => 'settings#linkStart', 'url' => '/settings/link/start', 'verb' => 'POST'],
 		['name' => 'settings#linkStatus', 'url' => '/settings/link/status', 'verb' => 'GET'],
 		['name' => 'settings#unlink', 'url' => '/settings/unlink', 'verb' => 'POST'],
+		['name' => 'settings#linkDismiss', 'url' => '/settings/link/dismiss', 'verb' => 'POST'],
 
 
 		// Awareness packets pushed by AaaS (public; authenticated by the

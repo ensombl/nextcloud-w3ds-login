@@ -7,6 +7,7 @@ namespace OCA\W3dsLogin\Controller;
 use OC\Authentication\Token\IProvider;
 use OCA\W3dsLogin\AppInfo\Application;
 use OCA\W3dsLogin\BackgroundJob\AwarenessBackfillJob;
+use OCA\W3dsLogin\Service\LinkHintService;
 use OCA\W3dsLogin\Service\QrCodeService;
 use OCA\W3dsLogin\Service\UserProvisioningService;
 use OCA\W3dsLogin\Service\W3dsAuthService;
@@ -40,6 +41,7 @@ class AuthController extends Controller {
 		private ISession $session,
 		private IProvider $tokenProvider,
 		private LoggerInterface $logger,
+		private LinkHintService $hints,
 	) {
 		parent::__construct(Application::APP_ID, $request);
 	}
@@ -179,6 +181,21 @@ class AuthController extends Controller {
 					Http::STATUS_BAD_REQUEST,
 				);
 			}
+			// Someone who signed in through an identity provider is linked
+			// to the eName that provider named, and no other: a different
+			// wallet here means the wrong wallet, or an IdP username that
+			// only looks like an eName.
+			$hint = $this->hints->getHint($ncUid);
+			if ($hint !== null && !LinkHintService::sameEName($hint, $w3id)) {
+				$message = sprintf('You signed in as %s, but this wallet holds %s. Scan with the wallet for %s.', $hint, $w3id, $hint);
+				$this->logger->warning('W3DS link refused: wallet does not match the IdP eName', [
+					'w3id' => $w3id,
+					'hint' => $hint,
+					'ncUid' => $ncUid,
+				]);
+				$this->authService->markSessionFailed($sessionId, $message);
+				return $this->corsResponse(['error' => $message], Http::STATUS_CONFLICT);
+			}
 			try {
 				$this->provisioningService->linkUser($w3id, $ncUid);
 			} catch (\RuntimeException $e) {
@@ -193,6 +210,7 @@ class AuthController extends Controller {
 				);
 			}
 			$this->authService->markSessionComplete($sessionId, $ncUid);
+			$this->hints->clear($ncUid);
 
 			// Everything sent to this person before now sits unread in the
 			// awareness service's history: the live poll resumes from a cursor
