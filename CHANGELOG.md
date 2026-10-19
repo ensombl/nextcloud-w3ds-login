@@ -9,6 +9,8 @@ Entries below are reconstructed from commit history.
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-10-19
+
 ### Added
 
 - An admin settings page, Administration settings → W3DS, to connect the
