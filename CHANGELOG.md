@@ -9,6 +9,8 @@ Entries below are reconstructed from commit history.
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-10-19
+
 ### Added
 
 - New messages can arrive within 30 seconds instead of with the next cron run:
