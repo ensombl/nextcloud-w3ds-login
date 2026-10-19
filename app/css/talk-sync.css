@@ -1,0 +1,69 @@
+.w3ds-ts {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 4px 8px;
+    padding: 6px 12px;
+    border-radius: var(--border-radius-element, var(--border-radius-large, 8px));
+    font-size: 0.85em;
+    line-height: 1.3;
+    color: var(--color-text-maxcontrast, #767676);
+    cursor: default;
+    user-select: none;
+}
+
+.w3ds-ts-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.w3ds-ts-icon {
+    flex: 0 0 auto;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--color-text-maxcontrast, #767676);
+}
+
+.w3ds-ts-ok .w3ds-ts-icon {
+    background: var(--color-success, #46ba61);
+}
+
+.w3ds-ts-error {
+    color: var(--color-error-text, var(--color-error, #e9322d));
+}
+
+.w3ds-ts-error .w3ds-ts-icon {
+    background: var(--color-error, #e9322d);
+}
+
+.w3ds-ts-busy .w3ds-ts-icon {
+    width: 10px;
+    height: 10px;
+    background: none;
+    border: 2px solid var(--color-border-dark, #ccc);
+    border-top-color: var(--color-primary-element, var(--color-primary, #0082c9));
+    animation: w3ds-ts-spin 0.8s linear infinite;
+}
+
+@keyframes w3ds-ts-spin {
+    to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .w3ds-ts-busy .w3ds-ts-icon {
+        animation-duration: 2.4s;
+    }
+}
+
+.w3ds-ts-floating {
+    position: fixed;
+    left: 16px;
+    bottom: 16px;
+    z-index: 2000;
+    max-width: 280px;
+    border: 1px solid var(--color-border, #ededed);
+    background: var(--color-main-background, #fff);
+    box-shadow: 0 2px 8px var(--color-box-shadow, rgba(0, 0, 0, 0.15));
+}

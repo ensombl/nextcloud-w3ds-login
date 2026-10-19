@@ -9,6 +9,24 @@ Entries below are reconstructed from commit history.
 
 ## [Unreleased]
 
+### Changed
+
+- Opening a conversation in Talk fetches new W3DS messages immediately, and
+  again every 10 seconds while it stays open (every 30 with none open).
+- The "Sync W3DS chats" button in Talk is replaced by a status indicator at the
+  foot of the conversation list. It shows "Syncing W3DS…", "Fetching your W3DS
+  history…", "W3DS up to date · 12s ago", or why sync cannot run.
+- A user's W3DS history is fetched automatically the first time they open
+  Talk, and an incomplete fetch is retried automatically after 15 minutes.
+  Personal settings keep a manual "Fetch my W3DS history again".
+
+### Fixed
+
+- A history fetch no longer ends at the first page the awareness service fails
+  to return. Each page is retried three times with backoff.
+- The sync no longer reports misleading counts: "384 conversations" counted
+  every chat on the network it had read, not the user's.
+
 ## [0.11.0] - 2026-10-19
 
 ### Added

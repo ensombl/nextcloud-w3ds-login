@@ -193,7 +193,7 @@ Webhook delivery needs your Nextcloud to be reachable from the awareness service
 
 Incoming messages are fetched by polling the awareness service; nothing is pushed to the server. Three things poll, and only one runs at a time:
 - **The poll worker** (recommended): every 30 seconds.
-- **Open Talk pages**: every 30 seconds while someone has Talk open.
+- **Open Talk pages**: immediately when a conversation is opened, then every 10 seconds while it stays open, and every 30 seconds otherwise. An indicator at the foot of the conversation list shows the sync's status.
 - **The background job**: on every cron run, so every 5 minutes on most servers.
 
 Run the worker next to Nextcloud. With systemd, as `/etc/systemd/system/w3ds-awareness-poll.service`:
@@ -319,7 +319,7 @@ Only an account the plugin created can be folded. The link is refused, with "Ask
 
 ### Troubleshooting
 
-**Linked users see no W3DS chats.** Open **Administration settings → W3DS** and run **Test connection**. Without an accepted key and an approved consumer, nothing is delivered. Users can then press **Sync W3DS chats** at the foot of Talk's conversation list, or in **Personal settings → Security**. That fetches every conversation in their eVault, plus the last 90 days of its messages. The sync runs as a background job, so cron must be running.
+**Linked users see no W3DS chats.** Open **Administration settings → W3DS** and run **Test connection**. Without an accepted key and an approved consumer, nothing is delivered. Talk fetches each user's history the first time they open it: every conversation in their eVault, plus the last 90 days of messages. An indicator at the foot of the conversation list shows progress. **Personal settings → Security → Fetch my W3DS history again** runs that fetch again by hand. The sync runs as a background job, so cron must be running.
 
 **Users from the identity provider have 64-character hex user IDs.** `user_oidc` is still hashing the IdP's `sub`. Configure `--unique-uid=0 --mapping-uid=preferred_username`, as described in the previous section, and delete the hashed accounts.
 

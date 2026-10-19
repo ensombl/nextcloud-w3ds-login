@@ -16,15 +16,14 @@ use OCP\Util;
 use Psr\Log\LoggerInterface;
 
 /**
- * Puts a "Sync W3DS chats" button into Talk, for linked users, and has the
- * page ask for new W3DS messages every 30 seconds while it is open.
- *
- * Talk has no extension point for its conversation list, so the button is
- * added by a small script once Talk has rendered.
+ * Keeps W3DS conversations current while a linked user has Talk open, with
+ * an indicator showing it happening: new messages are fetched on opening a
+ * conversation and every few seconds after, and the user's history the first
+ * time they come.
  *
  * @implements IEventListener<Event>
  */
-class ChatSyncButtonListener implements IEventListener {
+class TalkSyncListener implements IEventListener {
 	private const TALK_APP_ID = 'spreed';
 
 	public function __construct(
@@ -50,14 +49,14 @@ class ChatSyncButtonListener implements IEventListener {
 				return;
 			}
 
-			$this->initialState->provideInitialState('chat-sync', [
-				'url' => $this->urlGenerator->linkToRoute(Application::APP_ID . '.chat_sync.start'),
+			$this->initialState->provideInitialState('talk-sync', [
 				'pollUrl' => $this->urlGenerator->linkToRoute(Application::APP_ID . '.chat_sync.poll'),
+				'syncUrl' => $this->urlGenerator->linkToRoute(Application::APP_ID . '.chat_sync.start'),
 			]);
-			Util::addScript(Application::APP_ID, 'chat-sync');
-			Util::addStyle(Application::APP_ID, 'chat-sync');
+			Util::addScript(Application::APP_ID, 'talk-sync');
+			Util::addStyle(Application::APP_ID, 'talk-sync');
 		} catch (\Throwable $e) {
-			$this->logger->info('Could not add the W3DS chat sync button', [
+			$this->logger->info('Could not add W3DS sync to Talk', [
 				'exception' => $e->getMessage(),
 			]);
 		}

@@ -23,6 +23,12 @@ class ChatSyncController extends Controller {
 	/** A poll younger than this is fresh enough for a page to skip. */
 	private const POLL_MIN_INTERVAL = 25;
 
+	/**
+	 * The same, for a page with a conversation open: someone is waiting on
+	 * the next message, so only a poll from moments ago will do.
+	 */
+	private const OPEN_CHAT_POLL_MIN_INTERVAL = 3;
+
 	public function __construct(
 		IRequest $request,
 		private IUserSession $userSession,
@@ -78,28 +84,53 @@ class ChatSyncController extends Controller {
 	/**
 	 * Poll the awareness service now, unless that happened moments ago.
 	 *
-	 * Called every 30 seconds by open Talk pages, so that on a server
-	 * running neither the poll worker nor a fast cron, messages still arrive
-	 * while anyone is chatting. One poll serves every user, so most calls
-	 * find a recent one and return straight away; the poller's lock keeps
-	 * the rest from overlapping.
+	 * Called by open Talk pages: every 30 seconds, and every 10 while a
+	 * conversation is open -- immediately on opening one. That keeps
+	 * messages arriving on a server running neither the poll worker nor a
+	 * fast cron. One poll serves every user, so most calls find a recent one
+	 * and return straight away; the poller's lock keeps the rest from
+	 * overlapping.
+	 *
+	 * The response is what the page's sync indicator shows.
 	 *
 	 * @NoAdminRequired
-	 * @UserRateThrottle(limit=10, period=60)
+	 * @UserRateThrottle(limit=40, period=60)
 	 */
-	public function poll(): JSONResponse {
+	public function poll(bool $chatOpen = false): JSONResponse {
+		if (!$this->poller->isConfigured()) {
+			return new JSONResponse([
+				'polled' => false,
+				'configured' => false,
+				'error' => 'Incoming W3DS messages are not set up on this server. An administrator can connect them under Administration settings → W3DS.',
+			]);
+		}
+
+		$minInterval = $chatOpen ? self::OPEN_CHAT_POLL_MIN_INTERVAL : self::POLL_MIN_INTERVAL;
 		$since = $this->poller->secondsSinceLastPoll();
-		if ($since !== null && $since < self::POLL_MIN_INTERVAL) {
-			return new JSONResponse(['polled' => false, 'secondsSinceLastPoll' => $since]);
+		if ($since !== null && $since < $minInterval) {
+			return new JSONResponse(['polled' => false, 'configured' => true, 'lastPolledAt' => time() - $since]);
 		}
 
 		try {
 			$applied = $this->poller->poll();
 		} catch (\Throwable $e) {
 			$this->logger->warning('[W3DS Awareness] Poll from a Talk page failed', ['exception' => $e->getMessage()]);
-			return new JSONResponse(['polled' => false]);
+			return new JSONResponse([
+				'polled' => false,
+				'configured' => true,
+				'error' => 'Could not reach the W3DS awareness service. Retrying.',
+			]);
 		}
 
-		return new JSONResponse(['polled' => $applied !== null, 'applied' => $applied ?? 0]);
+		$since = $this->poller->secondsSinceLastPoll();
+
+		return new JSONResponse([
+			// Null means another poll holds the lock and is fetching right
+			// now; the page simply asks again shortly.
+			'polled' => $applied !== null,
+			'configured' => true,
+			'applied' => $applied ?? 0,
+			'lastPolledAt' => $since !== null ? time() - $since : null,
+		]);
 	}
 }

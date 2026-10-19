@@ -1,18 +1,15 @@
 /**
- * "Sync W3DS chats": fetches the user's W3DS conversations again on request.
+ * "Fetch my W3DS history again", on the personal settings page.
  *
- * In Talk the button sits at the foot of the conversation list. Talk exposes
- * no extension point there, so it is placed once Talk has rendered, and put
- * back if Talk re-renders over it. On the personal settings page it goes
- * into the slot the settings template provides.
+ * Talk keeps conversations current on its own, and fetches someone's
+ * history the first time they open it; this is the manual way to run that
+ * history fetch again.
  */
 (function () {
     'use strict';
 
     var POLL_INTERVAL = 4000;
     var MAX_POLLS = 450; // 30 minutes, the same horizon the server allows.
-    var PLACE_TIMEOUT = 15000;
-    var LIVE_POLL_INTERVAL = 30000;
 
     var state;
     try {
@@ -39,9 +36,9 @@
         return node;
     }
 
-    function request(method, onDone, url) {
+    function request(method, onDone) {
         var xhr = new XMLHttpRequest();
-        xhr.open(method, url || state.url, true);
+        xhr.open(method, state.url, true);
         xhr.setRequestHeader('requesttoken', OC.requestToken);
         xhr.setRequestHeader('Accept', 'application/json');
         xhr.onload = function () {
@@ -57,18 +54,19 @@
         xhr.send();
     }
 
-    function build() {
+    function build(slot) {
         root = el('div', 'w3ds-cs');
         button = el('button', 'w3ds-cs-button');
         button.type = 'button';
         button.appendChild(el('span', 'w3ds-cs-icon', '↻'));
-        button.appendChild(el('span', null, 'Sync W3DS chats'));
+        button.appendChild(el('span', null, 'Fetch my W3DS history again'));
         button.addEventListener('click', start);
         root.appendChild(button);
 
         status = el('div', 'w3ds-cs-status');
         status.setAttribute('aria-live', 'polite');
         root.appendChild(status);
+        slot.appendChild(root);
     }
 
     function setStatus(message, type) {
@@ -87,11 +85,11 @@
         request('POST', function (code, data) {
             if (code === 429) {
                 setBusy(false);
-                return setStatus('Too many sync requests. Try again in a few minutes.', 'error');
+                return setStatus('Too many requests. Try again in a few minutes.', 'error');
             }
             if (code !== 200 || !data) {
                 setBusy(false);
-                return setStatus((data && data.error) || (code === 0 ? 'Network error. Try again.' : 'Could not start the sync.'), 'error');
+                return setStatus((data && data.error) || (code === 0 ? 'Network error. Try again.' : 'Could not start fetching.'), 'error');
             }
             pollCount = 0;
             show(data);
@@ -103,7 +101,7 @@
             pollCount++;
             if (pollCount > MAX_POLLS) {
                 setBusy(false);
-                return setStatus('The sync has not started. Background jobs may not be running on this server.', 'error');
+                return setStatus('This has not started. Background jobs may not be running on this server.', 'error');
             }
             request('GET', function (code, data) {
                 if (code !== 200 || !data) {
@@ -127,15 +125,19 @@
             return poll();
         case 'running':
             setBusy(true);
-            setStatus('Fetching your conversations…');
+            setStatus('Fetching your W3DS history…');
             return poll();
         case 'done':
             setBusy(false);
-            setStatus(summary(data), data.complete === false ? 'error' : 'success');
+            if (data.complete === false) {
+                setStatus('Part of your history could not be fetched. Talk retries it automatically.', 'error');
+            } else {
+                setStatus('Your W3DS history is up to date' + (data.finishedAt ? ' (fetched ' + new Date(data.finishedAt * 1000).toLocaleString() + ').' : '.'), 'success');
+            }
             return;
         case 'failed':
             setBusy(false);
-            setStatus(data.error || 'The sync failed.', 'error');
+            setStatus(data.error || 'Fetching your history failed.', 'error');
             return;
         default:
             setBusy(false);
@@ -143,113 +145,23 @@
         }
     }
 
-    function summary(data) {
-        var text = 'Synced ' + (data.chats || 0) + ' conversation' + (data.chats === 1 ? '' : 's')
-            + ' and ' + (data.messages || 0) + ' message' + (data.messages === 1 ? '' : 's') + '.';
-        if (data.complete === false) {
-            text += ' Part of the history could not be read; try again later.';
-        } else if (data.finishedAt) {
-            text += ' Last run ' + new Date(data.finishedAt * 1000).toLocaleString() + '.';
-        }
-        return text;
-    }
-
-    /**
-     * Where the button goes: the settings slot, else the foot of Talk's
-     * conversation list, just above its settings entry when there is one.
-     */
-    function place() {
-        if (root.isConnected) {
-            return true;
-        }
-        var slot = document.getElementById('w3ds-chat-sync-slot');
-        if (slot) {
-            slot.appendChild(root);
-            return true;
-        }
-        // The inner <nav> is the panel the conversation list lives in; the
-        // outer .app-navigation also holds the collapse toggle, outside it.
-        var nav = document.getElementById('app-navigation-vue')
-            || document.querySelector('.app-navigation__content, .app-navigation');
-        if (!nav) {
-            return false;
-        }
-        var footer = nav.querySelector('.left-sidebar__settings-button-container, .app-navigation__settings, #app-settings');
-        if (footer && footer.parentNode) {
-            footer.parentNode.insertBefore(root, footer);
-        } else {
-            nav.appendChild(root);
-        }
-        return true;
-    }
-
     function init() {
-        build();
-        // Pick up a sync already running, from another tab or an earlier visit.
+        var slot = document.getElementById('w3ds-chat-sync-slot');
+        if (!slot) {
+            return;
+        }
+        build(slot);
+        // Show a fetch already running, from Talk or an earlier visit.
         request('GET', function (code, data) {
             if (code === 200 && data) {
                 show(data);
             }
         });
-
-        if (place()) {
-            if (!document.getElementById('w3ds-chat-sync-slot')) {
-                watch();
-            }
-            return;
-        }
-
-        var observer = new MutationObserver(function () {
-            if (place()) {
-                observer.disconnect();
-                watch();
-            }
-        });
-        observer.observe(document.body, { childList: true, subtree: true });
-
-        // Talk laid out differently than expected: float the button rather
-        // than not offer it at all.
-        setTimeout(function () {
-            if (!root.isConnected) {
-                observer.disconnect();
-                root.classList.add('w3ds-cs-floating');
-                document.body.appendChild(root);
-            }
-        }, PLACE_TIMEOUT);
-    }
-
-    /** Talk re-renders its navigation; put the button back when it does. */
-    function watch() {
-        new MutationObserver(function () {
-            if (!root.isConnected && !root.classList.contains('w3ds-cs-floating')) {
-                place();
-            }
-        }).observe(document.body, { childList: true, subtree: true });
-    }
-
-    /**
-     * Ask the server to fetch new W3DS messages while this tab is in view.
-     * The server skips the work when any tab, or its own poller, did it in
-     * the last few seconds, so many open tabs cost little.
-     */
-    function startLivePolling() {
-        if (!state.pollUrl) {
-            return;
-        }
-        var tick = function () {
-            if (document.visibilityState === 'visible') {
-                request('POST', function () {}, state.pollUrl);
-            }
-        };
-        tick();
-        setInterval(tick, LIVE_POLL_INTERVAL);
     }
 
     if (document.readyState === 'loading') {
         document.addEventListener('DOMContentLoaded', init);
-        document.addEventListener('DOMContentLoaded', startLivePolling);
     } else {
         init();
-        startLivePolling();
     }
 })();

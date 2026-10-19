@@ -56,6 +56,13 @@ class AwarenessBackfillJob extends QueuedJob {
 	 */
 	private const MAX_PAGES = 200;
 
+	/**
+	 * Pauses before re-reading a page that failed, in seconds. The service
+	 * rate-limits and occasionally times out; one bad response used to end
+	 * the whole backfill, leaving most of someone's history unread.
+	 */
+	private const RETRY_DELAYS = [2, 5, 15];
+
 	/** False when a page could not be read and the walk stopped short. */
 	private bool $complete = true;
 
@@ -151,7 +158,7 @@ class AwarenessBackfillJob extends QueuedJob {
 		$applied = 0;
 
 		for ($page = 0; $page < self::MAX_PAGES; $page++) {
-			$result = $this->awarenessClient->fetchPackets($cursor, $ontologies, $from, $w3id);
+			$result = $this->fetchWithRetry($cursor, $ontologies, $from, $w3id);
 
 			// A failed read ends the backfill rather than skipping past it.
 			// Continuing would leave a hole in the middle of someone's history
@@ -185,5 +192,27 @@ class AwarenessBackfillJob extends QueuedJob {
 		$this->logger->warning('[W3DS Awareness] Backfill stopped at its page limit', ['w3id' => $w3id]);
 
 		return $applied;
+	}
+
+	/**
+	 * @param string[] $ontologies
+	 * @return array{packets: list<array<string, mixed>>, nextCursor: ?string, hasMore: bool}|null
+	 */
+	private function fetchWithRetry(?string $cursor, array $ontologies, ?string $from, string $w3id): ?array {
+		$result = $this->awarenessClient->fetchPackets($cursor, $ontologies, $from, $w3id);
+		foreach (self::RETRY_DELAYS as $delay) {
+			if ($result !== null) {
+				break;
+			}
+			$this->pause($delay);
+			$result = $this->awarenessClient->fetchPackets($cursor, $ontologies, $from, $w3id);
+		}
+
+		return $result;
+	}
+
+	/** Separate so tests need not wait. */
+	protected function pause(int $seconds): void {
+		sleep($seconds);
 	}
 }

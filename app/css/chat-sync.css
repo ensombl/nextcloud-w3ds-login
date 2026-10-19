@@ -63,15 +63,3 @@
 .w3ds-cs-status.w3ds-cs-error {
     color: var(--color-error-text, var(--color-error, #e9322d));
 }
-
-.w3ds-cs-floating {
-    position: fixed;
-    left: 16px;
-    bottom: 16px;
-    z-index: 2000;
-    max-width: 280px;
-    border: 1px solid var(--color-border, #ededed);
-    border-radius: var(--border-radius-large, 8px);
-    background: var(--color-main-background, #fff);
-    box-shadow: 0 2px 8px var(--color-box-shadow, rgba(0, 0, 0, 0.15));
-}
