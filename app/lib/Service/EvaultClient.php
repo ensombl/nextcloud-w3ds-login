@@ -13,6 +13,7 @@ use Psr\Log\LoggerInterface;
 
 class EvaultClient {
 	public const USER_SCHEMA_ID = '550e8400-e29b-41d4-a716-446655440000';
+	public const PROFESSIONAL_PROFILE_SCHEMA_ID = '550e8400-e29b-41d4-a716-446655440009';
 
 	private const REGISTRY_BASE_URL = 'https://registry.w3ds.metastate.foundation';
 	private const PLATFORM_NAME = 'nextcloud';
@@ -874,6 +875,50 @@ class EvaultClient {
 			]);
 			return null;
 		}
+	}
+
+	/**
+	 * The parsed ProfessionalProfile a user keeps in their own eVault, or
+	 * null when they have none or it cannot be read.
+	 *
+	 * Optional and secondary to the User profile: it is where a headline,
+	 * phone number and current job live. Read with one GraphQL query against
+	 * the user's own eVault rather than the shared by-ontology listing, which
+	 * is rate limited and would return every other user's envelope too.
+	 *
+	 * @return array<string, mixed>|null
+	 */
+	public function fetchProfessionalProfile(string $w3id): ?array {
+		$page = $this->fetchMetaEnvelopes($w3id, self::PROFESSIONAL_PROFILE_SCHEMA_ID, 5);
+		$edges = is_array($page['edges'] ?? null) ? $page['edges'] : [];
+
+		return self::pickOwnParsed($edges, $w3id);
+	}
+
+	/**
+	 * The `parsed` body of the envelope owned by $w3id among GraphQL edges.
+	 *
+	 * An eVault can hold several envelopes of one ontology (legacy replicas
+	 * next to the primary); the primary is the one whose `ename` names the
+	 * owner. Anything else non-empty is a better answer than nothing.
+	 *
+	 * @param array<mixed> $edges
+	 * @return array<string, mixed>|null
+	 */
+	public static function pickOwnParsed(array $edges, string $w3id): ?array {
+		$fallback = null;
+		foreach ($edges as $edge) {
+			$parsed = is_array($edge) && is_array($edge['node'] ?? null) ? ($edge['node']['parsed'] ?? null) : null;
+			if (!is_array($parsed) || $parsed === []) {
+				continue;
+			}
+			if (($parsed['ename'] ?? null) === $w3id) {
+				return $parsed;
+			}
+			$fallback ??= $parsed;
+		}
+
+		return $fallback;
 	}
 
 	/**

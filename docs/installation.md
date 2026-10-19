@@ -256,11 +256,44 @@ To also prompt users who have no eName hint (for example, users signed in with a
 sudo -u www-data php occ config:app:set w3ds_login prompt_unlinked_users --value=yes
 ```
 
+#### The profile follows the eVault
+
+Once an account is linked, every login copies the user's eVault profile onto it. That covers IdP logins, wallet logins and the moment of linking. The profile wins over whatever the IdP sent and over edits made in Nextcloud. A field the profile leaves empty is left alone.
+
+| Nextcloud | eVault profile |
+|---|---|
+| Display name | `displayName`, else `givenName` + `familyName` (or `firstName` + `lastName`) |
+| Email | `email` |
+| Avatar | `avatarUrl` (downloaded again only when it changes) |
+| Phone | `telephone`, else the ProfessionalProfile `phone` |
+| Address | `address`, else `location` |
+| Website, About | `website`, `bio` |
+| Headline, Organisation, Role | ProfessionalProfile `headline`, and the company and role of the current `workExperience` entry |
+
+`user_oidc` still writes the IdP's name and email at each login; the plugin overwrites them straight after. To stop the two from disagreeing, have the IdP take its `name` and `email` claims from the connector, which reads them from the same profile.
+
+#### Linking when the eName already has an account
+
+People often have an account here for their eName before they ever sign in through the IdP. One is created when they log in with their wallet, appear in a synced chat, or show up in a search. When they then link their IdP account, the plugin folds that older account into it instead of refusing:
+
+1. The eName moves to the IdP account straight away.
+2. Talk membership, one-to-one conversations, messages, mentions, reactions and read markers move with it. Nothing is announced in the rooms.
+3. A background job moves the old account's files into a "Transferred from …" folder in the IdP account, then deletes the old account.
+
+Only an account the plugin created can be folded. The link is refused, with "Ask an administrator to unlink it", when the account holding the eName:
+- was created by an admin or another backend;
+- is an administrator;
+- has calendar or contact entries, which are not moved.
+
 ### Troubleshooting
 
 **Users from the identity provider have 64-character hex user IDs.** `user_oidc` is still hashing the IdP's `sub`. Configure `--unique-uid=0 --mapping-uid=preferred_username`, as described in the previous section, and delete the hashed accounts.
 
 **"You signed in as @…, but this wallet holds @…".** The IdP named a different eName from the wallet that was scanned. Scan with the wallet for the eName shown. If the IdP username only looks like an eName and isn't the user's, clear the hint with `occ user:setting <uid> w3ds_login oidc_ename_hint --delete`. They can then link any wallet from personal settings; the hint returns at their next IdP login if they are still unlinked.
+
+**"This W3DS identity is already linked to another Nextcloud account".** The account holding the eName couldn't be folded into this one (see [Linking when the eName already has an account](#linking-when-the-ename-already-has-an-account)). Find it with `SELECT nc_uid FROM oc_w3ds_login_mappings WHERE w3id = '@<ename>';`. Move what matters and unlink it: `occ files:transfer-ownership <old> <new>`, then `occ user:delete <old>`. After that the user can link again.
+
+**An old account is still there after linking.** The background job keeps it when its files couldn't be moved, and `nextcloud.log` says why. Finish by hand with `occ files:transfer-ownership <old> <new>` and `occ user:delete <old>`.
 
 **"Session expired" the moment the poll starts.** No shared cache — go back to step 5.
 

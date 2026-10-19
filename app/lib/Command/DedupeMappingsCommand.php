@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace OCA\W3dsLogin\Command;
 
+use OCA\W3dsLogin\Service\AccountMergeService;
 use OCA\W3dsLogin\Service\UserProvisioningService;
 use OCP\IDBConnection;
 use OCP\IUserManager;
@@ -153,9 +154,18 @@ class DedupeMappingsCommand extends Command {
 		$qb->select('p.userid')
 			->from('preferences', 'p')
 			->leftJoin('p', 'w3ds_login_mappings', 'm', $qb->expr()->eq('p.userid', 'm.nc_uid'))
+			// A folded account has no mapping and, once its Talk rows moved,
+			// no usage either -- but it still holds files that
+			// AbsorbShadowAccountJob has yet to move. Leave it to that job.
+			->leftJoin('p', 'preferences', 'f', $qb->expr()->andX(
+				$qb->expr()->eq('f.userid', 'p.userid'),
+				$qb->expr()->eq('f.appid', 'p.appid'),
+				$qb->expr()->eq('f.configkey', $qb->createNamedParameter(AccountMergeService::MERGED_INTO_KEY)),
+			))
 			->where($qb->expr()->eq('p.appid', $qb->createNamedParameter('w3ds_login')))
 			->andWhere($qb->expr()->eq('p.configkey', $qb->createNamedParameter('provisioned')))
-			->andWhere($qb->expr()->isNull('m.nc_uid'));
+			->andWhere($qb->expr()->isNull('m.nc_uid'))
+			->andWhere($qb->expr()->isNull('f.userid'));
 		$result = $qb->executeQuery();
 
 		$found = 0;

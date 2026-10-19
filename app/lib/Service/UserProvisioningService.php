@@ -16,11 +16,8 @@ use OCP\Security\ISecureRandom;
 use Psr\Log\LoggerInterface;
 
 class UserProvisioningService {
-	/** Per-user config key recording the last avatar refresh attempt. */
-	private const AVATAR_CHECKED_AT_KEY = 'avatar_checked_at';
-
-	/** Avatars are cosmetic; one eVault round trip per user per day is plenty. */
-	private const AVATAR_REFRESH_INTERVAL = 86400;
+	/** Per-user config key marking an account this app created itself. */
+	public const PROVISIONED_KEY = 'provisioned';
 
 	public function __construct(
 		private W3dsMappingMapper $mapper,
@@ -30,7 +27,7 @@ class UserProvisioningService {
 		private IConfig $config,
 		private TentativeUserMapper $tentativeUserMapper,
 		private LoggerInterface $logger,
-		private AvatarSyncService $avatarSync,
+		private ProfileSyncService $profileSync,
 	) {
 	}
 
@@ -85,53 +82,6 @@ class UserProvisioningService {
 		}
 
 		$this->hydrateProfileFromEvault($user, $w3id, $prefetchedProfile);
-	}
-
-	/**
-	 * Refresh a linked user's avatar from their eVault profile.
-	 *
-	 * The provisioning path only runs once, so without this a picture
-	 * changed on another platform would never propagate. Throttled via a
-	 * per-user config timestamp: a login is a hot path and the avatar is
-	 * cosmetic, so at most one eVault round trip per user per interval.
-	 *
-	 * Silent on every failure -- this must never obstruct a login.
-	 */
-	public function refreshAvatarIfStale(IUser $user, string $w3id): void {
-		try {
-			$uid = $user->getUID();
-
-			// An avatar Nextcloud cannot resize renders as initials in every
-			// place that asks for a size it has not already cached, and the
-			// throttle below would otherwise leave it that way for a day
-			// after the fix that would repair it. Bypass the throttle for
-			// that specific, self-diagnosing case.
-			$needsRepair = $this->avatarSync->storedAvatarNeedsRepair($uid);
-
-			$last = (int)$this->config->getUserValue($uid, Application::APP_ID, self::AVATAR_CHECKED_AT_KEY, '0');
-			if (!$needsRepair && $last > 0 && (time() - $last) < self::AVATAR_REFRESH_INTERVAL) {
-				return;
-			}
-
-			// Record the attempt before doing the work, so a persistently
-			// failing eVault doesn't re-trigger a fetch on every login.
-			$this->config->setUserValue($uid, Application::APP_ID, self::AVATAR_CHECKED_AT_KEY, (string)time());
-
-			$profileId = $this->evaultClient->getProfileEnvelopeId($w3id);
-			if ($profileId === null) {
-				return;
-			}
-			$envelope = $this->evaultClient->fetchMetaEnvelopeById($w3id, $profileId);
-			$parsed = $envelope['parsed'] ?? null;
-			if (is_array($parsed)) {
-				$this->avatarSync->syncFromProfile($uid, $parsed);
-			}
-		} catch (\Throwable $e) {
-			$this->logger->info('Avatar refresh failed; keeping existing avatar', [
-				'w3id' => $w3id,
-				'exception' => $e->getMessage(),
-			]);
-		}
 	}
 
 	/**
@@ -252,7 +202,7 @@ class UserProvisioningService {
 		$this->config->setUserValue(
 			$user->getUID(),
 			Application::APP_ID,
-			'provisioned',
+			self::PROVISIONED_KEY,
 			'1',
 		);
 
@@ -364,8 +314,8 @@ class UserProvisioningService {
 	}
 
 	/**
-	 * Copy the user's displayName and email from their eVault User profile
-	 * onto the freshly-created NC account. Never throws: a broken eVault
+	 * Copy the user's eVault User profile onto the freshly-created NC
+	 * account. Never throws: a broken eVault
 	 * must not prevent login.
 	 *
 	 * If $prefetchedParsed is provided, skips the two eVault round-trips
@@ -389,21 +339,10 @@ class UserProvisioningService {
 				return;
 			}
 
-			$displayName = $this->pickDisplayName($parsed, $w3id);
-			if ($displayName !== '' && $displayName !== $w3id) {
-				$user->setDisplayName($displayName);
-			}
-
-			$email = $parsed['email'] ?? null;
-			if (is_string($email) && $email !== '') {
-				$user->setEMailAddress($email);
-			}
-
-			// Auto-provisioned accounts otherwise land with no visual identity
-			// at all, so a busy group chat renders as a wall of identical
-			// initials. Failures here are logged and swallowed inside the
-			// avatar service; the account is still perfectly usable without one.
-			$this->avatarSync->syncFromProfile($user->getUID(), $parsed);
+			// Only the User profile: this runs for every peer a chat or a
+			// search resolves, so the ProfessionalProfile round trip is left
+			// to the login sync, which only ever handles one person.
+			$this->profileSync->applyProfile($user, $w3id, $parsed);
 		} catch (\Throwable $e) {
 			$this->logger->info('Could not hydrate profile from eVault; continuing with defaults', [
 				'w3id' => $w3id,
@@ -414,41 +353,9 @@ class UserProvisioningService {
 	}
 
 	/**
-	 * Best display name a profile can offer, falling back to the eName.
-	 *
-	 * Profiles are written by several platforms and are not consistent about
-	 * name fields: some send `displayName`, some the schema.org
-	 * `givenName`/`familyName` pair, some plain `firstName`/`lastName`.
-	 * A profile that only carries the latter is a real person with a real
-	 * name, so ignoring that shape shows them a raw UUID for no reason.
-	 *
-	 * A `displayName` equal to the eName is a placeholder the profile itself
-	 * never filled in, so the name parts are preferred over it.
-	 *
-	 * @param array<string, mixed> $parsed
-	 */
-	private function pickDisplayName(array $parsed, string $w3id): string {
-		$candidate = $parsed['displayName'] ?? null;
-		if (is_string($candidate) && trim($candidate) !== '' && trim($candidate) !== $w3id) {
-			return trim($candidate);
-		}
-
-		foreach ([['givenName', 'familyName'], ['firstName', 'lastName']] as [$first, $last]) {
-			$a = is_string($parsed[$first] ?? null) ? trim($parsed[$first]) : '';
-			$b = is_string($parsed[$last] ?? null) ? trim($parsed[$last]) : '';
-			$joined = trim($a . ' ' . $b);
-			if ($joined !== '') {
-				return $joined;
-			}
-		}
-
-		return $w3id;
-	}
-
-	/**
 	 * Link an existing Nextcloud user to a W3ID.
 	 *
-	 * @throws \RuntimeException If the W3ID is already linked to another user
+	 * @throws IdentityLinkedElsewhereException If the W3ID is already linked to another user
 	 */
 	public function linkUser(string $w3id, string $ncUid): void {
 		try {
@@ -456,7 +363,7 @@ class UserProvisioningService {
 			if ($existing->getNcUid() === $ncUid) {
 				return; // Already linked to this user, nothing to do
 			}
-			throw new \RuntimeException('This W3DS identity is already linked to another account');
+			throw new IdentityLinkedElsewhereException($existing->getNcUid());
 		} catch (DoesNotExistException) {
 			// Not linked yet, proceed
 		}
@@ -469,6 +376,15 @@ class UserProvisioningService {
 		$mapping->setNcUid($ncUid);
 		$mapping->setCreatedAt(time());
 		$this->mapper->insert($mapping);
+	}
+
+	/**
+	 * Whether this app created the account itself (wallet login, chat sync,
+	 * collaborator search) rather than it belonging to some other backend
+	 * or having been made by an admin.
+	 */
+	public function isAppProvisioned(string $uid): bool {
+		return $this->config->getUserValue($uid, Application::APP_ID, self::PROVISIONED_KEY, '') === '1';
 	}
 
 	/**

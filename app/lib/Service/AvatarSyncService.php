@@ -4,9 +4,11 @@ declare(strict_types=1);
 
 namespace OCA\W3dsLogin\Service;
 
+use OCA\W3dsLogin\AppInfo\Application;
 use OCP\Files\NotPermittedException;
 use OCP\Http\Client\IClientService;
 use OCP\IAvatarManager;
+use OCP\IConfig;
 use Psr\Log\LoggerInterface;
 
 /**
@@ -68,6 +70,9 @@ class AvatarSyncService {
 
 	private const REQUEST_TIMEOUT = 10;
 
+	/** Per-user config key holding a hash of the avatar source last stored. */
+	private const SOURCE_FINGERPRINT_KEY = 'avatar_source_fp';
+
 	/**
 	 * Image types we are willing to fetch and hand on.
 	 *
@@ -100,7 +105,62 @@ class AvatarSyncService {
 		private IAvatarManager $avatarManager,
 		private IClientService $clientService,
 		private LoggerInterface $logger,
+		private IConfig $config,
 	) {
+	}
+
+	/**
+	 * Sync the avatar unless the profile still points at the picture already
+	 * stored.
+	 *
+	 * Profiles are synced on every login, and an avatar is the one field
+	 * that costs a download and an image re-encode. Platforms upload a new
+	 * picture under a new file reference, so an unchanged reference means an
+	 * unchanged picture. A stored avatar Nextcloud cannot resize is synced
+	 * regardless, as is one that was removed since.
+	 *
+	 * @param array<string, mixed> $parsedProfile
+	 * @return bool True when an avatar was actually written.
+	 */
+	public function syncIfChanged(string $uid, array $parsedProfile): bool {
+		try {
+			$source = $this->pickAvatarSource($parsedProfile);
+			if ($source === null) {
+				return false;
+			}
+
+			$fingerprint = hash('sha256', $source);
+			$stored = $this->config->getUserValue($uid, Application::APP_ID, self::SOURCE_FINGERPRINT_KEY, '');
+			if ($stored === $fingerprint && $this->hasCustomAvatar($uid) && !$this->storedAvatarNeedsRepair($uid)) {
+				return false;
+			}
+
+			if (!$this->syncFromProfile($uid, $parsedProfile)) {
+				return false;
+			}
+
+			// Only after a successful write, so a failed download is retried
+			// on the next login instead of being remembered as done.
+			$this->config->setUserValue($uid, Application::APP_ID, self::SOURCE_FINGERPRINT_KEY, $fingerprint);
+
+			return true;
+		} catch (\Throwable $e) {
+			$this->logger->info('[W3DS Avatar] Avatar sync failed, keeping existing avatar', [
+				'uid' => $uid,
+				'exception' => $e->getMessage(),
+			]);
+			return false;
+		}
+	}
+
+	private function hasCustomAvatar(string $uid): bool {
+		try {
+			$avatar = $this->avatarManager->getAvatar($uid);
+
+			return $avatar->exists() && $avatar->isCustomAvatar() !== false;
+		} catch (\Throwable) {
+			return false;
+		}
 	}
 
 	/**

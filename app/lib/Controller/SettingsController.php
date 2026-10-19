@@ -47,29 +47,43 @@ class SettingsController extends Controller {
 			);
 		}
 
-		$callbackUrl = $this->urlGenerator->linkToRouteAbsolute(
-			Application::APP_ID . '.auth.callback',
-		);
+		// Answer in JSON whatever goes wrong: Nextcloud's own error page is
+		// HTML, which the linking dialog can only report as "try again".
+		try {
+			$callbackUrl = $this->urlGenerator->linkToRouteAbsolute(
+				Application::APP_ID . '.auth.callback',
+			);
 
-		$authSession = $this->authService->createSession(
-			$callbackUrl,
-			'Nextcloud',
-			$user->getUID(),
-		);
+			$authSession = $this->authService->createSession(
+				$callbackUrl,
+				'Nextcloud',
+				$user->getUID(),
+			);
 
-		$statusUrl = $this->urlGenerator->linkToRouteAbsolute(
-			Application::APP_ID . '.settings.linkStatus',
-			['session' => $authSession['sessionId']],
-		);
+			$statusUrl = $this->urlGenerator->linkToRouteAbsolute(
+				Application::APP_ID . '.settings.linkStatus',
+				['session' => $authSession['sessionId']],
+			);
 
-		$qrSvg = $this->qrCodeService->generateSvg($authSession['uri']);
+			$qrSvg = $this->qrCodeService->generateSvg($authSession['uri']);
 
-		return new JSONResponse([
-			'qrSvg' => $qrSvg,
-			'w3dsUri' => $authSession['uri'],
-			'statusUrl' => $statusUrl,
-			'sessionId' => $authSession['sessionId'],
-		]);
+			return new JSONResponse([
+				'qrSvg' => $qrSvg,
+				'w3dsUri' => $authSession['uri'],
+				'statusUrl' => $statusUrl,
+				'sessionId' => $authSession['sessionId'],
+			]);
+		} catch (\Throwable $e) {
+			$this->logger->error('Could not start a W3DS linking session', [
+				'uid' => $user->getUID(),
+				'exception' => $e,
+			]);
+
+			return new JSONResponse(
+				['error' => 'Could not start linking. Try again in a moment.'],
+				Http::STATUS_INTERNAL_SERVER_ERROR,
+			);
+		}
 	}
 
 	/**

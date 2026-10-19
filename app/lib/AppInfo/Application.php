@@ -9,6 +9,7 @@ use OCA\W3dsLogin\BackgroundJob\TentativeUserCleanupJob;
 use OCA\W3dsLogin\Listener\AttendeesAddedTentativeFlipListener;
 use OCA\W3dsLogin\Listener\AttendeesChangedListener;
 use OCA\W3dsLogin\Listener\LinkPromptListener;
+use OCA\W3dsLogin\Listener\LoginProfileSyncListener;
 use OCA\W3dsLogin\Listener\MessageSentListener;
 use OCA\W3dsLogin\Listener\OidcTokenListener;
 use OCA\W3dsLogin\Listener\RoomCreatedListener;
@@ -21,6 +22,7 @@ use OCP\AppFramework\Bootstrap\IBootstrap;
 use OCP\AppFramework\Bootstrap\IRegistrationContext;
 use OCP\AppFramework\Http\Events\BeforeTemplateRenderedEvent;
 use OCP\BackgroundJob\IJobList;
+use OCP\User\Events\UserLoggedInEvent;
 
 class Application extends App implements IBootstrap {
 	public const APP_ID = 'w3ds_login';
@@ -86,6 +88,12 @@ class Application extends App implements IBootstrap {
 		// one scan so their account can sync.
 		$context->registerEventListener(self::OIDC_TOKEN_OBTAINED_EVENT, OidcTokenListener::class);
 		$context->registerEventListener(BeforeTemplateRenderedEvent::class, LinkPromptListener::class);
+
+		// Every interactive login of a linked user pulls their eVault
+		// profile, after the IdP has written its claims, so the eVault wins.
+		// Also the hint fallback for user_oidc releases without the event
+		// above. Wallet logins skip core's login path and sync themselves.
+		$context->registerEventListener(UserLoggedInEvent::class, LoginProfileSyncListener::class);
 	}
 
 	public function boot(IBootContext $context): void {

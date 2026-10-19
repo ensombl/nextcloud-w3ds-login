@@ -7,7 +7,10 @@ namespace OCA\W3dsLogin\Controller;
 use OC\Authentication\Token\IProvider;
 use OCA\W3dsLogin\AppInfo\Application;
 use OCA\W3dsLogin\BackgroundJob\AwarenessBackfillJob;
+use OCA\W3dsLogin\Service\AccountMergeService;
+use OCA\W3dsLogin\Service\IdentityLinkedElsewhereException;
 use OCA\W3dsLogin\Service\LinkHintService;
+use OCA\W3dsLogin\Service\ProfileSyncService;
 use OCA\W3dsLogin\Service\QrCodeService;
 use OCA\W3dsLogin\Service\UserProvisioningService;
 use OCA\W3dsLogin\Service\W3dsAuthService;
@@ -42,6 +45,8 @@ class AuthController extends Controller {
 		private IProvider $tokenProvider,
 		private LoggerInterface $logger,
 		private LinkHintService $hints,
+		private ProfileSyncService $profileSync,
+		private AccountMergeService $accountMerge,
 	) {
 		parent::__construct(Application::APP_ID, $request);
 	}
@@ -174,7 +179,8 @@ class AuthController extends Controller {
 
 		if ($ncUid !== null) {
 			// Linking flow: attach W3ID to existing account
-			if ($this->userManager->get($ncUid) === null) {
+			$linkedUser = $this->userManager->get($ncUid);
+			if ($linkedUser === null) {
 				$this->logger->warning('W3DS link: user no longer exists', ['ncUid' => $ncUid]);
 				return $this->corsResponse(
 					['error' => 'User account no longer exists'],
@@ -197,7 +203,17 @@ class AuthController extends Controller {
 				return $this->corsResponse(['error' => $message], Http::STATUS_CONFLICT);
 			}
 			try {
-				$this->provisioningService->linkUser($w3id, $ncUid);
+				try {
+					$this->provisioningService->linkUser($w3id, $ncUid);
+				} catch (IdentityLinkedElsewhereException $e) {
+					// Almost always an account this app made for the same
+					// eName -- at a wallet login, or when the person turned up
+					// in a synced chat -- before they ever signed in through
+					// the IdP. The signature above proves they own the eName,
+					// so that account is folded into this one. Throws when it
+					// is not ours to fold.
+					$this->accountMerge->takeOver($w3id, $e->getExistingUid(), $ncUid);
+				}
 			} catch (\RuntimeException $e) {
 				$this->logger->warning('W3DS link failed: ' . $e->getMessage(), [
 					'w3id' => $w3id,
@@ -211,6 +227,11 @@ class AuthController extends Controller {
 			}
 			$this->authService->markSessionComplete($sessionId, $ncUid);
 			$this->hints->clear($ncUid);
+
+			// The account carries whatever the IdP or the user set until now;
+			// from here on it is this person, so show them as their profile
+			// says. Failure-silent inside the service.
+			$this->profileSync->syncProfile($linkedUser, $w3id);
 
 			// Everything sent to this person before now sits unread in the
 			// awareness service's history: the live poll resumes from a cursor
@@ -233,10 +254,11 @@ class AuthController extends Controller {
 			);
 		}
 
-		// Pick up a profile picture changed on another platform. Throttled
-		// and failure-silent inside the service; provisioning only hydrates
-		// once, so without this an updated avatar would never propagate.
-		$this->provisioningService->refreshAvatarIfStale($user, $w3id);
+		// Pick up profile changes made on any other platform. A wallet login
+		// never goes through core's login path, so UserLoggedInEvent -- and
+		// the sync listening for it -- does not fire for it. Failure-silent
+		// inside the service.
+		$this->profileSync->syncProfile($user, $w3id);
 
 		$this->authService->markSessionComplete($sessionId, $user->getUID());
 
@@ -360,6 +382,9 @@ class AuthController extends Controller {
 			$this->userSession->setLoginName($userId);
 		}
 		$this->userSession->createSessionToken($this->request, $userId, $userId);
+		// Core only records this inside its own login path, which this one
+		// bypasses; without it every wallet user reads as "never logged in".
+		$user->updateLastLoginTimestamp();
 
 		// Mark this session as one that cannot confirm a password. The W3DS
 		// account has a random unguessable secret the user does not know, so
