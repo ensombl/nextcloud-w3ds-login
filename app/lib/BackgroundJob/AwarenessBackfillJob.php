@@ -37,23 +37,24 @@ use Psr\Log\LoggerInterface;
  */
 class AwarenessBackfillJob extends QueuedJob {
 	/**
-	 * How far back a newly linked user's history is fetched.
+	 * How far back a person's messages are fetched.
 	 *
-	 * The service holds the whole ecosystem's history -- hundreds of thousands
-	 * of packets -- and almost none of it belongs to any one person. A month
-	 * covers the conversations somebody is likely to care about at a cost of
-	 * roughly fifty requests, where "everything ever" is an unbounded walk
-	 * whose length grows with the network rather than with the user.
+	 * The read is restricted to their own eVault, so its cost grows with
+	 * their history rather than the network's. Their conversations
+	 * themselves are read without a window: a message is only placed in a
+	 * conversation that exists here, and a conversation started before the
+	 * window would otherwise drop every message sent in it since.
 	 */
-	private const WINDOW_DAYS = 30;
+	private const WINDOW_DAYS = 90;
 
 	/**
-	 * Pages read per ontology, at 200 packets each.
+	 * Pages read per ontology, at 500 packets each.
 	 *
-	 * A ceiling rather than an expectation: it bounds one person's backfill so
-	 * it cannot occupy the queue indefinitely on a busy network.
+	 * A ceiling rather than an expectation -- one person's eVault rarely
+	 * fills more than a handful -- so a runaway history cannot hold the queue
+	 * indefinitely. Reaching it is reported as an incomplete sync.
 	 */
-	private const MAX_PAGES = 60;
+	private const MAX_PAGES = 200;
 
 	/** False when a page could not be read and the walk stopped short. */
 	private bool $complete = true;
@@ -107,10 +108,11 @@ class AwarenessBackfillJob extends QueuedJob {
 		// discard most of what this job exists to fetch.
 		$this->complete = true;
 		try {
-			$chats = $this->replay([ChatSyncService::CHAT_SCHEMA_ID], $from);
+			$chats = $this->replay([ChatSyncService::CHAT_SCHEMA_ID], null, $w3id);
 			$messages = $this->replay(
 				[ChatSyncService::MESSAGE_SCHEMA_ID, AwarenessClient::FILE_ONTOLOGY],
 				$from,
+				$w3id,
 			);
 		} catch (\Throwable $e) {
 			$this->status->markFailed($w3id, 'Fetching conversations failed. Try again later.');
@@ -133,23 +135,23 @@ class AwarenessBackfillJob extends QueuedJob {
 	}
 
 	/**
-	 * Walk one slice of the history, applying whatever belongs here.
+	 * Walk one slice of one person's history, applying whatever belongs here.
 	 *
-	 * The service cannot filter by conversation or by participant, so this
-	 * reads the window and lets ingest decide: chats nobody here is in are
-	 * ignored, and messages for unknown conversations are dropped. Wasteful in
-	 * bytes, but it is the only query the API offers, and it is the same
-	 * judgement the live poll makes on every packet anyway.
+	 * Restricted to their eVault, which holds a copy of every conversation
+	 * and message they are part of. Reading the whole network instead -- the
+	 * service's only other option -- meant walking everyone's traffic oldest
+	 * first and stopping at a page limit, which on a busy network ran out
+	 * before reaching the recent messages people actually miss.
 	 *
 	 * @param string[] $ontologies
 	 * @return int Packets that resulted in local work.
 	 */
-	private function replay(array $ontologies, string $from): int {
+	private function replay(array $ontologies, ?string $from, string $w3id): int {
 		$cursor = null;
 		$applied = 0;
 
 		for ($page = 0; $page < self::MAX_PAGES; $page++) {
-			$result = $this->awarenessClient->fetchPackets($cursor, $ontologies, $from);
+			$result = $this->awarenessClient->fetchPackets($cursor, $ontologies, $from, $w3id);
 
 			// A failed read ends the backfill rather than skipping past it.
 			// Continuing would leave a hole in the middle of someone's history
@@ -159,7 +161,7 @@ class AwarenessBackfillJob extends QueuedJob {
 				$this->logger->warning('[W3DS Awareness] Backfill stopped early: could not read history');
 				$this->complete = false;
 
-				break;
+				return $applied;
 			}
 
 			foreach ($result['packets'] as $packet) {
@@ -174,9 +176,13 @@ class AwarenessBackfillJob extends QueuedJob {
 
 			$cursor = $result['nextCursor'];
 			if (!$result['hasMore'] || $cursor === null) {
-				break;
+				return $applied;
 			}
 		}
+
+		// Out of pages with more still to read.
+		$this->complete = false;
+		$this->logger->warning('[W3DS Awareness] Backfill stopped at its page limit', ['w3id' => $w3id]);
 
 		return $applied;
 	}

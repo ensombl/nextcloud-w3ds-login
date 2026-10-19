@@ -12,6 +12,7 @@
     var POLL_INTERVAL = 4000;
     var MAX_POLLS = 450; // 30 minutes, the same horizon the server allows.
     var PLACE_TIMEOUT = 15000;
+    var LIVE_POLL_INTERVAL = 30000;
 
     var state;
     try {
@@ -38,9 +39,9 @@
         return node;
     }
 
-    function request(method, onDone) {
+    function request(method, onDone, url) {
         var xhr = new XMLHttpRequest();
-        xhr.open(method, state.url, true);
+        xhr.open(method, url || state.url, true);
         xhr.setRequestHeader('requesttoken', OC.requestToken);
         xhr.setRequestHeader('Accept', 'application/json');
         xhr.onload = function () {
@@ -226,9 +227,29 @@
         }).observe(document.body, { childList: true, subtree: true });
     }
 
+    /**
+     * Ask the server to fetch new W3DS messages while this tab is in view.
+     * The server skips the work when any tab, or its own poller, did it in
+     * the last few seconds, so many open tabs cost little.
+     */
+    function startLivePolling() {
+        if (!state.pollUrl) {
+            return;
+        }
+        var tick = function () {
+            if (document.visibilityState === 'visible') {
+                request('POST', function () {}, state.pollUrl);
+            }
+        };
+        tick();
+        setInterval(tick, LIVE_POLL_INTERVAL);
+    }
+
     if (document.readyState === 'loading') {
         document.addEventListener('DOMContentLoaded', init);
+        document.addEventListener('DOMContentLoaded', startLivePolling);
     } else {
         init();
+        startLivePolling();
     }
 })();

@@ -24,6 +24,8 @@ return [
 		// Fetch the signed-in user's W3DS conversations again, on request.
 		['name' => 'chat_sync#start', 'url' => '/chats/sync', 'verb' => 'POST'],
 		['name' => 'chat_sync#status', 'url' => '/chats/sync', 'verb' => 'GET'],
+		// Open Talk pages ask for new messages every 30 seconds.
+		['name' => 'chat_sync#poll', 'url' => '/chats/poll', 'verb' => 'POST'],
 
 
 		// Awareness packets pushed by AaaS (public; authenticated by the

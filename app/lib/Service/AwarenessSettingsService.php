@@ -34,6 +34,7 @@ class AwarenessSettingsService {
 	 */
 	public function get(): array {
 		$lastCron = (int)$this->config->getAppValue('core', 'lastcron', '0');
+		$lastPolled = (int)$this->value(AwarenessPoller::LAST_POLLED_KEY);
 
 		return [
 			'baseUrl' => $this->value(self::BASE_URL_KEY),
@@ -45,6 +46,7 @@ class AwarenessSettingsService {
 			),
 			'backgroundJobsMode' => $this->config->getAppValue('core', 'backgroundjobs_mode', 'ajax'),
 			'lastCron' => $lastCron > 0 ? $lastCron : null,
+			'lastPolled' => $lastPolled > 0 ? $lastPolled : null,
 			'followingSince' => $this->value('awareness_started_at') ?: null,
 		];
 	}

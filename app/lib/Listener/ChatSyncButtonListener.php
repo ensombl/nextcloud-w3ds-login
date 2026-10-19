@@ -16,7 +16,8 @@ use OCP\Util;
 use Psr\Log\LoggerInterface;
 
 /**
- * Puts a "Sync W3DS chats" button into Talk, for linked users.
+ * Puts a "Sync W3DS chats" button into Talk, for linked users, and has the
+ * page ask for new W3DS messages every 30 seconds while it is open.
  *
  * Talk has no extension point for its conversation list, so the button is
  * added by a small script once Talk has rendered.
@@ -51,6 +52,7 @@ class ChatSyncButtonListener implements IEventListener {
 
 			$this->initialState->provideInitialState('chat-sync', [
 				'url' => $this->urlGenerator->linkToRoute(Application::APP_ID . '.chat_sync.start'),
+				'pollUrl' => $this->urlGenerator->linkToRoute(Application::APP_ID . '.chat_sync.poll'),
 			]);
 			Util::addScript(Application::APP_ID, 'chat-sync');
 			Util::addStyle(Application::APP_ID, 'chat-sync');

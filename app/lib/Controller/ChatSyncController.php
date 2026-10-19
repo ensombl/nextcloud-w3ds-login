@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace OCA\W3dsLogin\Controller;
 
 use OCA\W3dsLogin\AppInfo\Application;
+use OCA\W3dsLogin\Service\AwarenessPoller;
 use OCA\W3dsLogin\Service\ChatSyncStatusService;
 use OCA\W3dsLogin\Service\UserProvisioningService;
 use OCP\AppFramework\Controller;
@@ -19,11 +20,15 @@ use Psr\Log\LoggerInterface;
  * again, and report on it.
  */
 class ChatSyncController extends Controller {
+	/** A poll younger than this is fresh enough for a page to skip. */
+	private const POLL_MIN_INTERVAL = 25;
+
 	public function __construct(
 		IRequest $request,
 		private IUserSession $userSession,
 		private UserProvisioningService $provisioningService,
 		private ChatSyncStatusService $status,
+		private AwarenessPoller $poller,
 		private LoggerInterface $logger,
 	) {
 		parent::__construct(Application::APP_ID, $request);
@@ -68,5 +73,33 @@ class ChatSyncController extends Controller {
 		$user = $this->userSession->getUser();
 
 		return $user === null ? null : $this->provisioningService->getLinkedW3id($user->getUID());
+	}
+
+	/**
+	 * Poll the awareness service now, unless that happened moments ago.
+	 *
+	 * Called every 30 seconds by open Talk pages, so that on a server
+	 * running neither the poll worker nor a fast cron, messages still arrive
+	 * while anyone is chatting. One poll serves every user, so most calls
+	 * find a recent one and return straight away; the poller's lock keeps
+	 * the rest from overlapping.
+	 *
+	 * @NoAdminRequired
+	 * @UserRateThrottle(limit=10, period=60)
+	 */
+	public function poll(): JSONResponse {
+		$since = $this->poller->secondsSinceLastPoll();
+		if ($since !== null && $since < self::POLL_MIN_INTERVAL) {
+			return new JSONResponse(['polled' => false, 'secondsSinceLastPoll' => $since]);
+		}
+
+		try {
+			$applied = $this->poller->poll();
+		} catch (\Throwable $e) {
+			$this->logger->warning('[W3DS Awareness] Poll from a Talk page failed', ['exception' => $e->getMessage()]);
+			return new JSONResponse(['polled' => false]);
+		}
+
+		return new JSONResponse(['polled' => $applied !== null, 'applied' => $applied ?? 0]);
 	}
 }

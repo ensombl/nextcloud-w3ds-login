@@ -66,6 +66,21 @@
 
         $('w3ds-admin-webhook-url').textContent = settings.webhookUrl || '';
 
+        var lastPoll = $('w3ds-admin-last-poll');
+        lastPoll.className = '';
+        if (!configured) {
+            lastPoll.textContent = 'Not polling until the service is configured.';
+        } else if (!settings.lastPolled) {
+            lastPoll.textContent = 'Never. Polls run from background jobs, open Talk pages, and the occ w3ds_login:awareness-poll worker.';
+            lastPoll.className = 'w3ds-admin-error';
+        } else {
+            var ago = Math.max(0, Math.round(Date.now() / 1000 - settings.lastPolled));
+            lastPoll.textContent = (ago < 90 ? ago + ' seconds' : Math.round(ago / 60) + ' minutes') + ' ago.';
+            if (ago > 90) {
+                lastPoll.textContent += ' For messages within seconds, run the poll worker: sudo -u www-data php occ w3ds_login:awareness-poll';
+            }
+        }
+
         var cron = $('w3ds-admin-cron');
         cron.className = '';
         if (!settings.lastCron) {

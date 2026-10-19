@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace OCA\W3dsLogin\Tests\Unit;
 
 use OCA\W3dsLogin\Controller\ChatSyncController;
+use OCA\W3dsLogin\Service\AwarenessPoller;
 use OCA\W3dsLogin\Service\ChatSyncStatusService;
 use OCA\W3dsLogin\Service\UserProvisioningService;
 use OCP\AppFramework\Http;
@@ -18,7 +19,7 @@ use Psr\Log\NullLogger;
  * The sync button tells the user why it cannot help, when it cannot.
  */
 class ChatSyncControllerTest extends TestCase {
-	private function controller(?string $w3id, ChatSyncStatusService $status): ChatSyncController {
+	private function controller(?string $w3id, ChatSyncStatusService $status, ?AwarenessPoller $poller = null): ChatSyncController {
 		$user = $this->createMock(IUser::class);
 		$user->method('getUID')->willReturn('alice');
 		$session = $this->createMock(IUserSession::class);
@@ -26,7 +27,7 @@ class ChatSyncControllerTest extends TestCase {
 		$provisioning = $this->createMock(UserProvisioningService::class);
 		$provisioning->method('getLinkedW3id')->willReturn($w3id);
 
-		return new ChatSyncController($this->createMock(IRequest::class), $session, $provisioning, $status, new NullLogger());
+		return new ChatSyncController($this->createMock(IRequest::class), $session, $provisioning, $status, $poller ?? $this->createMock(AwarenessPoller::class), new NullLogger());
 	}
 
 	public function testAnUnlinkedUserIsToldToLinkFirst(): void {
@@ -56,5 +57,29 @@ class ChatSyncControllerTest extends TestCase {
 		$response = $this->controller('@alice', $status)->start();
 
 		$this->assertSame(['state' => 'queued'], $response->getData());
+	}
+
+	/**
+	 * Every open Talk page asks every 30 seconds; one recent poll serves
+	 * them all.
+	 */
+	public function testAPageSkipsAPollThatJustHappened(): void {
+		$poller = $this->createMock(AwarenessPoller::class);
+		$poller->method('secondsSinceLastPoll')->willReturn(3);
+		$poller->expects($this->never())->method('poll');
+
+		$response = $this->controller('@alice', $this->createMock(ChatSyncStatusService::class), $poller)->poll();
+
+		$this->assertFalse($response->getData()['polled']);
+	}
+
+	public function testAPagePollsWhenNothingDidRecently(): void {
+		$poller = $this->createMock(AwarenessPoller::class);
+		$poller->method('secondsSinceLastPoll')->willReturn(120);
+		$poller->expects($this->once())->method('poll')->willReturn(4);
+
+		$response = $this->controller('@alice', $this->createMock(ChatSyncStatusService::class), $poller)->poll();
+
+		$this->assertSame(['polled' => true, 'applied' => 4], $response->getData());
 	}
 }
