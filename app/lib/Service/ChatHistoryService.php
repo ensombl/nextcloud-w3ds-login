@@ -60,31 +60,69 @@ class ChatHistoryService {
 	}
 
 	/**
-	 * Read the given ontologies from each eVault and apply what belongs here.
+	 * Read the given ontologies from each eVault and apply what belongs here,
+	 * oldest first.
+	 *
+	 * Talk orders a conversation by the order things were posted into it,
+	 * not by their timestamps. Applying each eVault in turn posted one
+	 * person's messages, then the next person's, so a conversation came out
+	 * shuffled; everything is gathered first and applied in the order it was
+	 * sent.
 	 *
 	 * @param list<string> $vaults
 	 * @param string[] $ontologies
 	 * @return array{applied: int, complete: bool}
 	 */
 	public function fetchFromVaults(array $vaults, array $ontologies, ?string $from, int $maxPagesPerVault): array {
-		$applied = 0;
+		$packets = [];
 		$complete = true;
 		foreach ($vaults as $vault) {
-			$result = $this->walk($ontologies, $from, $vault, $maxPagesPerVault);
-			$applied += $result['applied'];
+			$result = $this->walk($ontologies, $from, $vault, $maxPagesPerVault, collect: function (array $packet) use (&$packets): void {
+				$id = is_string($packet['id'] ?? null) ? $packet['id'] : '';
+				// One envelope can be listed under more than one eVault.
+				$packets[$id !== '' ? $id : '#' . count($packets)] = $packet;
+			});
 			$complete = $complete && $result['complete'];
+		}
+
+		$ordered = array_values($packets);
+		usort($ordered, static fn (array $a, array $b): int => strcmp(self::sentAt($a), self::sentAt($b)));
+
+		$applied = 0;
+		foreach ($ordered as $packet) {
+			if ($this->processor->process($packet, reapply: true)) {
+				$applied++;
+			}
 		}
 
 		return ['applied' => $applied, 'complete' => $complete];
 	}
 
 	/**
+	 * When a packet's content was sent, as a sortable UTC string. Falls back
+	 * to when the service received it.
+	 *
+	 * @param array<string, mixed> $packet
+	 */
+	private static function sentAt(array $packet): string {
+		$data = is_array($packet['data'] ?? null) ? $packet['data'] : [];
+		foreach ([$data['createdAt'] ?? null, $packet['receivedAt'] ?? null] as $value) {
+			if (is_string($value) && ($time = strtotime($value)) !== false) {
+				return gmdate('Y-m-d\TH:i:s', $time);
+			}
+		}
+
+		return '';
+	}
+
+	/**
 	 * Walk one slice of the stream, optionally restricted to one eVault.
+	 * With $collect, packets are handed to it instead of applied.
 	 *
 	 * @param string[] $ontologies
 	 * @return array{applied: int, complete: bool}
 	 */
-	public function walk(array $ontologies, ?string $from, ?string $evault, int $maxPages, bool $retry = true): array {
+	public function walk(array $ontologies, ?string $from, ?string $evault, int $maxPages, bool $retry = true, ?callable $collect = null): array {
 		$cursor = null;
 		$applied = 0;
 
@@ -104,6 +142,10 @@ class ChatHistoryService {
 			}
 
 			foreach ($result['packets'] as $packet) {
+				if ($collect !== null) {
+					$collect($packet);
+					continue;
+				}
 				// Re-apply rather than skip. Much of this has been seen by the
 				// live poll already; the handlers are idempotent, and a
 				// conversation ingested before someone here was in it only

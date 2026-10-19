@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace OCA\W3dsLogin\Service;
 
 use OCA\W3dsLogin\Db\IdMappingMapper;
+use OCP\ICache;
+use OCP\ICacheFactory;
 use Psr\Log\LoggerInterface;
 
 /**
@@ -26,11 +28,19 @@ class AwarenessPacketProcessor {
 	 */
 	private const EVENT_ENTITY = 'awareness_event';
 
+	/** How long a resolved reference's target is remembered, in seconds. */
+	private const REFERENCE_CACHE_TTL = 3600;
+
+	private ICache $referenceCache;
+
 	public function __construct(
 		private ChatSyncService $chatSyncService,
 		private IdMappingMapper $idMappingMapper,
 		private LoggerInterface $logger,
+		private EvaultClient $evaultClient,
+		ICacheFactory $cacheFactory,
 	) {
+		$this->referenceCache = $cacheFactory->createDistributed('w3ds_login_references');
 	}
 
 	/**
@@ -97,6 +107,20 @@ class AwarenessPacketProcessor {
 
 		if ($data === []) {
 			return false;
+		}
+
+		// A reference is a pointer some platforms leave in each participant's
+		// eVault, naming the real conversation or message and the eVault that
+		// holds it. Taken at face value it is an envelope with no title, no
+		// participants and no content -- which became a room of its own,
+		// holding nobody but its reader, once per reference. Apply what it
+		// points at instead, or nothing.
+		if (($data['isReference'] ?? false) === true) {
+			$target = $this->resolveReference($ontology, $data);
+			if ($target === null) {
+				return false;
+			}
+			[$globalId, $ownerW3id, $data] = $target;
 		}
 
 		// Decide whether this packet concerns us before recording that we have
@@ -187,5 +211,64 @@ class AwarenessPacketProcessor {
 		// announcements carry no conversation of their own and are acted on
 		// through the message that references them.
 		return $ontology === ChatSyncService::CHAT_SCHEMA_ID;
+	}
+
+	/**
+	 * What a reference points at: [global id, owning eName, parsed body],
+	 * or null when it cannot be read, is itself a reference, or is already
+	 * here.
+	 *
+	 * The target is named by `canonicalOwnerEName` and a
+	 * `canonical<Kind>Id` field (`canonicalChatId`, `canonicalMessageId`).
+	 *
+	 * @param array<string, mixed> $data
+	 * @return array{0: string, 1: string, 2: array<string, mixed>}|null
+	 */
+	private function resolveReference(string $ontology, array $data): ?array {
+		$owner = is_string($data['canonicalOwnerEName'] ?? null) ? $data['canonicalOwnerEName'] : '';
+		$targetId = '';
+		foreach ($data as $key => $value) {
+			if (is_string($key) && is_string($value) && $value !== ''
+				&& preg_match('/^canonical[A-Z][A-Za-z]*Id$/', $key) === 1) {
+				$targetId = $value;
+				break;
+			}
+		}
+		if ($owner === '' || $targetId === '') {
+			return null;
+		}
+
+		// Already here under its real id: the reference adds nothing.
+		$entity = match ($ontology) {
+			ChatSyncService::CHAT_SCHEMA_ID => 'chat',
+			ChatSyncService::MESSAGE_SCHEMA_ID => 'message',
+			default => null,
+		};
+		if ($entity === null || $this->idMappingMapper->getLocalId($entity, $targetId) !== null) {
+			return null;
+		}
+
+		$key = md5($owner . '|' . $targetId);
+		$cached = $this->referenceCache->get($key);
+		if (is_string($cached)) {
+			$parsed = json_decode($cached, true);
+		} else {
+			$envelope = $this->evaultClient->fetchMetaEnvelopeById($owner, $targetId);
+			$parsed = is_array($envelope['parsed'] ?? null) ? $envelope['parsed'] : null;
+			if ($parsed !== null) {
+				$this->referenceCache->set($key, (string)json_encode($parsed), self::REFERENCE_CACHE_TTL);
+			}
+		}
+
+		if (!is_array($parsed) || $parsed === [] || ($parsed['isReference'] ?? false) === true) {
+			$this->logger->info('[W3DS Awareness] Could not resolve a reference; ignoring it', [
+				'owner' => $owner,
+				'targetId' => $targetId,
+			]);
+
+			return null;
+		}
+
+		return [$targetId, $owner, $parsed];
 	}
 }

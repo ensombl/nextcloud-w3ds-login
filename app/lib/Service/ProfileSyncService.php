@@ -143,6 +143,42 @@ class ProfileSyncService {
 	}
 
 	/**
+	 * The display name the eVault profile gives this eName, or null when it
+	 * has none or cannot be read. Shares this request's read with
+	 * {@see syncProfile()}.
+	 */
+	public function displayNameFor(string $w3id): ?string {
+		try {
+			$profiles = $this->readProfiles($w3id);
+		} catch (\Throwable) {
+			return null;
+		}
+		if ($profiles === null) {
+			return null;
+		}
+		$name = self::pickDisplayName($profiles['user'] ?? [], $w3id);
+		if ($name === $w3id) {
+			$name = self::text($profiles['professional']['displayName'] ?? null) ?? $w3id;
+		}
+
+		return $name !== $w3id ? $name : null;
+	}
+
+	/**
+	 * The email address the eVault profile gives this eName, or null.
+	 */
+	public function emailFor(string $w3id): ?string {
+		try {
+			$profiles = $this->readProfiles($w3id);
+		} catch (\Throwable) {
+			return null;
+		}
+
+		return $profiles === null ? null
+			: (self::email($profiles['user']['email'] ?? null) ?? self::email($profiles['professional']['email'] ?? null));
+	}
+
+	/**
 	 * Best display name a profile can offer, falling back to the eName.
 	 *
 	 * Profiles are written by several platforms and are not consistent about
