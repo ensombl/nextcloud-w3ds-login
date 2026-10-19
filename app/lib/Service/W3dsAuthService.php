@@ -269,7 +269,7 @@ class W3dsAuthService {
 		$whoisResponse = $client->get($whoisUrl, [
 			'timeout' => 10,
 			'headers' => ['X-ENAME' => $w3id],
-		]);
+		] + OutboundRequestOptions::forUrl($whoisUrl));
 		$whoisBody = json_decode($whoisResponse->getBody(), true);
 
 		$certs = $whoisBody['keyBindingCertificates'] ?? null;

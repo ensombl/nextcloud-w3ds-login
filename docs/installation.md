@@ -138,21 +138,15 @@ sudo -u www-data php occ config:system:get memcache.distributed
 
 Should print `\OC\Memcache\APCu` or `\OC\Memcache\Redis`, not an empty line.
 
-### 6. Allow outbound requests to the registry and eVaults
+### 6. eVaults on bare IP addresses
 
-The W3DS Registry sometimes returns an eVault URL whose host is a bare IP address rather than a DNS name. Nextcloud's built-in HTTP client has SSRF protection that rejects those by default, and you'll see this in the log when a user tries to sign in:
+The W3DS Registry sometimes returns an eVault URL whose host is a bare IP address rather than a DNS name. Nextcloud's DNS pinning can't resolve an IP literal and rejects the request with:
 
 ```
 w3ds_login: Signature verification error: No DNS record found for <ip>
 ```
 
-To allow it:
-
-```bash
-sudo -u www-data php occ config:system:set allow_local_remote_servers --value=true --type=boolean
-```
-
-Strictly speaking this loosens Nextcloud's outbound SSRF guard for all apps, not just this one — the trade-off is acceptable for a single-purpose server but weigh it against your threat model if this box also hosts other apps. The long-term fix lives with the registry/eVault operator: have them return a hostname.
+The app handles this itself: requests to an eVault whose host is a publicly routable IP skip DNS pinning for that one request, with redirects disabled. Hostnames and private or reserved IPs stay under Nextcloud's normal SSRF rules, so you do **not** need `allow_local_remote_servers`. The only case that still needs it is an eVault on a private network address (for example in local development).
 
 ### 7. Connect the awareness service (required for incoming chat)
 
