@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace OCA\W3dsLogin\Tests\Unit;
 
 use OCA\W3dsLogin\BackgroundJob\AwarenessBackfillJob;
+use OCA\W3dsLogin\Db\FetchMarks;
 use OCA\W3dsLogin\Db\W3dsMapping;
 use OCA\W3dsLogin\Db\W3dsMappingMapper;
 use OCA\W3dsLogin\Service\AwarenessClient;
@@ -68,9 +69,9 @@ class AwarenessBackfillJobTest extends TestCase {
 			return $result;
 		});
 		$history->method('vaultsForUser')->with(self::UID)->willReturn($roomVaults);
-		$history->method('fetchFromVaults')->willReturnCallback(function (array $vaults, array $ontologies, ?string $from) use ($result): array {
+		$history->method('fetchFromVaults')->willReturnCallback(function (array $vaults, array $ontologies, int $windowStart) use ($result): array {
 			$this->messageVaults = $vaults;
-			$this->walks[] = ['kind' => 'vaults', 'ontologies' => $ontologies, 'from' => $from, 'evault' => null];
+			$this->walks[] = ['kind' => 'vaults', 'ontologies' => $ontologies, 'from' => gmdate('Y-m-d\TH:i:s\Z', $windowStart), 'evault' => null];
 			return $result;
 		});
 
@@ -91,7 +92,16 @@ class AwarenessBackfillJobTest extends TestCase {
 			$config,
 			new NullLogger(),
 			$this->statusService($config, $client),
+			$this->marks(),
 		);
+	}
+
+	/** No marks yet: every read starts where it would on a first fetch. */
+	private function marks(): FetchMarks {
+		$marks = $this->createMock(FetchMarks::class);
+		$marks->method('from')->willReturnCallback(static fn (string $key, ?int $earliest): ?string => $earliest === null ? null : gmdate('Y-m-d\TH:i:s\Z', $earliest));
+
+		return $marks;
 	}
 
 	private function statusService(IConfig $config, AwarenessClient $client): ChatSyncStatusService {

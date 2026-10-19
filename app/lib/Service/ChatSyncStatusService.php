@@ -39,13 +39,14 @@ class ChatSyncStatusService {
 	}
 
 	/**
-	 * Queue a fresh fetch of this eName's conversations, unless one is
-	 * already under way.
+	 * Queue a fetch of this eName's conversations, unless one is already
+	 * under way: of what arrived since the last one, or with $full of the
+	 * whole history window.
 	 *
 	 * @return array<string, mixed> The status after the request
 	 * @throws \RuntimeException With a message for the user, when it cannot run
 	 */
-	public function request(string $w3id): array {
+	public function request(string $w3id, bool $full = false): array {
 		if (!$this->awarenessClient->isConfigured()) {
 			throw new \RuntimeException('Chat sync is not set up on this server yet: an administrator has to connect the awareness service.');
 		}
@@ -62,6 +63,7 @@ class ChatSyncStatusService {
 		$this->jobList->add(AwarenessBackfillJob::class, [
 			'w3id' => $w3id,
 			'force' => true,
+			'full' => $full,
 			'requestedAt' => $now,
 		]);
 

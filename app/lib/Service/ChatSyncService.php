@@ -27,7 +27,26 @@ class ChatSyncService {
 	 * @var array<string, true>
 	 */
 	private array $roomsOutOfOrder = [];
-	private bool $resequenceOnShutdown = false;
+
+	/**
+	 * Rooms that received anything, whose list position needs refreshing.
+	 *
+	 * @var array<string, true>
+	 */
+	private array $roomsTouched = [];
+
+	/**
+	 * Per room and local user, the newest send time of a message they are
+	 * known to have read.
+	 *
+	 * @var array<string, array<string, \DateTimeImmutable>>
+	 */
+	private array $readUntil = [];
+
+	/** @var array<string, ?string> eName to local uid, for read receipts. */
+	private array $readerUids = [];
+
+	private bool $upkeepOnShutdown = false;
 
 	public const CHAT_SCHEMA_ID = '550e8400-e29b-41d4-a716-446655440003';
 	public const MESSAGE_SCHEMA_ID = '550e8400-e29b-41d4-a716-446655440004';
@@ -896,7 +915,13 @@ class ChatSyncService {
 		// Check for duplicate
 		$existingLocalId = $this->idMappingMapper->getLocalId('message', $globalId);
 		if ($existingLocalId !== null) {
-			return; // Already exists
+			// Already here, but the envelope may say more about who has
+			// read it by now.
+			$roomToken = $this->idMappingMapper->getLocalId('chat', (string)($data['chatId'] ?? ''));
+			if ($roomToken !== null) {
+				$this->noteReadReceipts($roomToken, $data);
+			}
+			return;
 		}
 
 		// Serialise ingest of this envelope across concurrent requests.
@@ -967,6 +992,7 @@ class ChatSyncService {
 		$innerKey = $this->innerMessageKey($chatGlobalId, $data);
 		if ($innerKey !== null && $this->idMappingMapper->getLocalId(self::MESSAGE_INNER_ENTITY, $innerKey) !== null) {
 			$this->rememberMessageCopy($globalId, $ownerW3id);
+			$this->noteReadReceipts($roomToken, $data);
 			return;
 		}
 
@@ -1016,6 +1042,7 @@ class ChatSyncService {
 		if ($this->isAlreadyInRoom($roomToken, $senderUid, $data['createdAt'] ?? null, $mediaUrl !== null && $messageType !== 'system' ? null : $content)) {
 			$this->rememberMessageCopy($globalId, $ownerW3id);
 			$this->rememberInnerMessage($innerKey, $ownerW3id);
+			$this->noteReadReceipts($roomToken, $data);
 			return;
 		}
 
@@ -1078,6 +1105,7 @@ class ChatSyncService {
 					);
 					$this->rememberInnerMessage($innerKey, $ownerW3id);
 					$this->backdateImportedShare((int)$share->getId(), $roomToken, $data['createdAt'] ?? null);
+					$this->noteReadReceipts($roomToken, $data);
 					return;
 				}
 
@@ -1125,6 +1153,7 @@ class ChatSyncService {
 			// fresh envelope.
 			$this->idMappingMapper->storeMapping('message', $localMessageId, $globalId, $ownerW3id, 'inbound');
 			$this->rememberInnerMessage($innerKey, $ownerW3id);
+			$this->noteReadReceipts($roomToken, $data);
 		} catch (\Throwable $e) {
 			$this->logger->error('Failed to create local message from webhook', [
 				'globalId' => $globalId,
@@ -1407,26 +1436,40 @@ class ChatSyncService {
 	}
 
 	/**
-	 * Put every room that received something out of order back in order.
+	 * Bring every room that received messages up to date: its order, who has
+	 * read what, and its place in the conversation list.
 	 *
 	 * Called once at the end of a poll or a history fetch, so a room that
-	 * gained a hundred old messages is resequenced once rather than a hundred
+	 * gained a hundred old messages is handled once rather than a hundred
 	 * times; anything still pending when the process ends is handled then.
 	 */
 	public function flushResequencing(): void {
-		$rooms = array_keys($this->roomsOutOfOrder);
+		$outOfOrder = $this->roomsOutOfOrder;
+		$touched = $this->roomsTouched;
+		$readUntil = $this->readUntil;
 		$this->roomsOutOfOrder = [];
-		foreach ($rooms as $roomToken) {
+		$this->roomsTouched = [];
+		$this->readUntil = [];
+
+		foreach (array_keys($touched + $outOfOrder) as $roomToken) {
 			try {
-				$moved = $this->talkHistory->resequence($roomToken);
-				if ($moved > 0) {
-					$this->logger->info('[W3DS Sync] Restored the order of a conversation', [
-						'roomToken' => $roomToken,
-						'moved' => $moved,
-					]);
+				// Order first: read markers and the list preview name
+				// messages by id, and reordering changes the ids.
+				if (isset($outOfOrder[$roomToken])) {
+					$moved = $this->talkHistory->resequence($roomToken);
+					if ($moved > 0) {
+						$this->logger->info('[W3DS Sync] Restored the order of a conversation', [
+							'roomToken' => $roomToken,
+							'moved' => $moved,
+						]);
+					}
 				}
+				foreach ($readUntil[$roomToken] ?? [] as $uid => $until) {
+					$this->advanceReadMarker($roomToken, (string)$uid, $until);
+				}
+				$this->talkHistory->refreshRoomActivity($roomToken);
 			} catch (\Throwable $e) {
-				$this->logger->warning('[W3DS Sync] Could not restore the order of a conversation', [
+				$this->logger->warning('[W3DS Sync] Could not update a conversation after sync', [
 					'roomToken' => $roomToken,
 					'exception' => $e->getMessage(),
 				]);
@@ -1435,21 +1478,102 @@ class ChatSyncService {
 	}
 
 	private function noteIfOutOfOrder(string $roomToken, mixed $createdAt): void {
+		$this->touchRoom($roomToken);
 		if (!is_string($createdAt) || $createdAt === '' || isset($this->roomsOutOfOrder[$roomToken])) {
 			return;
 		}
 		try {
-			if (!$this->talkHistory->isOlderThanNewest($roomToken, new \DateTimeImmutable($createdAt))) {
-				return;
+			if ($this->talkHistory->isOlderThanNewest($roomToken, new \DateTimeImmutable($createdAt))) {
+				$this->roomsOutOfOrder[$roomToken] = true;
 			}
+		} catch (\Throwable) {
+		}
+	}
+
+	private function touchRoom(string $roomToken): void {
+		$this->roomsTouched[$roomToken] = true;
+		if (!$this->upkeepOnShutdown) {
+			$this->upkeepOnShutdown = true;
+			register_shutdown_function([$this, 'flushResequencing']);
+		}
+	}
+
+	/**
+	 * Remember who here has read this message, from the envelope itself.
+	 *
+	 * Messages carry read receipts (`readBy`, `readByAt`), and whoever sent
+	 * a message has read it. Imported history otherwise arrives entirely
+	 * unread, because Talk only knows what was read in Talk.
+	 *
+	 * @param array<string, mixed> $data
+	 */
+	private function noteReadReceipts(string $roomToken, array $data): void {
+		$createdAt = $data['createdAt'] ?? null;
+		if (!is_string($createdAt) || $createdAt === '') {
+			return;
+		}
+		try {
+			$sentAt = new \DateTimeImmutable($createdAt);
 		} catch (\Throwable) {
 			return;
 		}
 
-		$this->roomsOutOfOrder[$roomToken] = true;
-		if (!$this->resequenceOnShutdown) {
-			$this->resequenceOnShutdown = true;
-			register_shutdown_function([$this, 'flushResequencing']);
+		$readers = [];
+		foreach ([$data['senderEName'] ?? null, $data['senderId'] ?? null] as $sender) {
+			if (is_string($sender) && str_starts_with($sender, '@')) {
+				$readers[] = $sender;
+			}
+		}
+		if (is_array($data['readBy'] ?? null)) {
+			$readers = array_merge($readers, array_filter($data['readBy'], 'is_string'));
+		}
+		if (is_array($data['readByAt'] ?? null)) {
+			$readers = array_merge($readers, array_filter(array_keys($data['readByAt']), 'is_string'));
+		}
+
+		foreach (array_unique($readers) as $reader) {
+			$uid = $this->readerUid($reader);
+			if ($uid === null) {
+				continue;
+			}
+			$current = $this->readUntil[$roomToken][$uid] ?? null;
+			if ($current === null || $sentAt > $current) {
+				$this->readUntil[$roomToken][$uid] = $sentAt;
+			}
+		}
+		$this->touchRoom($roomToken);
+	}
+
+	private function readerUid(string $w3id): ?string {
+		if (!array_key_exists($w3id, $this->readerUids)) {
+			try {
+				$this->readerUids[$w3id] = $this->w3dsMappingMapper->findByW3id($w3id)->getNcUid();
+			} catch (\Throwable) {
+				$this->readerUids[$w3id] = null;
+			}
+		}
+
+		return $this->readerUids[$w3id];
+	}
+
+	/**
+	 * Move a person's read marker forward to the newest message they have
+	 * read. Never back: reading in Talk counts too.
+	 */
+	private function advanceReadMarker(string $roomToken, string $uid, \DateTimeImmutable $until): void {
+		$messageId = $this->talkHistory->lastMessageUpTo($roomToken, $until);
+		if ($messageId === null) {
+			return;
+		}
+		try {
+			$room = \OCP\Server::get(\OCA\Talk\Manager::class)->getRoomByToken($roomToken);
+			$participantService = \OCP\Server::get(\OCA\Talk\Service\ParticipantService::class);
+			$participant = $participantService->getParticipant($room, $uid, false);
+			if ($participant->getAttendee()->getLastReadMessage() < $messageId) {
+				$participantService->updateLastReadMessage($participant, $messageId);
+			}
+		} catch (\Throwable) {
+			// Not in the room (yet): nothing to mark.
 		}
 	}
 

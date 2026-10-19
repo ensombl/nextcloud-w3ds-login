@@ -9,6 +9,36 @@ Entries below are reconstructed from commit history.
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-10-19
+
+### Changed
+
+- History is fetched incrementally. Each slice (a person's own
+  conversations, the network's, and each eVault's messages) remembers where
+  its last complete read began. The next read asks the awareness service only
+  for what arrived since, with a ten-minute overlap. Opening a conversation
+  does the same. "Fetch my W3DS history again" still reads the whole window.
+
+### Fixed
+
+- Imported messages are no longer all unread. Read receipts carried in the
+  messages (`readBy`, `readByAt`), and the fact that a sender has read their
+  own message, move each person's read marker forward. They never move it
+  back.
+- The conversation list is ordered by each conversation's last message.
+  Imported history, and notices that someone was added, used to bring a
+  conversation to the top as if it were active right now.
+- The awareness poll runs on every cron run again. Before 0.11 it was declared
+  time-insensitive, and Nextcloud kept it to the maintenance window long after
+  that changed. An upgrade step clears the stored flag.
+
+### Added
+
+- `occ w3ds_login:fetch-history [<ename>] [--full]` fetches history now, for
+  one identity or everyone who signs in here.
+- `occ w3ds_login:resequence-rooms` also corrects each conversation's place
+  in the list.
+
 ## [0.14.2] - 2026-10-19
 
 ### Fixed

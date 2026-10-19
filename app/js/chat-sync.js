@@ -38,7 +38,8 @@
 
     function request(method, onDone) {
         var xhr = new XMLHttpRequest();
-        xhr.open(method, state.url, true);
+        // Asked for by hand: the whole history, not only what is new.
+        xhr.open(method, method === 'POST' ? state.url + '?full=1' : state.url, true);
         xhr.setRequestHeader('requesttoken', OC.requestToken);
         xhr.setRequestHeader('Accept', 'application/json');
         xhr.onload = function () {

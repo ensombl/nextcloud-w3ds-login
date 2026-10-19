@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace OCA\W3dsLogin\BackgroundJob;
 
 use OCA\W3dsLogin\AppInfo\Application;
+use OCA\W3dsLogin\Db\FetchMarks;
 use OCA\W3dsLogin\Db\W3dsMappingMapper;
 use OCA\W3dsLogin\Service\AwarenessClient;
 use OCA\W3dsLogin\Service\ChatHistoryService;
@@ -63,8 +64,19 @@ class AwarenessBackfillJob extends QueuedJob {
 		private IConfig $config,
 		private LoggerInterface $logger,
 		private ChatSyncStatusService $status,
+		private FetchMarks $marks,
 	) {
 		parent::__construct($time);
+	}
+
+	/**
+	 * Fetch now rather than when cron picks the job up; see the
+	 * w3ds_login:fetch-history command.
+	 *
+	 * @param array{w3id: string, force?: bool, full?: bool} $argument
+	 */
+	public function runNow(array $argument): void {
+		$this->run($argument);
 	}
 
 	protected function run(mixed $argument): void {
@@ -76,6 +88,9 @@ class AwarenessBackfillJob extends QueuedJob {
 		// Asked for by the user, or by Talk on their first visit: run even if
 		// this identity was fetched before, which is the point of asking.
 		$forced = is_array($argument) && ($argument['force'] ?? false) === true;
+		// "Fetch my history again" reads the whole window rather than only
+		// what arrived since the last read.
+		$full = is_array($argument) && ($argument['full'] ?? false) === true;
 
 		if (!$this->awarenessClient->isConfigured()) {
 			$this->logger->info('[W3DS Awareness] Skipping backfill, no awareness service configured', [
@@ -98,7 +113,8 @@ class AwarenessBackfillJob extends QueuedJob {
 		$this->config->setAppValue(Application::APP_ID, $marker, (string)time());
 		$this->status->markRunning($w3id);
 
-		$from = gmdate('Y-m-d\TH:i:s\Z', time() - (self::WINDOW_DAYS * 86400));
+		$windowStart = time() - (self::WINDOW_DAYS * 86400);
+		$from = gmdate('Y-m-d\\TH:i:s\\Z', $windowStart);
 
 		try {
 			// Conversations first. A message whose chat has no local room is
@@ -109,8 +125,9 @@ class AwarenessBackfillJob extends QueuedJob {
 			// conversation from the window, because a group keeps its
 			// conversation in the group's eVault rather than its members',
 			// and only the processor can tell which of those include them.
-			$own = $this->history->walk([ChatSyncService::CHAT_SCHEMA_ID], null, $w3id, self::MAX_PAGES);
-			$groups = $this->history->walk([ChatSyncService::CHAT_SCHEMA_ID], $from, null, self::MAX_PAGES);
+			// Each only since it was last read in full.
+			$own = $this->walkMarked('chats:' . $w3id, $full ? null : $this->marks->from('chats:' . $w3id, null), $w3id);
+			$groups = $this->walkMarked('chats:network', $full ? $from : $this->marks->from('chats:network', $windowStart), null);
 
 			// Then the messages, from every eVault that holds any: each
 			// conversation's own and each participant's. Messages are not
@@ -119,8 +136,9 @@ class AwarenessBackfillJob extends QueuedJob {
 			$messages = $this->history->fetchFromVaults(
 				array_slice($vaults, 0, self::MAX_VAULTS),
 				[ChatSyncService::MESSAGE_SCHEMA_ID, AwarenessClient::FILE_ONTOLOGY],
-				$from,
+				$windowStart,
 				self::MAX_PAGES,
+				$full,
 			);
 		} catch (\Throwable $e) {
 			$this->status->markFailed($w3id, 'Fetching conversations failed. Try again later.');
@@ -145,6 +163,22 @@ class AwarenessBackfillJob extends QueuedJob {
 			'complete' => $complete,
 			'since' => $from,
 		]);
+	}
+
+	/**
+	 * Read conversations from $from and, when the read is complete, mark
+	 * where the next one may start.
+	 *
+	 * @return array{applied: int, complete: bool}
+	 */
+	private function walkMarked(string $key, ?string $from, ?string $evault): array {
+		$startedAt = time();
+		$result = $this->history->walk([ChatSyncService::CHAT_SCHEMA_ID], $from, $evault, self::MAX_PAGES);
+		if ($result['complete']) {
+			$this->marks->set($key, $startedAt);
+		}
+
+		return $result;
 	}
 
 	/**

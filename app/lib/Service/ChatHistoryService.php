@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace OCA\W3dsLogin\Service;
 
 use OCA\W3dsLogin\Db\ChatVaults;
+use OCA\W3dsLogin\Db\FetchMarks;
 use OCP\ICache;
 use OCP\ICacheFactory;
 use Psr\Log\LoggerInterface;
@@ -42,6 +43,7 @@ class ChatHistoryService {
 		private ChatSyncService $chatSync,
 		ICacheFactory $cacheFactory,
 		private LoggerInterface $logger,
+		private FetchMarks $marks,
 	) {
 		$this->cache = $cacheFactory->createDistributed('w3ds_login_chat_history');
 	}
@@ -70,19 +72,30 @@ class ChatHistoryService {
 	 * shuffled; everything is gathered first and applied in the order it was
 	 * sent.
 	 *
+	 * Each eVault is read from where its last complete read began (see
+	 * {@see FetchMarks}), or from $windowStart if it never was, or when a
+	 * $full read is asked for.
+	 *
 	 * @param list<string> $vaults
 	 * @param string[] $ontologies
 	 * @return array{applied: int, complete: bool}
 	 */
-	public function fetchFromVaults(array $vaults, array $ontologies, ?string $from, int $maxPagesPerVault): array {
+	public function fetchFromVaults(array $vaults, array $ontologies, int $windowStart, int $maxPagesPerVault, bool $full = false): array {
 		$packets = [];
 		$complete = true;
 		foreach ($vaults as $vault) {
+			// Only what arrived since this eVault was last read in full.
+			$key = 'vault:' . $vault;
+			$from = $full ? gmdate('Y-m-d\TH:i:s\Z', $windowStart) : $this->marks->from($key, $windowStart);
+			$startedAt = time();
 			$result = $this->walk($ontologies, $from, $vault, $maxPagesPerVault, collect: function (array $packet) use (&$packets): void {
 				$id = is_string($packet['id'] ?? null) ? $packet['id'] : '';
 				// One envelope can be listed under more than one eVault.
 				$packets[$id !== '' ? $id : '#' . count($packets)] = $packet;
 			});
+			if ($result['complete']) {
+				$this->marks->set($key, $startedAt);
+			}
 			$complete = $complete && $result['complete'];
 		}
 
@@ -189,17 +202,26 @@ class ChatHistoryService {
 			return 0;
 		}
 
-		$from = gmdate('Y-m-d\TH:i:s\Z', time() - self::OPEN_ROOM_WINDOW_DAYS * 86400);
+		$windowStart = time() - self::OPEN_ROOM_WINDOW_DAYS * 86400;
 		$applied = 0;
 		foreach ($vaults as $vault) {
+			$key = 'vault:' . $vault;
+			$marked = $this->marks->get($key) !== null;
+			$startedAt = time();
 			// No retries: someone is waiting, and the next open tries again.
-			$applied += $this->walk(
+			$result = $this->walk(
 				[ChatSyncService::MESSAGE_SCHEMA_ID, AwarenessClient::FILE_ONTOLOGY],
-				$from,
+				$this->marks->from($key, $windowStart),
 				$vault,
 				self::OPEN_ROOM_MAX_PAGES,
 				retry: false,
-			)['applied'];
+			);
+			$applied += $result['applied'];
+			// Only advance a mark the read continued from: an eVault never
+			// read in full still has history before this window.
+			if ($marked && $result['complete']) {
+				$this->marks->set($key, $startedAt);
+			}
 		}
 
 		$this->chatSync->flushResequencing();
