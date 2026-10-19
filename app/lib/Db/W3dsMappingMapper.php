@@ -47,6 +47,31 @@ class W3dsMappingMapper extends QBMapper {
 		$qb->executeStatement();
 	}
 
+	/**
+	 * Move $w3id from $fromUid to $toUid in one transaction, dropping any
+	 * other mapping $toUid had. Returns false, changing nothing, when the
+	 * eName is no longer mapped to $fromUid.
+	 */
+	public function reassign(string $w3id, string $fromUid, string $toUid): bool {
+		$this->db->beginTransaction();
+		try {
+			$mapping = $this->findByW3id($w3id);
+			if ($mapping->getNcUid() !== $fromUid) {
+				$this->db->rollBack();
+				return false;
+			}
+			$this->deleteByNcUid($toUid);
+			$mapping->setNcUid($toUid);
+			$this->update($mapping);
+			$this->db->commit();
+
+			return true;
+		} catch (\Throwable $e) {
+			$this->db->rollBack();
+			throw $e;
+		}
+	}
+
 	public function existsByW3id(string $w3id): bool {
 		try {
 			$this->findByW3id($w3id);

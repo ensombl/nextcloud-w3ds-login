@@ -5,7 +5,9 @@ declare(strict_types=1);
 namespace OCA\W3dsLogin\Tests\Unit;
 
 use OCA\W3dsLogin\Controller\AuthController;
+use OCA\W3dsLogin\Service\AccountMergeService;
 use OCA\W3dsLogin\Service\LinkHintService;
+use OCA\W3dsLogin\Service\ProfileSyncService;
 use OCA\W3dsLogin\Service\UserProvisioningService;
 use OCA\W3dsLogin\Service\W3dsAuthService;
 use OCP\AppFramework\Controller;
@@ -62,6 +64,8 @@ class AuthControllerLinkHintTest extends TestCase {
 		$this->set($controller, AuthController::class, 'jobList', $this->createMock(IJobList::class));
 		$this->set($controller, AuthController::class, 'logger', new NullLogger());
 		$this->set($controller, AuthController::class, 'hints', $hints);
+		$this->set($controller, AuthController::class, 'profileSync', $this->createMock(ProfileSyncService::class));
+		$this->set($controller, AuthController::class, 'accountMerge', $this->createMock(AccountMergeService::class));
 
 		$response = $controller->callback();
 

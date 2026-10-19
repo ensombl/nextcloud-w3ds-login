@@ -42,6 +42,7 @@ $unlinkUrl = $_['unlinkUrl'];
             <button id="w3ds-link-btn" type="button" class="button primary">
                 Link W3DS identity
             </button>
+            <p id="w3ds-link-error" class="w3ds-settings-error" role="alert" aria-live="assertive" hidden></p>
         <?php endif; ?>
     </div>
 
@@ -80,6 +81,11 @@ $unlinkUrl = $_['unlinkUrl'];
         margin-top: 0.5rem;
         font-size: 0.85rem;
         color: var(--color-text-maxcontrast, #767676);
+    }
+
+    #w3ds-settings .w3ds-settings-error {
+        margin-top: 0.5rem;
+        color: var(--color-error, #e9322d);
     }
 
     /* Modal */

@@ -49,30 +49,40 @@
         xhr.setRequestHeader('Accept', 'application/json');
 
         xhr.onload = function () {
-            if (xhr.status !== 200) {
-                linkBtn.disabled = false;
-                linkBtn.textContent = 'Link W3DS identity';
-                return;
-            }
-
-            var data;
+            var data = null;
             try {
                 data = JSON.parse(xhr.responseText);
-            } catch (e) {
-                linkBtn.disabled = false;
-                linkBtn.textContent = 'Link W3DS identity';
+            } catch (e) {}
+
+            if (xhr.status !== 200 || !data || !data.qrSvg) {
+                failStart(data && data.error ? data.error : 'Could not start linking. Try again.');
                 return;
             }
 
+            showLinkError('');
             showModal(data);
         };
 
         xhr.onerror = function () {
-            linkBtn.disabled = false;
-            linkBtn.textContent = 'Link W3DS identity';
+            failStart('Network error. Check your connection and try again.');
         };
 
         xhr.send();
+    }
+
+    function failStart(message) {
+        linkBtn.disabled = false;
+        linkBtn.textContent = 'Link W3DS identity';
+        showLinkError(message);
+    }
+
+    function showLinkError(message) {
+        var errorEl = document.getElementById('w3ds-link-error');
+        if (!errorEl) {
+            return;
+        }
+        errorEl.textContent = message;
+        errorEl.hidden = message === '';
     }
 
     function showModal(data) {

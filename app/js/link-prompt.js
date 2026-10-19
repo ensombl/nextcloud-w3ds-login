@@ -113,7 +113,7 @@
         request('POST', state.linkStartUrl, function (code, data) {
             if (code !== 200 || !data) {
                 connectBtn.disabled = false;
-                setStatus('Could not start linking. Try again.', 'error');
+                setStatus((data && data.error) || (code === 0 ? 'Network error. Try again.' : 'Could not start linking. Try again.'), 'error');
                 return;
             }
             while (qr.firstChild) {
