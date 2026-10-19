@@ -49,9 +49,11 @@ class AwarenessPollCommand extends Command {
 			$output->writeln('<comment>The awareness service is not configured (Administration settings → W3DS); waiting for it.</comment>');
 		}
 
-		if (function_exists('pcntl_async_signals') && defined('SIGTERM') && defined('SIGINT')) {
+		if (function_exists('pcntl_async_signals')) {
 			pcntl_async_signals(true);
-			foreach ([(int)constant('SIGTERM'), (int)constant('SIGINT')] as $signal) {
+			// SIGTERM and SIGINT by number: the constants only exist where
+			// pcntl is loaded, and static analysis runs both with and without.
+			foreach ([15, 2] as $signal) {
 				pcntl_signal($signal, function (): void {
 					$this->stopping = true;
 				});
