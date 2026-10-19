@@ -236,13 +236,13 @@ class AvatarSyncService {
 
 	/**
 	 * Fetch an avatar over HTTP. Uses Nextcloud's HTTP client so the admin's
-	 * proxy and SSRF settings apply -- an eVault host may legitimately be an
-	 * IP address, which is governed by `allow_local_remote_servers`.
+	 * proxy and SSRF settings apply -- an eVault host may legitimately be a
+	 * public IP address, see OutboundRequestOptions.
 	 */
 	private function fetchUrl(string $url): ?string {
 		$response = $this->clientService->newClient()->get($url, [
 			'timeout' => self::REQUEST_TIMEOUT,
-		]);
+		] + OutboundRequestOptions::forUrl($url));
 
 		$contentType = $response->getHeader('Content-Type');
 		if ($contentType !== '') {

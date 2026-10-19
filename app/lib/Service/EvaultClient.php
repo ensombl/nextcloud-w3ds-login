@@ -161,7 +161,7 @@ class EvaultClient {
 				'timeout' => self::HTTP_TIMEOUT,
 				'headers' => $headers,
 				'body' => json_encode($payload),
-			]),
+			] + OutboundRequestOptions::forUrl($url)),
 			$w3id,
 		);
 
@@ -495,7 +495,7 @@ class EvaultClient {
 				fn (): \OCP\Http\Client\IResponse => $client->get($url, [
 					'timeout' => self::LIST_HTTP_TIMEOUT,
 					'headers' => $headers,
-				]),
+				] + OutboundRequestOptions::forUrl($url)),
 				$w3id,
 			);
 			$body = json_decode($response->getBody(), true);
@@ -793,7 +793,7 @@ class EvaultClient {
 		try {
 			$response = $this->clientService->newClient()->get($publicUrl, [
 				'timeout' => self::HTTP_TIMEOUT,
-			]);
+			] + OutboundRequestOptions::forUrl($publicUrl));
 
 			$body = (string)$response->getBody();
 			if ($body === '') {
