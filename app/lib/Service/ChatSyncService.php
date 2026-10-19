@@ -43,6 +43,14 @@ class ChatSyncService {
 	 */
 	private array $readUntil = [];
 
+	/**
+	 * Per room, when its conversation record says it was last changed: what
+	 * a room without messages is dated by in the conversation list.
+	 *
+	 * @var array<string, \DateTimeImmutable>
+	 */
+	private array $chatTimes = [];
+
 	/** @var array<string, ?string> eName to local uid, for read receipts. */
 	private array $readerUids = [];
 
@@ -872,6 +880,8 @@ class ChatSyncService {
 	 * @param array<string, mixed> $data
 	 */
 	private function rememberChatVaults(string $roomToken, array $data, string $ownerW3id): void {
+		$this->noteChatTime($roomToken, $data);
+
 		try {
 			$vaults = [$ownerW3id];
 			foreach (['ename', 'groupEname', 'groupEName'] as $field) {
@@ -1447,9 +1457,11 @@ class ChatSyncService {
 		$outOfOrder = $this->roomsOutOfOrder;
 		$touched = $this->roomsTouched;
 		$readUntil = $this->readUntil;
+		$chatTimes = $this->chatTimes;
 		$this->roomsOutOfOrder = [];
 		$this->roomsTouched = [];
 		$this->readUntil = [];
+		$this->chatTimes = [];
 
 		foreach (array_keys($touched + $outOfOrder) as $roomToken) {
 			try {
@@ -1467,7 +1479,7 @@ class ChatSyncService {
 				foreach ($readUntil[$roomToken] ?? [] as $uid => $until) {
 					$this->advanceReadMarker($roomToken, (string)$uid, $until);
 				}
-				$this->talkHistory->refreshRoomActivity($roomToken);
+				$this->talkHistory->refreshRoomActivity($roomToken, $chatTimes[$roomToken] ?? null);
 			} catch (\Throwable $e) {
 				$this->logger->warning('[W3DS Sync] Could not update a conversation after sync', [
 					'roomToken' => $roomToken,
@@ -1495,6 +1507,26 @@ class ChatSyncService {
 		if (!$this->upkeepOnShutdown) {
 			$this->upkeepOnShutdown = true;
 			register_shutdown_function([$this, 'flushResequencing']);
+		}
+	}
+
+	/**
+	 * Remember when the conversation record says it last changed, for
+	 * dating a room that has no messages here.
+	 *
+	 * @param array<string, mixed> $data
+	 */
+	private function noteChatTime(string $roomToken, array $data): void {
+		foreach ([$data['updatedAt'] ?? null, $data['createdAt'] ?? null] as $value) {
+			if (!is_string($value) || $value === '') {
+				continue;
+			}
+			try {
+				$this->chatTimes[$roomToken] = new \DateTimeImmutable($value);
+				$this->touchRoom($roomToken);
+				return;
+			} catch (\Throwable) {
+			}
 		}
 	}
 

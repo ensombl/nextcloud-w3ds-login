@@ -268,9 +268,10 @@ class TalkHistory {
 	 * message, and updates both whenever anything is written -- an imported
 	 * message from last month, or a notice that someone was added -- so an
 	 * imported conversation jumped to the top as if active right now. Both
-	 * are set from the newest entry by the time it was sent.
+	 * are set from the newest entry by the time it was sent; a conversation
+	 * with no messages here is dated by $chatTime, from its own record.
 	 */
-	public function refreshRoomActivity(string $roomToken): void {
+	public function refreshRoomActivity(string $roomToken, ?\DateTimeInterface $chatTime = null): void {
 		$roomId = $this->roomId($roomToken);
 		if ($roomId === null) {
 			return;
@@ -289,6 +290,17 @@ class TalkHistory {
 		$newest = $result->fetch();
 		$result->closeCursor();
 		if ($newest === false) {
+			// Nothing said here yet, or only before the history window: the
+			// conversation dates from its own record, not from the notice
+			// written when this server created the room.
+			if ($chatTime !== null) {
+				$qb = $this->db->getQueryBuilder();
+				$qb->update('talk_rooms')
+					->set('last_activity', $qb->createNamedParameter(\DateTimeImmutable::createFromInterface($chatTime), IQueryBuilder::PARAM_DATE))
+					->where($qb->expr()->eq('id', $qb->createNamedParameter($roomId, IQueryBuilder::PARAM_INT)))
+					->executeStatement();
+				$this->clearTalkCaches();
+			}
 			return;
 		}
 
