@@ -83,6 +83,7 @@ class AwarenessPoller {
 		private ILockingProvider $lockingProvider,
 		private IAppConfig $appConfig,
 		private LoggerInterface $logger,
+		private ChatSyncService $chatSync,
 	) {
 	}
 
@@ -115,6 +116,8 @@ class AwarenessPoller {
 
 			$this->ensureSubscription();
 			$applied = $this->drain();
+			// A message delivered after newer ones lands out of order.
+			$this->chatSync->flushResequencing();
 			$this->config->setAppValue(Application::APP_ID, self::LAST_POLLED_KEY, (string)time());
 
 			return $applied;

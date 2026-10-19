@@ -39,6 +39,7 @@ class ChatHistoryService {
 		private AwarenessClient $awarenessClient,
 		private AwarenessPacketProcessor $processor,
 		private ChatVaults $chatVaults,
+		private ChatSyncService $chatSync,
 		ICacheFactory $cacheFactory,
 		private LoggerInterface $logger,
 	) {
@@ -94,6 +95,7 @@ class ChatHistoryService {
 				$applied++;
 			}
 		}
+		$this->chatSync->flushResequencing();
 
 		return ['applied' => $applied, 'complete' => $complete];
 	}
@@ -199,6 +201,8 @@ class ChatHistoryService {
 				retry: false,
 			)['applied'];
 		}
+
+		$this->chatSync->flushResequencing();
 
 		return $applied;
 	}

@@ -20,6 +20,15 @@ class ChatSyncService {
 	/** Mapping rows identifying a message across its copies; see innerMessageKey(). */
 	private const MESSAGE_INNER_ENTITY = 'message_inner';
 
+	/**
+	 * Rooms that received something older than their newest entry, and so
+	 * need their order restored; see flushResequencing().
+	 *
+	 * @var array<string, true>
+	 */
+	private array $roomsOutOfOrder = [];
+	private bool $resequenceOnShutdown = false;
+
 	public const CHAT_SCHEMA_ID = '550e8400-e29b-41d4-a716-446655440003';
 	public const MESSAGE_SCHEMA_ID = '550e8400-e29b-41d4-a716-446655440004';
 
@@ -1010,6 +1019,11 @@ class ChatSyncService {
 			return;
 		}
 
+		// Talk places an entry by when it is written, not when it was sent.
+		// Something older than what the room already shows would land below
+		// newer messages; note the room so its order is restored afterwards.
+		$this->noteIfOutOfOrder($roomToken, $data['createdAt'] ?? null);
+
 		try {
 			// An attachment message materialises as a real Talk file share
 			// rather than text: download the blob, drop it in the recipient's
@@ -1389,6 +1403,53 @@ class ChatSyncService {
 		try {
 			$this->idMappingMapper->storeMapping('message', 'copy:' . $globalId, $globalId, $ownerW3id, 'inbound');
 		} catch (\Throwable) {
+		}
+	}
+
+	/**
+	 * Put every room that received something out of order back in order.
+	 *
+	 * Called once at the end of a poll or a history fetch, so a room that
+	 * gained a hundred old messages is resequenced once rather than a hundred
+	 * times; anything still pending when the process ends is handled then.
+	 */
+	public function flushResequencing(): void {
+		$rooms = array_keys($this->roomsOutOfOrder);
+		$this->roomsOutOfOrder = [];
+		foreach ($rooms as $roomToken) {
+			try {
+				$moved = $this->talkHistory->resequence($roomToken);
+				if ($moved > 0) {
+					$this->logger->info('[W3DS Sync] Restored the order of a conversation', [
+						'roomToken' => $roomToken,
+						'moved' => $moved,
+					]);
+				}
+			} catch (\Throwable $e) {
+				$this->logger->warning('[W3DS Sync] Could not restore the order of a conversation', [
+					'roomToken' => $roomToken,
+					'exception' => $e->getMessage(),
+				]);
+			}
+		}
+	}
+
+	private function noteIfOutOfOrder(string $roomToken, mixed $createdAt): void {
+		if (!is_string($createdAt) || $createdAt === '' || isset($this->roomsOutOfOrder[$roomToken])) {
+			return;
+		}
+		try {
+			if (!$this->talkHistory->isOlderThanNewest($roomToken, new \DateTimeImmutable($createdAt))) {
+				return;
+			}
+		} catch (\Throwable) {
+			return;
+		}
+
+		$this->roomsOutOfOrder[$roomToken] = true;
+		if (!$this->resequenceOnShutdown) {
+			$this->resequenceOnShutdown = true;
+			register_shutdown_function([$this, 'flushResequencing']);
 		}
 	}
 

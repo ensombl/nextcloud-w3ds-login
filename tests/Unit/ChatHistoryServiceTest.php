@@ -8,6 +8,7 @@ use OCA\W3dsLogin\Db\ChatVaults;
 use OCA\W3dsLogin\Service\AwarenessClient;
 use OCA\W3dsLogin\Service\AwarenessPacketProcessor;
 use OCA\W3dsLogin\Service\ChatHistoryService;
+use OCA\W3dsLogin\Service\ChatSyncService;
 use OCP\ICache;
 use OCP\ICacheFactory;
 use PHPUnit\Framework\TestCase;
@@ -45,7 +46,7 @@ class ChatHistoryServiceTest extends TestCase {
 
 		// Retries pause for real seconds; not here.
 		$service = $this->getMockBuilder(ChatHistoryService::class)
-			->setConstructorArgs([$client, $processor ?? $this->createMock(AwarenessPacketProcessor::class), $this->vaults, $factory, new NullLogger()])
+			->setConstructorArgs([$client, $processor ?? $this->createMock(AwarenessPacketProcessor::class), $this->vaults, $this->createMock(ChatSyncService::class), $factory, new NullLogger()])
 			->onlyMethods(['pause'])
 			->getMock();
 

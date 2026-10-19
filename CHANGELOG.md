@@ -9,6 +9,24 @@ Entries below are reconstructed from commit history.
 
 ## [Unreleased]
 
+## [0.14.2] - 2026-10-19
+
+### Fixed
+
+- Conversations stay in the order messages were sent. Talk shows a
+  conversation in the order entries were written, so anything imported late
+  landed below newer messages: history read from several eVaults, a message
+  delivered late, one found when a conversation was opened.
+  - When that happens, the room's existing ids are handed out again in send
+    order. Replies, reactions, attachments, threads, reminders and read
+    markers move with their message.
+  - Only messages and files are reordered; system notices keep their place.
+
+### Added
+
+- `occ w3ds_login:resequence-rooms [--room=<token>]` puts conversations
+  imported earlier back in order.
+
 ## [0.14.1] - 2026-10-19
 
 ### Fixed

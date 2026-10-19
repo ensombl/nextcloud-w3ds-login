@@ -8,6 +8,15 @@ use OCP\DB\QueryBuilder\IQueryBuilder;
 use OCP\IDBConnection;
 
 /**
+ * Keeps imported conversations in the order things were said.
+ *
+ * Talk orders a conversation by the id each entry got when it was written,
+ * not by its timestamp. Anything written late therefore lands at the bottom:
+ * history read from several eVaults, a message delivered after newer ones,
+ * one only found when the conversation was opened. resequence() hands the
+ * room's ids back out in time order; backdateShare() gives an imported file
+ * the time it was sent.
+ *
  * Puts imported attachments at the time they were sent.
  *
  * Talk posts a file share's chat entry at the moment the share is created,
@@ -99,5 +108,227 @@ class TalkHistory {
 		$result->closeCursor();
 
 		return $found;
+	}
+
+	/**
+	 * Whether the newest entry in the room was sent after $at -- i.e. whether
+	 * something sent at $at, written now, would land out of order.
+	 */
+	public function isOlderThanNewest(string $roomToken, \DateTimeInterface $at): bool {
+		$roomId = $this->roomId($roomToken);
+		if ($roomId === null) {
+			return false;
+		}
+
+		$qb = $this->db->getQueryBuilder();
+		$qb->select($qb->func()->max('creation_timestamp'))
+			->from('comments')
+			->where($qb->expr()->eq('object_type', $qb->createNamedParameter('chat')))
+			->andWhere($qb->expr()->eq('object_id', $qb->createNamedParameter((string)$roomId)))
+			->andWhere($qb->expr()->in('verb', $qb->createNamedParameter(self::REORDERED, IQueryBuilder::PARAM_STR_ARRAY)));
+		$result = $qb->executeQuery();
+		$newest = $result->fetchOne();
+		$result->closeCursor();
+
+		return is_string($newest) && strtotime($newest) > $at->getTimestamp();
+	}
+
+	/**
+	 * Put a room's entries back in the order they were sent.
+	 *
+	 * The ids the room already holds are handed out again by time, so the
+	 * entries keep their text, authors and timestamps and only change place;
+	 * every reference to an entry by id is moved with it. A room already in
+	 * order is left untouched.
+	 *
+	 * @return int Entries that moved.
+	 */
+	public function resequence(string $roomToken): int {
+		$roomId = $this->roomId($roomToken);
+		if ($roomId === null) {
+			return 0;
+		}
+
+		$qb = $this->db->getQueryBuilder();
+		$qb->select('id', 'creation_timestamp')
+			->from('comments')
+			->where($qb->expr()->eq('object_type', $qb->createNamedParameter('chat')))
+			->andWhere($qb->expr()->eq('object_id', $qb->createNamedParameter((string)$roomId)))
+			->andWhere($qb->expr()->in('verb', $qb->createNamedParameter(self::REORDERED, IQueryBuilder::PARAM_STR_ARRAY)))
+			->orderBy('id');
+		$result = $qb->executeQuery();
+		$rows = $result->fetchAll();
+		$result->closeCursor();
+
+		$moves = self::plan(array_map(static fn (array $r): array => [(int)$r['id'], (string)$r['creation_timestamp']], $rows));
+		if ($moves === []) {
+			return 0;
+		}
+
+		$this->db->beginTransaction();
+		try {
+			// Through temporary ids above every id in use, so no step collides
+			// with an entry that has not moved yet. Not negative: id columns
+			// are unsigned on MySQL and MariaDB.
+			$temp = [];
+			$next = $this->maxCommentId() + 1;
+			foreach ($moves as $old => $new) {
+				$temp[$old] = $next++;
+			}
+
+			foreach ([['comments', 'id'], ...self::REFERENCES] as [$table, $column]) {
+				if (!$this->db->tableExists($table)) {
+					continue;
+				}
+				foreach ($moves as $old => $new) {
+					$this->setColumn($table, $column, $old, $temp[$old]);
+				}
+				foreach ($moves as $old => $new) {
+					$this->setColumn($table, $column, $temp[$old], $new);
+				}
+			}
+
+			$this->moveMappings($moves);
+			$this->db->commit();
+		} catch (\Throwable $e) {
+			$this->db->rollBack();
+			throw $e;
+		}
+
+		$this->clearTalkCaches();
+
+		return count($moves);
+	}
+
+	/**
+	 * Which id each entry should have so that ids follow send time: the
+	 * room's own ids, sorted, given to its entries sorted by time. Only
+	 * entries that change are returned, as [old id => new id].
+	 *
+	 * @param list<array{0: int, 1: string}> $entries [id, sent at]
+	 * @return array<int, int>
+	 */
+	public static function plan(array $entries): array {
+		$ids = array_map(static fn (array $e): int => $e[0], $entries);
+		sort($ids);
+
+		$byTime = $entries;
+		usort($byTime, static function (array $a, array $b): int {
+			$order = strtotime($a[1]) <=> strtotime($b[1]);
+			return $order !== 0 ? $order : $a[0] <=> $b[0];
+		});
+
+		$moves = [];
+		foreach ($byTime as $i => [$id]) {
+			if ($ids[$i] !== $id) {
+				$moves[$id] = $ids[$i];
+			}
+		}
+
+		return $moves;
+	}
+
+	/**
+	 * What gets reordered: messages and files. System entries ("created the
+	 * conversation", "added you") are dated when they were written, while
+	 * imported messages carry when they were sent, so ordering those by time
+	 * would move every notice below the whole imported history.
+	 */
+	private const REORDERED = ['comment', 'object_shared', 'comment_deleted'];
+
+	/** Every column that refers to a chat entry by id. */
+	private const REFERENCES = [
+		['comments', 'parent_id'],
+		['comments', 'topmost_parent_id'],
+		['reactions', 'parent_id'],
+		['talk_attachments', 'message_id'],
+		['talk_attendees', 'last_read_message'],
+		['talk_attendees', 'last_mention_message'],
+		['talk_attendees', 'last_mention_direct'],
+		['talk_rooms', 'last_message'],
+		['talk_reminders', 'message_id'],
+		['talk_threads', 'id'],
+		['talk_threads', 'last_message_id'],
+		['talk_thread_attendees', 'thread_id'],
+		['talk_scheduled_msg', 'parent_id'],
+	];
+
+	private function setColumn(string $table, string $column, int $from, int $to): void {
+		$qb = $this->db->getQueryBuilder();
+		$qb->update($table)
+			->set($column, $qb->createNamedParameter($to, IQueryBuilder::PARAM_INT))
+			->where($qb->expr()->eq($column, $qb->createNamedParameter($from, IQueryBuilder::PARAM_INT)))
+			->executeStatement();
+	}
+
+	private function maxCommentId(): int {
+		$qb = $this->db->getQueryBuilder();
+		$qb->select($qb->func()->max('id'))->from('comments');
+		$result = $qb->executeQuery();
+		$max = (int)$result->fetchOne();
+		$result->closeCursor();
+
+		return $max;
+	}
+
+	/**
+	 * This app's own record of which envelope each entry mirrors.
+	 *
+	 * @param array<int, int> $moves
+	 */
+	private function moveMappings(array $moves): void {
+		foreach ($moves as $old => $new) {
+			$qb = $this->db->getQueryBuilder();
+			$qb->update('w3ds_id_mappings')
+				->set('local_id', $qb->createNamedParameter('resequence:' . $new))
+				->where($qb->expr()->eq('entity_type', $qb->createNamedParameter('message')))
+				->andWhere($qb->expr()->eq('local_id', $qb->createNamedParameter((string)$old)))
+				->executeStatement();
+		}
+		foreach ($moves as $new) {
+			$qb = $this->db->getQueryBuilder();
+			$qb->update('w3ds_id_mappings')
+				->set('local_id', $qb->createNamedParameter((string)$new))
+				->where($qb->expr()->eq('entity_type', $qb->createNamedParameter('message')))
+				->andWhere($qb->expr()->eq('local_id', $qb->createNamedParameter('resequence:' . $new)))
+				->executeStatement();
+		}
+	}
+
+	/**
+	 * Talk caches each room's last message id, unread counts and threads;
+	 * all of them name entries by id.
+	 */
+	private function clearTalkCaches(): void {
+		try {
+			$factory = \OCP\Server::get(\OCP\ICacheFactory::class);
+			$prefixes = ['talk.threads'];
+			$cachePrefix = 'OCA\\Talk\\CachePrefix';
+			foreach (['CHAT_LAST_MESSAGE_ID', 'CHAT_UNREAD_COUNT'] as $name) {
+				if (defined($cachePrefix . '::' . $name)) {
+					$prefixes[] = (string)constant($cachePrefix . '::' . $name);
+				}
+			}
+			foreach ($prefixes as $prefix) {
+				$factory->createDistributed($prefix)->clear();
+			}
+		} catch (\Throwable) {
+			// Stale for at most their TTL.
+		}
+	}
+
+	private function roomId(string $roomToken): ?int {
+		if (!$this->db->tableExists('talk_rooms')) {
+			return null;
+		}
+		$qb = $this->db->getQueryBuilder();
+		$qb->select('id')->from('talk_rooms')
+			->where($qb->expr()->eq('token', $qb->createNamedParameter($roomToken)))
+			->setMaxResults(1);
+		$result = $qb->executeQuery();
+		$roomId = $result->fetchOne();
+		$result->closeCursor();
+
+		return $roomId === false ? null : (int)$roomId;
 	}
 }
