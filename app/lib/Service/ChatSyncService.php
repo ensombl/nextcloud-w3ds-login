@@ -7,6 +7,7 @@ namespace OCA\W3dsLogin\Service;
 use OCA\W3dsLogin\AppInfo\Application;
 use OCA\W3dsLogin\Db\ChatVaults;
 use OCA\W3dsLogin\Db\IdMappingMapper;
+use OCA\W3dsLogin\Db\TalkHistory;
 use OCA\W3dsLogin\Db\W3dsMappingMapper;
 use OCP\AppFramework\Db\DoesNotExistException;
 use OCP\ICache;
@@ -16,6 +17,9 @@ use OCP\IUserSession;
 use Psr\Log\LoggerInterface;
 
 class ChatSyncService {
+	/** Mapping rows identifying a message across its copies; see innerMessageKey(). */
+	private const MESSAGE_INNER_ENTITY = 'message_inner';
+
 	public const CHAT_SCHEMA_ID = '550e8400-e29b-41d4-a716-446655440003';
 	public const MESSAGE_SCHEMA_ID = '550e8400-e29b-41d4-a716-446655440004';
 
@@ -98,6 +102,7 @@ class ChatSyncService {
 		private IUserManager $userManager,
 		private IUserSession $userSession,
 		private ChatVaults $chatVaults,
+		private TalkHistory $talkHistory,
 	) {
 		$this->cache = $cacheFactory->createDistributed(Application::APP_ID);
 	}
@@ -706,6 +711,9 @@ class ChatSyncService {
 			$globalId = $this->evaultClient->createMetaEnvelope($w3id, self::MESSAGE_SCHEMA_ID, $payload, $acl);
 			if ($globalId !== null) {
 				$this->idMappingMapper->storeMapping('message', $localId, $globalId, $w3id);
+				// Copies of this message come back from participants' eVaults
+				// under other envelope ids; the inner id is how they are known.
+				$this->rememberInnerMessage($this->innerMessageKey($chatGlobalId, $payload), $w3id);
 				$this->logger->info('[W3DS Sync] Pushed new message to eVault', [
 					'localId' => $localId,
 					'globalId' => $globalId,
@@ -942,6 +950,17 @@ class ChatSyncService {
 			return;
 		}
 
+		// The same message exists as several envelopes: the sender's, and a
+		// copy in each participant's eVault, every one with its own envelope
+		// id. They share the inner `id`, which senders keep stable across
+		// copies for exactly this, so a second copy is recognised here rather
+		// than posted again.
+		$innerKey = $this->innerMessageKey($chatGlobalId, $data);
+		if ($innerKey !== null && $this->idMappingMapper->getLocalId(self::MESSAGE_INNER_ENTITY, $innerKey) !== null) {
+			$this->rememberMessageCopy($globalId, $ownerW3id);
+			return;
+		}
+
 		// Prefer senderEName, fall back to senderId, which we now write as an
 		// eName but which may be a profile envelope ID in older envelopes.
 		$senderEName = is_string($data['senderEName'] ?? null) ? $data['senderEName'] : '';
@@ -982,12 +1001,20 @@ class ChatSyncService {
 		[$data, $rawContent, $content, $messageType, $forwardedFrom]
 			= $this->resolveForwardedMessage($data, $rawContent, $content, $messageType);
 
+		// A copy of something imported before copies carried an identity
+		// here: the same person, at the same moment, saying the same thing.
+		$mediaUrl = $this->pickAttachmentUri($data);
+		if ($this->isAlreadyInRoom($roomToken, $senderUid, $data['createdAt'] ?? null, $mediaUrl !== null && $messageType !== 'system' ? null : $content)) {
+			$this->rememberMessageCopy($globalId, $ownerW3id);
+			$this->rememberInnerMessage($innerKey, $ownerW3id);
+			return;
+		}
+
 		try {
 			// An attachment message materialises as a real Talk file share
 			// rather than text: download the blob, drop it in the recipient's
 			// Files, and share it into the room. Talk generates its own
 			// comment for the share, so there's nothing further to post.
-			$mediaUrl = $this->pickAttachmentUri($data);
 
 			// A resolvable `mediaUrl` is what makes this an attachment, not
 			// the declared `type`. The schema's enum is advisory about
@@ -1035,6 +1062,8 @@ class ChatSyncService {
 						$ownerW3id,
 						'inbound',
 					);
+					$this->rememberInnerMessage($innerKey, $ownerW3id);
+					$this->backdateImportedShare((int)$share->getId(), $roomToken, $data['createdAt'] ?? null);
 					return;
 				}
 
@@ -1081,6 +1110,7 @@ class ChatSyncService {
 			// a concurrent poller from pushing this same message back out as a
 			// fresh envelope.
 			$this->idMappingMapper->storeMapping('message', $localMessageId, $globalId, $ownerW3id, 'inbound');
+			$this->rememberInnerMessage($innerKey, $ownerW3id);
 		} catch (\Throwable $e) {
 			$this->logger->error('Failed to create local message from webhook', [
 				'globalId' => $globalId,
@@ -1322,6 +1352,75 @@ class ChatSyncService {
 			return is_string($name) && trim($name) !== '' ? trim($name) : null;
 		} catch (\Throwable) {
 			return null;
+		}
+	}
+
+	/**
+	 * Identity of a message across its copies: the conversation and the
+	 * inner `id`, or null when the envelope carries none.
+	 *
+	 * @param array<string, mixed> $data
+	 */
+	private function innerMessageKey(string $chatGlobalId, array $data): ?string {
+		$innerId = $data['id'] ?? null;
+		if (!is_string($innerId) || $innerId === '' || $chatGlobalId === '') {
+			return null;
+		}
+
+		return $chatGlobalId . '|' . $innerId;
+	}
+
+	private function rememberInnerMessage(?string $innerKey, string $ownerW3id): void {
+		if ($innerKey === null || $this->idMappingMapper->getLocalId(self::MESSAGE_INNER_ENTITY, $innerKey) !== null) {
+			return;
+		}
+		try {
+			$this->idMappingMapper->storeMapping(self::MESSAGE_INNER_ENTITY, $innerKey, $innerKey, $ownerW3id, 'inbound');
+		} catch (\Throwable) {
+			// Recorded concurrently; either row says the same.
+		}
+	}
+
+	/**
+	 * Record a further copy of a message already here, so it is skipped at
+	 * the first lookup next time.
+	 */
+	private function rememberMessageCopy(string $globalId, string $ownerW3id): void {
+		try {
+			$this->idMappingMapper->storeMapping('message', 'copy:' . $globalId, $globalId, $ownerW3id, 'inbound');
+		} catch (\Throwable) {
+		}
+	}
+
+	/**
+	 * @param string|null $text The message text, or null for a file share.
+	 */
+	private function isAlreadyInRoom(string $roomToken, string $senderUid, mixed $createdAt, ?string $text): bool {
+		if (!is_string($createdAt) || $createdAt === '') {
+			return false;
+		}
+		try {
+			return $this->talkHistory->hasEntry($roomToken, $senderUid, new \DateTimeImmutable($createdAt), $text);
+		} catch (\Throwable) {
+			return false;
+		}
+	}
+
+	private function backdateImportedShare(int $shareId, string $roomToken, mixed $createdAt): void {
+		if (!is_string($createdAt) || $createdAt === '') {
+			return;
+		}
+		try {
+			$at = new \DateTimeImmutable($createdAt);
+			// Only history: something sent moments ago is already in place.
+			if ($at->getTimestamp() < time() - 60) {
+				$this->talkHistory->backdateShare($shareId, $roomToken, $at);
+			}
+		} catch (\Throwable $e) {
+			$this->logger->info('[W3DS Sync] Could not date an imported attachment', [
+				'shareId' => $shareId,
+				'exception' => $e->getMessage(),
+			]);
 		}
 	}
 

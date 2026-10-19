@@ -9,6 +9,33 @@ Entries below are reconstructed from commit history.
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-10-19
+
+### Fixed
+
+- Display names no longer revert to the eName at every login. user_oidc writes
+  the identity provider's name each time, and an IdP without one sends the
+  username, which is the eName. For accounts linked to that eName, the name
+  and email user_oidc writes now come from the eVault profile.
+- References are no longer turned into rooms. Some platforms leave a
+  reference in each participant's eVault pointing at the real conversation or
+  message (`isReference`, `canonicalOwnerEName`, `canonical…Id`). Each one
+  became an empty, untitled room with only its reader in it. The conversation
+  or message it points at is now applied instead.
+- Copies of one message, which have a different envelope id in each
+  participant's eVault, are recognised by their shared inner id. Copies of
+  messages imported earlier are recognised by sender and send time.
+- Imported history is applied oldest first across all eVaults, so
+  conversations are in order. Imported attachments keep the date they were
+  sent instead of showing as sent on the day of the import.
+
+### Added
+
+- `occ w3ds_login:cleanup-reference-rooms [--delete]` removes the empty rooms
+  made from references.
+- `occ w3ds_login:backdate-imported-attachments [--dry-run]` gives attachments
+  imported before this release their original dates.
+
 ## [0.13.0] - 2026-10-19
 
 ### Fixed

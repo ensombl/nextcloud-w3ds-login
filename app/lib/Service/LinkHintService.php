@@ -53,11 +53,16 @@ class LinkHintService {
 		$payload = strtr($parts[1], '-_', '+/');
 		$payload .= str_repeat('=', (4 - strlen($payload) % 4) % 4);
 		$json = base64_decode($payload, true);
-		$claims = is_string($json) ? json_decode($json, true) : null;
-		if (!is_array($claims)) {
-			return null;
-		}
-		$username = $claims['preferred_username'] ?? null;
+		$claims = is_string($json) ? json_decode($json) : null;
+
+		return is_object($claims) ? self::eNameFromClaims($claims) : null;
+	}
+
+	/**
+	 * The eName decoded ID token claims name, or null.
+	 */
+	public static function eNameFromClaims(object $claims): ?string {
+		$username = $claims->preferred_username ?? null;
 		if (!is_string($username)) {
 			return null;
 		}

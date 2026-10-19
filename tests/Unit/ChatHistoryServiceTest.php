@@ -115,4 +115,25 @@ class ChatHistoryServiceTest extends TestCase {
 
 		$this->assertNull($this->service([])->fetchOpenRoom('room1'));
 	}
+
+	/**
+	 * Talk orders a conversation by posting order, so history from several
+	 * eVaults is applied in the order it was sent, not eVault by eVault.
+	 */
+	public function testHistoryFromSeveralEVaultsIsAppliedOldestFirst(): void {
+		$applied = [];
+		$processor = $this->createMock(AwarenessPacketProcessor::class);
+		$processor->method('process')->willReturnCallback(function (array $packet) use (&$applied): bool {
+			$applied[] = $packet['id'];
+			return true;
+		});
+		$at = static fn (string $id, string $when): array => ['id' => $id, 'data' => ['createdAt' => $when]];
+
+		$this->service([
+			['packets' => [$at('bob-2', '2026-10-02T10:00:00Z'), $at('bob-1', '2026-09-01T10:00:00Z')], 'nextCursor' => null, 'hasMore' => false],
+			['packets' => [$at('group-1', '2026-09-15T10:00:00Z'), $at('bob-2', '2026-10-02T10:00:00Z')], 'nextCursor' => null, 'hasMore' => false],
+		], $processor)->fetchFromVaults(['@bob', '@group'], ['m'], null, 5);
+
+		$this->assertSame(['bob-1', 'group-1', 'bob-2'], $applied, 'sorted by time, each envelope once');
+	}
 }

@@ -8,6 +8,9 @@ use OCA\W3dsLogin\Db\IdMappingMapper;
 use OCA\W3dsLogin\Service\AwarenessClient;
 use OCA\W3dsLogin\Service\AwarenessPacketProcessor;
 use OCA\W3dsLogin\Service\ChatSyncService;
+use OCA\W3dsLogin\Service\EvaultClient;
+use OCP\ICache;
+use OCP\ICacheFactory;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\NullLogger;
 
@@ -60,8 +63,17 @@ class AwarenessPacketProcessorTest extends TestCase {
 	/**
 	 * @param list<string> $claimed
 	 */
-	private function processor(ChatSyncService $sync, array &$claimed, bool $chatIsKnown = true): AwarenessPacketProcessor {
-		return new AwarenessPacketProcessor($sync, $this->mapper($claimed, $chatIsKnown), new NullLogger());
+	private function processor(ChatSyncService $sync, array &$claimed, bool $chatIsKnown = true, ?EvaultClient $evault = null, ?IdMappingMapper $mapper = null): AwarenessPacketProcessor {
+		$factory = $this->createMock(ICacheFactory::class);
+		$factory->method('createDistributed')->willReturn($this->createMock(ICache::class));
+
+		return new AwarenessPacketProcessor(
+			$sync,
+			$mapper ?? $this->mapper($claimed, $chatIsKnown),
+			new NullLogger(),
+			$evault ?? $this->createMock(EvaultClient::class),
+			$factory,
+		);
 	}
 
 	/**
@@ -266,5 +278,66 @@ class AwarenessPacketProcessorTest extends TestCase {
 
 		$this->assertTrue($processor->process($legacy));
 		$this->assertFalse($processor->process($legacy));
+	}
+
+	/**
+	 * A reference left in a participant's eVault became a room of its own --
+	 * no title, no participants, nobody in it but its reader. The chat it
+	 * points at is applied instead, under its own id and owner.
+	 */
+	public function testAChatReferenceAppliesTheChatItPointsAt(): void {
+		$claimed = [];
+		$mapper = $this->createMock(IdMappingMapper::class);
+		$mapper->method('getLocalId')->willReturn(null);
+		$mapper->method('tryClaim')->willReturn(true);
+		$evault = $this->createMock(EvaultClient::class);
+		$evault->expects($this->once())->method('fetchMetaEnvelopeById')
+			->with('@group-owner', 'real-chat')
+			->willReturn(['parsed' => ['name' => 'Team', 'participantIds' => ['@alice']]]);
+		$sync = $this->createMock(ChatSyncService::class);
+		$sync->expects($this->once())->method('handleInboundChat')
+			->with('real-chat', '@group-owner', ['name' => 'Team', 'participantIds' => ['@alice']]);
+
+		$this->processor($sync, $claimed, evault: $evault, mapper: $mapper)->process($this->packet([
+			'ontology' => ChatSyncService::CHAT_SCHEMA_ID,
+			'id' => 'reference-envelope',
+			'w3id' => '@alice',
+			'data' => ['isReference' => true, 'canonicalOwnerEName' => '@group-owner', 'canonicalChatId' => 'real-chat', 'type' => 'group'],
+		]));
+	}
+
+	/**
+	 * Never the pointer itself, even when its target cannot be read.
+	 */
+	public function testAReferenceThatCannotBeResolvedIsIgnored(): void {
+		$claimed = [];
+		$mapper = $this->createMock(IdMappingMapper::class);
+		$mapper->method('getLocalId')->willReturn(null);
+		$evault = $this->createMock(EvaultClient::class);
+		$evault->method('fetchMetaEnvelopeById')->willReturn(null);
+		$sync = $this->createMock(ChatSyncService::class);
+		$sync->expects($this->never())->method('handleInboundChat');
+
+		$applied = $this->processor($sync, $claimed, evault: $evault, mapper: $mapper)->process($this->packet([
+			'ontology' => ChatSyncService::CHAT_SCHEMA_ID,
+			'data' => ['isReference' => true, 'canonicalOwnerEName' => '@group-owner', 'canonicalChatId' => 'real-chat'],
+		]));
+
+		$this->assertFalse($applied);
+	}
+
+	/**
+	 * A reference to something already here costs no eVault round trip.
+	 */
+	public function testAReferenceToSomethingAlreadyHereIsSkipped(): void {
+		$claimed = [];
+		$evault = $this->createMock(EvaultClient::class);
+		$evault->expects($this->never())->method('fetchMetaEnvelopeById');
+		$sync = $this->createMock(ChatSyncService::class);
+		$sync->expects($this->never())->method('handleInboundMessage');
+
+		$this->processor($sync, $claimed, evault: $evault)->process($this->packet([
+			'data' => ['isReference' => true, 'canonicalOwnerEName' => '@bob', 'canonicalMessageId' => 'real-message'],
+		]));
 	}
 }

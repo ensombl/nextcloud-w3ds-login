@@ -11,6 +11,7 @@ use OCA\W3dsLogin\Listener\AttendeesChangedListener;
 use OCA\W3dsLogin\Listener\LinkPromptListener;
 use OCA\W3dsLogin\Listener\LoginProfileSyncListener;
 use OCA\W3dsLogin\Listener\MessageSentListener;
+use OCA\W3dsLogin\Listener\OidcAttributeListener;
 use OCA\W3dsLogin\Listener\OidcTokenListener;
 use OCA\W3dsLogin\Listener\RoomCreatedListener;
 use OCA\W3dsLogin\Listener\TalkSyncListener;
@@ -51,6 +52,8 @@ class Application extends App implements IBootstrap {
 
 	// Raised by the OpenID Connect user backend (user_oidc) after a login.
 	private const OIDC_TOKEN_OBTAINED_EVENT = 'OCA\\UserOIDC\\Event\\UserObtainedTokenEvent';
+	// Raised by user_oidc for each attribute it is about to write at login.
+	private const OIDC_ATTRIBUTE_MAPPED_EVENT = 'OCA\\UserOIDC\\Event\\AttributeMappedEvent';
 
 	public function __construct() {
 		parent::__construct(self::APP_ID);
@@ -88,6 +91,10 @@ class Application extends App implements IBootstrap {
 		// wallet: note the eName it claims, and ask them to confirm it with
 		// one scan so their account can sync.
 		$context->registerEventListener(self::OIDC_TOKEN_OBTAINED_EVENT, OidcTokenListener::class);
+		// The name and email user_oidc writes at every login come from the
+		// eVault for linked accounts, so the IdP's username stops replacing
+		// the person's name.
+		$context->registerEventListener(self::OIDC_ATTRIBUTE_MAPPED_EVENT, OidcAttributeListener::class);
 		$context->registerEventListener(BeforeTemplateRenderedEvent::class, LinkPromptListener::class);
 		$context->registerEventListener(BeforeTemplateRenderedEvent::class, TalkSyncListener::class);
 
