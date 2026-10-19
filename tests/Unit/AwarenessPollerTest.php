@@ -7,6 +7,7 @@ namespace OCA\W3dsLogin\Tests\Unit;
 use OCA\W3dsLogin\Service\AwarenessClient;
 use OCA\W3dsLogin\Service\AwarenessPacketProcessor;
 use OCA\W3dsLogin\Service\AwarenessPoller;
+use OCA\W3dsLogin\Service\ChatSyncService;
 use OCP\IAppConfig;
 use OCP\IConfig;
 use OCP\IURLGenerator;
@@ -61,6 +62,7 @@ class AwarenessPollerTest extends TestCase {
 			$locks,
 			$this->createMock(IAppConfig::class),
 			new NullLogger(),
+			$this->createMock(ChatSyncService::class),
 		);
 	}
 
