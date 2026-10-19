@@ -9,6 +9,8 @@ Entries below are reconstructed from commit history.
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-10-19
+
 ### Changed
 
 - Opening a conversation in Talk fetches new W3DS messages immediately, and
