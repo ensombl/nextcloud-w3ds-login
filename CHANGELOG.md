@@ -9,6 +9,8 @@ Entries below are reconstructed from commit history.
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-10-19
+
 ### Fixed
 
 - Messages from other people now come through.
