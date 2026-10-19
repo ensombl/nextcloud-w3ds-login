@@ -9,6 +9,44 @@ Entries below are reconstructed from commit history.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-19
+
+### Added
+
+- Linked users get their whole eVault profile at every login: through the
+  identity provider, with the wallet, and right after linking. That covers
+  display name, email, avatar, phone, address, website, biography, headline,
+  organisation and role, with the ProfessionalProfile filling gaps. The eVault
+  wins over the identity provider's claims; empty profile fields leave
+  Nextcloud's values alone.
+- Linking no longer fails when this app had already made an account for the
+  eName (at a wallet login, in a synced chat or in a search). That account is
+  folded into the one being linked:
+  - its Talk conversations, messages, reactions and read markers move across
+    without announcing anything in the rooms;
+  - a background job moves its files and then deletes it.
+
+  Accounts this app did not create, administrators, and accounts with calendar
+  or contact entries are still refused.
+
+### Changed
+
+- The display name now always follows the eVault, so edits made in Nextcloud
+  are overwritten at the next login.
+- The avatar is re-downloaded only when the profile points at a new picture,
+  replacing the once-a-day refresh.
+
+### Fixed
+
+- The eName hint is now read from the OIDC session as well, so the link prompt
+  appears with released versions of `user_oidc`. Those don't raise the token
+  event the app listened for.
+- Accounts created by `user_oidc` now take their display name from the eVault.
+  Their backend refuses Nextcloud's normal display-name setter.
+- The linking dialogs show why linking could not start instead of silently
+  resetting.
+- Wallet logins now record the last-login time.
+
 ## [0.8.0] - 2026-09-30
 
 ### Added
