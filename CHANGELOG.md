@@ -9,6 +9,16 @@ Entries below are reconstructed from commit history.
 
 ## [Unreleased]
 
+## [0.15.1] - 2026-10-19
+
+### Fixed
+
+- Conversations with no messages here (none sent yet, or only before the
+  history window) are placed in the list by their own record's date. Before,
+  they were dated by the notice written when this server created the room, so
+  they sorted above conversations with real messages.
+  `occ w3ds_login:resequence-rooms` corrects existing ones.
+
 ## [0.15.0] - 2026-10-19
 
 ### Changed
