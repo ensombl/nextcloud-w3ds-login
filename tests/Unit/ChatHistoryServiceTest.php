@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace OCA\W3dsLogin\Tests\Unit;
 
 use OCA\W3dsLogin\Db\ChatVaults;
+use OCA\W3dsLogin\Db\FetchMarks;
 use OCA\W3dsLogin\Service\AwarenessClient;
 use OCA\W3dsLogin\Service\AwarenessPacketProcessor;
 use OCA\W3dsLogin\Service\ChatHistoryService;
@@ -23,10 +24,13 @@ class ChatHistoryServiceTest extends TestCase {
 
 	private ChatVaults $vaults;
 	private ICache $cache;
+	private FetchMarks $marks;
 
 	protected function setUp(): void {
 		$this->vaults = $this->createMock(ChatVaults::class);
 		$this->cache = $this->createMock(ICache::class);
+		$this->marks = $this->createMock(FetchMarks::class);
+		$this->marks->method('from')->willReturnCallback(static fn (string $key, ?int $earliest): ?string => $earliest === null ? null : gmdate('Y-m-d\TH:i:s\Z', $earliest));
 	}
 
 	/**
@@ -46,7 +50,7 @@ class ChatHistoryServiceTest extends TestCase {
 
 		// Retries pause for real seconds; not here.
 		$service = $this->getMockBuilder(ChatHistoryService::class)
-			->setConstructorArgs([$client, $processor ?? $this->createMock(AwarenessPacketProcessor::class), $this->vaults, $this->createMock(ChatSyncService::class), $factory, new NullLogger()])
+			->setConstructorArgs([$client, $processor ?? $this->createMock(AwarenessPacketProcessor::class), $this->vaults, $this->createMock(ChatSyncService::class), $factory, new NullLogger(), $this->marks])
 			->onlyMethods(['pause'])
 			->getMock();
 
@@ -58,7 +62,7 @@ class ChatHistoryServiceTest extends TestCase {
 	}
 
 	public function testEachEVaultIsReadSeparately(): void {
-		$result = $this->service([])->fetchFromVaults(['@group', '@bob'], ['m'], '2026-01-01T00:00:00Z', 5);
+		$result = $this->service([])->fetchFromVaults(['@group', '@bob'], ['m'], 1700000000, 5);
 
 		$this->assertSame(['@group', '@bob'], array_column($this->calls, 'evault'));
 		$this->assertTrue($result['complete']);
@@ -133,8 +137,45 @@ class ChatHistoryServiceTest extends TestCase {
 		$this->service([
 			['packets' => [$at('bob-2', '2026-10-02T10:00:00Z'), $at('bob-1', '2026-09-01T10:00:00Z')], 'nextCursor' => null, 'hasMore' => false],
 			['packets' => [$at('group-1', '2026-09-15T10:00:00Z'), $at('bob-2', '2026-10-02T10:00:00Z')], 'nextCursor' => null, 'hasMore' => false],
-		], $processor)->fetchFromVaults(['@bob', '@group'], ['m'], null, 5);
+		], $processor)->fetchFromVaults(['@bob', '@group'], ['m'], 1700000000, 5);
 
 		$this->assertSame(['bob-1', 'group-1', 'bob-2'], $applied, 'sorted by time, each envelope once');
+	}
+
+	/**
+	 * Each eVault is read only from where its last complete read began.
+	 */
+	public function testAnEVaultIsReadFromItsMark(): void {
+		$this->marks = $this->createMock(FetchMarks::class);
+		$this->marks->method('from')->willReturnMap([
+			['vault:@group', 1700000000, '2026-10-19T12:00:00Z'],
+			['vault:@bob', 1700000000, '2023-11-14T22:13:20Z'],
+		]);
+		$this->marks->expects($this->exactly(2))->method('set');
+
+		$this->service([])->fetchFromVaults(['@group', '@bob'], ['m'], 1700000000, 5);
+
+		$this->assertSame(['2026-10-19T12:00:00Z', '2023-11-14T22:13:20Z'], array_column($this->calls, 'from'));
+	}
+
+	/**
+	 * A read that stopped short leaves the mark where it was, so the next
+	 * read repeats it rather than skipping what was missed.
+	 */
+	public function testAnIncompleteReadSetsNoMark(): void {
+		$this->marks->expects($this->never())->method('set');
+
+		$this->service([null, null, null, null])->fetchFromVaults(['@group'], ['m'], 1700000000, 5);
+	}
+
+	/**
+	 * Asked for in full, the whole window is read regardless of marks.
+	 */
+	public function testAFullReadIgnoresMarks(): void {
+		$this->marks->expects($this->never())->method('from');
+
+		$this->service([])->fetchFromVaults(['@group'], ['m'], 1700000000, 5, true);
+
+		$this->assertSame(gmdate('Y-m-d\TH:i:s\Z', 1700000000), $this->calls[0]['from']);
 	}
 }

@@ -29,7 +29,7 @@ Talk chat sync (requires Nextcloud Talk):
 - @ mentions translated between Talk and W3DS identities
 - W3DS users discoverable in the share picker and from inside a room
     ]]></description>
-    <version>0.14.2</version>
+    <version>0.15.0</version>
     <licence>AGPL-3.0-or-later</licence>
     <author>Ensombl Pte. Ltd.</author>
     <namespace>W3dsLogin</namespace>
@@ -54,6 +54,7 @@ Talk chat sync (requires Nextcloud Talk):
     <repair-steps>
         <post-migration>
             <step>OCA\W3dsLogin\Migration\FillOneToOneRooms</step>
+            <step>OCA\W3dsLogin\Migration\RestorePollJobSchedule</step>
         </post-migration>
     </repair-steps>
     <commands>
@@ -63,6 +64,7 @@ Talk chat sync (requires Nextcloud Talk):
         <command>OCA\W3dsLogin\Command\CleanupReferenceRoomsCommand</command>
         <command>OCA\W3dsLogin\Command\BackdateImportedAttachmentsCommand</command>
         <command>OCA\W3dsLogin\Command\ResequenceRoomsCommand</command>
+        <command>OCA\W3dsLogin\Command\FetchHistoryCommand</command>
     </commands>
     <settings>
         <admin>OCA\W3dsLogin\Settings\AdminSettings</admin>

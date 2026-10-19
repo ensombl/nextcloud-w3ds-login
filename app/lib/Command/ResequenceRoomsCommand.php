@@ -30,7 +30,7 @@ class ResequenceRoomsCommand extends Command {
 	protected function configure(): void {
 		$this
 			->setName('w3ds_login:resequence-rooms')
-			->setDescription('Put synced Talk conversations back in the order their messages were sent.')
+			->setDescription('Put synced Talk conversations back in the order their messages were sent, and the conversation list in order of their last message.')
 			->addOption('room', null, InputOption::VALUE_REQUIRED, 'Only this conversation (its token).');
 	}
 
@@ -53,6 +53,8 @@ class ResequenceRoomsCommand extends Command {
 		foreach ($tokens as $token) {
 			try {
 				$count = $this->talkHistory->resequence($token);
+				// And its place in the conversation list.
+				$this->talkHistory->refreshRoomActivity($token);
 			} catch (\Throwable $e) {
 				$output->writeln(sprintf('  <error>%s: %s</error>', $token, $e->getMessage()));
 				continue;

@@ -48,7 +48,7 @@ class ChatSyncController extends Controller {
 	 * @NoAdminRequired
 	 * @UserRateThrottle(limit=5, period=600)
 	 */
-	public function start(): JSONResponse {
+	public function start(bool $full = false): JSONResponse {
 		$w3id = $this->linkedW3id();
 		if ($w3id === null) {
 			return new JSONResponse(
@@ -58,7 +58,7 @@ class ChatSyncController extends Controller {
 		}
 
 		try {
-			return new JSONResponse($this->status->request($w3id));
+			return new JSONResponse($this->status->request($w3id, $full));
 		} catch (\RuntimeException $e) {
 			return new JSONResponse(['error' => $e->getMessage()], Http::STATUS_SERVICE_UNAVAILABLE);
 		} catch (\Throwable $e) {

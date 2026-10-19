@@ -261,6 +261,71 @@ class TalkHistory {
 			->executeStatement();
 	}
 
+	/**
+	 * Make the conversation list reflect what was last said.
+	 *
+	 * Talk sorts conversations by their last activity and previews their last
+	 * message, and updates both whenever anything is written -- an imported
+	 * message from last month, or a notice that someone was added -- so an
+	 * imported conversation jumped to the top as if active right now. Both
+	 * are set from the newest entry by the time it was sent.
+	 */
+	public function refreshRoomActivity(string $roomToken): void {
+		$roomId = $this->roomId($roomToken);
+		if ($roomId === null) {
+			return;
+		}
+
+		$qb = $this->db->getQueryBuilder();
+		$qb->select('id', 'creation_timestamp')
+			->from('comments')
+			->where($qb->expr()->eq('object_type', $qb->createNamedParameter('chat')))
+			->andWhere($qb->expr()->eq('object_id', $qb->createNamedParameter((string)$roomId)))
+			->andWhere($qb->expr()->in('verb', $qb->createNamedParameter(self::REORDERED, IQueryBuilder::PARAM_STR_ARRAY)))
+			->orderBy('creation_timestamp', 'DESC')
+			->addOrderBy('id', 'DESC')
+			->setMaxResults(1);
+		$result = $qb->executeQuery();
+		$newest = $result->fetch();
+		$result->closeCursor();
+		if ($newest === false) {
+			return;
+		}
+
+		$qb = $this->db->getQueryBuilder();
+		$qb->update('talk_rooms')
+			->set('last_message', $qb->createNamedParameter((int)$newest['id'], IQueryBuilder::PARAM_INT))
+			->set('last_activity', $qb->createNamedParameter(new \DateTimeImmutable((string)$newest['creation_timestamp']), IQueryBuilder::PARAM_DATE))
+			->where($qb->expr()->eq('id', $qb->createNamedParameter($roomId, IQueryBuilder::PARAM_INT)))
+			->executeStatement();
+
+		$this->clearTalkCaches();
+	}
+
+	/**
+	 * The newest message or file in the room sent at or before $until: the
+	 * furthest someone who has read up to $until has read.
+	 */
+	public function lastMessageUpTo(string $roomToken, \DateTimeInterface $until): ?int {
+		$roomId = $this->roomId($roomToken);
+		if ($roomId === null) {
+			return null;
+		}
+
+		$qb = $this->db->getQueryBuilder();
+		$qb->select($qb->func()->max('id'))
+			->from('comments')
+			->where($qb->expr()->eq('object_type', $qb->createNamedParameter('chat')))
+			->andWhere($qb->expr()->eq('object_id', $qb->createNamedParameter((string)$roomId)))
+			->andWhere($qb->expr()->in('verb', $qb->createNamedParameter(self::REORDERED, IQueryBuilder::PARAM_STR_ARRAY)))
+			->andWhere($qb->expr()->lte('creation_timestamp', $qb->createNamedParameter($until, IQueryBuilder::PARAM_DATE)));
+		$result = $qb->executeQuery();
+		$id = $result->fetchOne();
+		$result->closeCursor();
+
+		return $id === null || $id === false ? null : (int)$id;
+	}
+
 	private function maxCommentId(): int {
 		$qb = $this->db->getQueryBuilder();
 		$qb->select($qb->func()->max('id'))->from('comments');
@@ -299,7 +364,7 @@ class TalkHistory {
 	 * Talk caches each room's last message id, unread counts and threads;
 	 * all of them name entries by id.
 	 */
-	private function clearTalkCaches(): void {
+	public function clearTalkCaches(): void {
 		try {
 			$factory = \OCP\Server::get(\OCP\ICacheFactory::class);
 			$prefixes = ['talk.threads'];
