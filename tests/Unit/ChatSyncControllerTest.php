@@ -5,7 +5,9 @@ declare(strict_types=1);
 namespace OCA\W3dsLogin\Tests\Unit;
 
 use OCA\W3dsLogin\Controller\ChatSyncController;
+use OCA\W3dsLogin\Db\ChatVaults;
 use OCA\W3dsLogin\Service\AwarenessPoller;
+use OCA\W3dsLogin\Service\ChatHistoryService;
 use OCA\W3dsLogin\Service\ChatSyncStatusService;
 use OCA\W3dsLogin\Service\UserProvisioningService;
 use OCP\AppFramework\Http;
@@ -19,15 +21,17 @@ use Psr\Log\NullLogger;
  * The sync button tells the user why it cannot help, when it cannot.
  */
 class ChatSyncControllerTest extends TestCase {
-	private function controller(?string $w3id, ChatSyncStatusService $status, ?AwarenessPoller $poller = null): ChatSyncController {
+	private function controller(?string $w3id, ChatSyncStatusService $status, ?AwarenessPoller $poller = null, ?ChatHistoryService $history = null, array $rooms = []): ChatSyncController {
 		$user = $this->createMock(IUser::class);
 		$user->method('getUID')->willReturn('alice');
 		$session = $this->createMock(IUserSession::class);
 		$session->method('getUser')->willReturn($user);
 		$provisioning = $this->createMock(UserProvisioningService::class);
 		$provisioning->method('getLinkedW3id')->willReturn($w3id);
+		$vaults = $this->createMock(ChatVaults::class);
+		$vaults->method('roomsOf')->willReturn($rooms);
 
-		return new ChatSyncController($this->createMock(IRequest::class), $session, $provisioning, $status, $poller ?? $this->createMock(AwarenessPoller::class), new NullLogger());
+		return new ChatSyncController($this->createMock(IRequest::class), $session, $provisioning, $status, $poller ?? $this->createMock(AwarenessPoller::class), $history ?? $this->createMock(ChatHistoryService::class), $vaults, new NullLogger());
 	}
 
 	public function testAnUnlinkedUserIsToldToLinkFirst(): void {
@@ -111,5 +115,32 @@ class ChatSyncControllerTest extends TestCase {
 
 		$this->assertFalse($data['configured']);
 		$this->assertStringContainsString('administrator', $data['error']);
+	}
+
+	/**
+	 * The conversation on screen is fetched from its own eVault and its
+	 * participants', not just left to the stream.
+	 */
+	public function testTheOpenConversationIsFetched(): void {
+		$poller = $this->createMock(AwarenessPoller::class);
+		$poller->method('isConfigured')->willReturn(true);
+		$history = $this->createMock(ChatHistoryService::class);
+		$history->expects($this->once())->method('fetchOpenRoom')->with('room1');
+
+		$this->controller('@alice', $this->createMock(ChatSyncStatusService::class), $poller, $history, ['room1'])
+			->poll(chatOpen: true, chatToken: 'room1');
+	}
+
+	/**
+	 * The token comes from the page, so only a room the user is in.
+	 */
+	public function testARoomTheUserIsNotInIsNotFetched(): void {
+		$poller = $this->createMock(AwarenessPoller::class);
+		$poller->method('isConfigured')->willReturn(true);
+		$history = $this->createMock(ChatHistoryService::class);
+		$history->expects($this->never())->method('fetchOpenRoom');
+
+		$this->controller('@alice', $this->createMock(ChatSyncStatusService::class), $poller, $history, ['room1'])
+			->poll(chatOpen: true, chatToken: 'someone-elses-room');
 	}
 }

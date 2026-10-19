@@ -150,7 +150,9 @@
         }
         pollInFlight = true;
         render();
-        request('POST', state.pollUrl, { chatOpen: currentChat !== null || chatJustOpened }, function (code, data) {
+        // The open conversation's token lets the server bring in its recent
+        // messages from its group and participants' eVaults too.
+        request('POST', state.pollUrl, { chatOpen: currentChat !== null || chatJustOpened, chatToken: currentChat || '' }, function (code, data) {
             pollInFlight = false;
             var next = currentChat ? OPEN_CHAT_INTERVAL : IDLE_INTERVAL;
 

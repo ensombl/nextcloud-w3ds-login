@@ -5,7 +5,9 @@ declare(strict_types=1);
 namespace OCA\W3dsLogin\Controller;
 
 use OCA\W3dsLogin\AppInfo\Application;
+use OCA\W3dsLogin\Db\ChatVaults;
 use OCA\W3dsLogin\Service\AwarenessPoller;
+use OCA\W3dsLogin\Service\ChatHistoryService;
 use OCA\W3dsLogin\Service\ChatSyncStatusService;
 use OCA\W3dsLogin\Service\UserProvisioningService;
 use OCP\AppFramework\Controller;
@@ -35,6 +37,8 @@ class ChatSyncController extends Controller {
 		private UserProvisioningService $provisioningService,
 		private ChatSyncStatusService $status,
 		private AwarenessPoller $poller,
+		private ChatHistoryService $history,
+		private ChatVaults $chatVaults,
 		private LoggerInterface $logger,
 	) {
 		parent::__construct(Application::APP_ID, $request);
@@ -96,7 +100,7 @@ class ChatSyncController extends Controller {
 	 * @NoAdminRequired
 	 * @UserRateThrottle(limit=40, period=60)
 	 */
-	public function poll(bool $chatOpen = false): JSONResponse {
+	public function poll(bool $chatOpen = false, string $chatToken = ''): JSONResponse {
 		if (!$this->poller->isConfigured()) {
 			return new JSONResponse([
 				'polled' => false,
@@ -105,7 +109,14 @@ class ChatSyncController extends Controller {
 			]);
 		}
 
-		$minInterval = $chatOpen ? self::OPEN_CHAT_POLL_MIN_INTERVAL : self::POLL_MIN_INTERVAL;
+		// The conversation on screen: bring in its recent messages from its
+		// own eVault and every participant's, not only what the stream
+		// carried since this server started following it.
+		if ($chatToken !== '') {
+			$this->fetchOpenRoom($chatToken);
+		}
+
+		$minInterval = $chatOpen || $chatToken !== '' ? self::OPEN_CHAT_POLL_MIN_INTERVAL : self::POLL_MIN_INTERVAL;
 		$since = $this->poller->secondsSinceLastPoll();
 		if ($since !== null && $since < $minInterval) {
 			return new JSONResponse(['polled' => false, 'configured' => true, 'lastPolledAt' => time() - $since]);
@@ -132,5 +143,24 @@ class ChatSyncController extends Controller {
 			'applied' => $applied ?? 0,
 			'lastPolledAt' => $since !== null ? time() - $since : null,
 		]);
+	}
+
+	/**
+	 * Only for a synced room the user is in: the token comes from the page.
+	 */
+	private function fetchOpenRoom(string $chatToken): void {
+		$user = $this->userSession->getUser();
+		if ($user === null || !in_array($chatToken, $this->chatVaults->roomsOf($user->getUID()), true)) {
+			return;
+		}
+
+		try {
+			$this->history->fetchOpenRoom($chatToken);
+		} catch (\Throwable $e) {
+			$this->logger->warning('[W3DS Awareness] Could not fetch the open conversation', [
+				'roomToken' => $chatToken,
+				'exception' => $e->getMessage(),
+			]);
+		}
 	}
 }

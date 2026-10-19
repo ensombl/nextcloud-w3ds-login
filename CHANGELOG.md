@@ -9,6 +9,23 @@ Entries below are reconstructed from commit history.
 
 ## [Unreleased]
 
+### Fixed
+
+- Messages from other people now come through.
+  - W3DS stores a message in the conversation's own eVault (a group's) or in
+    its sender's, never in each reader's. Reading only the user's own eVault
+    fetched nothing but what they had sent themselves.
+  - The history fetch now reads every conversation's own eVault, the eVault
+    each conversation came from, and every participant's eVault.
+  - Opening a conversation reads its last week from those eVaults.
+- Conversations a group keeps in the group's own eVault are now found by the
+  history fetch.
+- Accounts this app creates for chat peers no longer count as "somebody here"
+  when deciding whether a conversation from the network belongs on this
+  server. Counting them created rooms here for unrelated conversations
+  involving those peers. An account counts when someone made or linked it
+  themselves, or has signed in to it.
+
 ## [0.12.0] - 2026-10-19
 
 ### Changed

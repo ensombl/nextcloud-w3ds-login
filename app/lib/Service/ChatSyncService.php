@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace OCA\W3dsLogin\Service;
 
 use OCA\W3dsLogin\AppInfo\Application;
+use OCA\W3dsLogin\Db\ChatVaults;
 use OCA\W3dsLogin\Db\IdMappingMapper;
 use OCA\W3dsLogin\Db\W3dsMappingMapper;
 use OCP\AppFramework\Db\DoesNotExistException;
@@ -96,6 +97,7 @@ class ChatSyncService {
 		private AttachmentSyncService $attachmentSync,
 		private IUserManager $userManager,
 		private IUserSession $userSession,
+		private ChatVaults $chatVaults,
 	) {
 		$this->cache = $cacheFactory->createDistributed(Application::APP_ID);
 	}
@@ -811,6 +813,7 @@ class ChatSyncService {
 			$this->setSyncLock('chat', $roomToken);
 
 			$this->idMappingMapper->storeMapping('chat', $roomToken, $globalId, $ownerW3id, 'inbound');
+			$this->rememberChatVaults($roomToken, $data, $ownerW3id);
 			$this->logger->info('Created local chat from inbound webhook', [
 				'globalId' => $globalId,
 				'roomToken' => $roomToken,
@@ -819,6 +822,47 @@ class ChatSyncService {
 			$this->logger->error('Failed to create local chat from webhook', [
 				'globalId' => $globalId,
 				'exception' => $e,
+			]);
+		}
+	}
+
+	/**
+	 * Remember every eVault this conversation's messages may live in: its
+	 * own (a group's eName), the one it came from, and each participant's.
+	 * The history fetch reads them all; see {@see ChatVaults}.
+	 *
+	 * Best effort: a room is still a room without this.
+	 *
+	 * @param array<string, mixed> $data
+	 */
+	private function rememberChatVaults(string $roomToken, array $data, string $ownerW3id): void {
+		try {
+			$vaults = [$ownerW3id];
+			foreach (['ename', 'groupEname', 'groupEName'] as $field) {
+				if (is_string($data[$field] ?? null)) {
+					$vaults[] = $data[$field];
+				}
+			}
+			foreach (['participantIds', 'participants', 'admins'] as $field) {
+				$references = is_array($data[$field] ?? null) ? $data[$field] : [];
+				foreach ($references as $reference) {
+					if (is_array($reference)) {
+						$reference = $reference['ename'] ?? $reference['id'] ?? null;
+					}
+					if (!is_string($reference) || $reference === '') {
+						continue;
+					}
+					$w3id = $this->resolveParticipantIdToW3id($reference, $ownerW3id);
+					if ($w3id !== null) {
+						$vaults[] = $w3id;
+					}
+				}
+			}
+			$this->chatVaults->remember($roomToken, ChatVaults::normalise($vaults));
+		} catch (\Throwable $e) {
+			$this->logger->info('[W3DS Sync] Could not record the eVaults of a chat', [
+				'roomToken' => $roomToken,
+				'exception' => $e->getMessage(),
 			]);
 		}
 	}
@@ -1617,6 +1661,8 @@ class ChatSyncService {
 	}
 
 	private function updateLocalChat(string $roomToken, array $data, string $ownerW3id = ''): void {
+		$this->rememberChatVaults($roomToken, $data, $ownerW3id);
+
 		try {
 			$manager = \OCP\Server::get(\OCA\Talk\Manager::class);
 			$room = $manager->getRoomByToken($roomToken);
@@ -1893,10 +1939,18 @@ class ChatSyncService {
 	}
 
 	/**
-	 * Whether this eName already belongs to a local account.
+	 * Whether this eName belongs to someone who actually uses this server.
 	 *
 	 * Deliberately a plain lookup: unlike {@see resolveW3idToNcUid()} it
 	 * never provisions, so it can be asked about strangers safely.
+	 *
+	 * Having an account here is not enough. This app makes one for every
+	 * peer it needs to show as a sender, and for every search result, so a
+	 * mapping alone would make any chat one of those peers is in -- anywhere
+	 * on the network -- look like it belonged here, and the awareness
+	 * broadcast turned that into a room for each of them. An account counts
+	 * when someone made it or linked it themselves, or has signed in to the
+	 * one this app made.
 	 */
 	private function isLinkedLocally(string $w3id): bool {
 		if ($w3id === '') {
@@ -1904,12 +1958,16 @@ class ChatSyncService {
 		}
 
 		try {
-			$this->w3dsMappingMapper->findByW3id($w3id);
-
-			return true;
+			$uid = $this->w3dsMappingMapper->findByW3id($w3id)->getNcUid();
 		} catch (DoesNotExistException) {
 			return false;
 		}
+
+		if (!$this->userProvisioning->isAppProvisioned($uid)) {
+			return true;
+		}
+
+		return ($this->userManager->get($uid)?->getLastLogin() ?? 0) > 0;
 	}
 
 	// ---------------------------------------------------------------

@@ -5,8 +5,10 @@ declare(strict_types=1);
 namespace OCA\W3dsLogin\Tests\Unit;
 
 use OCA\W3dsLogin\BackgroundJob\AwarenessBackfillJob;
+use OCA\W3dsLogin\Db\W3dsMapping;
+use OCA\W3dsLogin\Db\W3dsMappingMapper;
 use OCA\W3dsLogin\Service\AwarenessClient;
-use OCA\W3dsLogin\Service\AwarenessPacketProcessor;
+use OCA\W3dsLogin\Service\ChatHistoryService;
 use OCA\W3dsLogin\Service\ChatSyncService;
 use OCA\W3dsLogin\Service\ChatSyncStatusService;
 use OCP\AppFramework\Utility\ITimeFactory;
@@ -16,18 +18,24 @@ use PHPUnit\Framework\TestCase;
 use Psr\Log\NullLogger;
 
 /**
- * Fetching the conversations somebody already had, when they link.
+ * Fetching the conversations, and the messages in them, somebody already had.
  *
- * The live poll resumes from a cursor the whole instance shares, so anyone who
- * links afterwards inherits a position already past their own history. Without
- * this job they arrive to empty conversations while the messages sit unread in
- * the awareness service.
+ * Messages are not stored with whoever reads them: a group keeps them in its
+ * own eVault, and otherwise each sender keeps theirs. So the history is read
+ * from every eVault involved, not only the person's own.
  */
 class AwarenessBackfillJobTest extends TestCase {
-	private const W3ID = '@newly-linked';
+	private const W3ID = '@e4d1c2b0-5a6f-4c1e-9b1d-3f2a7c8e9d10';
+	private const UID = 'alice';
 
 	/** @var array<string, string> */
 	private array $appConfig = [];
+
+	/** @var list<array{kind: string, ontologies: array, from: ?string, evault: ?string}> */
+	private array $walks = [];
+
+	/** @var list<string> */
+	private array $messageVaults = [];
 
 	private function config(): IConfig {
 		$config = $this->createMock(IConfig::class);
@@ -43,43 +51,47 @@ class AwarenessBackfillJobTest extends TestCase {
 		return $config;
 	}
 
-	/**
-	 * @param list<array{ontologies: list<string>, from: ?string, cursor: ?string, evault: ?string}> $calls
-	 */
-	private function client(array &$calls, bool $configured = true, bool $failing = false): AwarenessClient {
+	private function client(bool $configured = true): AwarenessClient {
 		$client = $this->createMock(AwarenessClient::class);
 		$client->method('isConfigured')->willReturn($configured);
-
-		$client->method('fetchPackets')->willReturnCallback(
-			static function (?string $cursor, array $ontologies = [], ?string $from = null, ?string $evault = null) use (&$calls, $failing): ?array {
-				$calls[] = ['ontologies' => $ontologies, 'from' => $from, 'cursor' => $cursor, 'evault' => $evault];
-
-				if ($failing) {
-					return null;
-				}
-
-				return ['packets' => [['eventId' => 'e' . count($calls)]], 'nextCursor' => null, 'hasMore' => false];
-			},
-		);
 
 		return $client;
 	}
 
-	private function job(AwarenessClient $client, ?AwarenessPacketProcessor $processor = null): AwarenessBackfillJob {
-		$config = $this->config();
+	/**
+	 * @param array{applied: int, complete: bool} $result What every read returns.
+	 */
+	private function job(array $result = ['applied' => 1, 'complete' => true], bool $configured = true, array $roomVaults = ['@group', '@bob']): AwarenessBackfillJob {
+		$history = $this->createMock(ChatHistoryService::class);
+		$history->method('walk')->willReturnCallback(function (array $ontologies, ?string $from, ?string $evault) use ($result): array {
+			$this->walks[] = ['kind' => 'walk', 'ontologies' => $ontologies, 'from' => $from, 'evault' => $evault];
+			return $result;
+		});
+		$history->method('vaultsForUser')->with(self::UID)->willReturn($roomVaults);
+		$history->method('fetchFromVaults')->willReturnCallback(function (array $vaults, array $ontologies, ?string $from) use ($result): array {
+			$this->messageVaults = $vaults;
+			$this->walks[] = ['kind' => 'vaults', 'ontologies' => $ontologies, 'from' => $from, 'evault' => null];
+			return $result;
+		});
 
-		// Retries pause for real seconds; not here.
-		return $this->getMockBuilder(AwarenessBackfillJob::class)
-			->setConstructorArgs([
-				$this->createMock(ITimeFactory::class),
-				$client,
-				$processor ?? $this->createMock(AwarenessPacketProcessor::class),
-				$config,
-				new NullLogger(),
-				$this->statusService($config, $client),
-			])
-			->onlyMethods(['pause'])
-			->getMock();
+		$mapping = new W3dsMapping();
+		$mapping->setW3id(self::W3ID);
+		$mapping->setNcUid(self::UID);
+		$mappings = $this->createMock(W3dsMappingMapper::class);
+		$mappings->method('findByW3id')->willReturn($mapping);
+
+		$config = $this->config();
+		$client = $this->client($configured);
+
+		return new AwarenessBackfillJob(
+			$this->createMock(ITimeFactory::class),
+			$client,
+			$history,
+			$mappings,
+			$config,
+			new NullLogger(),
+			$this->statusService($config, $client),
+		);
 	}
 
 	private function statusService(IConfig $config, AwarenessClient $client): ChatSyncStatusService {
@@ -92,244 +104,134 @@ class AwarenessBackfillJobTest extends TestCase {
 		$method->invoke($job, $argument);
 	}
 
+	private function syncStatus(): array {
+		return $this->statusService($this->config(), $this->client())->get(self::W3ID);
+	}
+
 	/**
 	 * A message whose conversation has no local room is discarded rather than
-	 * queued, so reading messages before chats would throw away most of what
-	 * this job exists to fetch.
+	 * queued, so conversations are read before any message.
 	 */
 	public function testConversationsAreReadBeforeMessages(): void {
-		$calls = [];
-		$this->backfill($this->job($this->client($calls)));
+		$this->backfill($this->job());
 
-		$this->assertContains(ChatSyncService::CHAT_SCHEMA_ID, $calls[0]['ontologies']);
-		$this->assertContains(ChatSyncService::MESSAGE_SCHEMA_ID, $calls[1]['ontologies']);
+		$this->assertSame([ChatSyncService::CHAT_SCHEMA_ID], $this->walks[0]['ontologies']);
+		$this->assertSame([ChatSyncService::CHAT_SCHEMA_ID], $this->walks[1]['ontologies']);
+		$this->assertSame('vaults', $this->walks[2]['kind']);
+		$this->assertContains(ChatSyncService::MESSAGE_SCHEMA_ID, $this->walks[2]['ontologies']);
+		$this->assertContains(AwarenessClient::FILE_ONTOLOGY, $this->walks[2]['ontologies']);
 	}
 
 	/**
-	 * Attachments announce themselves on their own ontology, and are
-	 * materialised through the ordinary inbound path, which already suppresses
-	 * the echo that would push them back out.
+	 * The person's own conversations however old; a conversation started
+	 * before the window would otherwise lose every message sent in it since.
 	 */
-	public function testAttachmentsAreIncluded(): void {
-		$calls = [];
-		$this->backfill($this->job($this->client($calls)));
+	public function testOwnConversationsAreReadWithoutAWindow(): void {
+		$this->backfill($this->job());
 
-		$this->assertContains(AwarenessClient::FILE_ONTOLOGY, $calls[1]['ontologies']);
+		$this->assertSame(self::W3ID, $this->walks[0]['evault']);
+		$this->assertNull($this->walks[0]['from']);
 	}
 
 	/**
-	 * Only this person's packets. Reading the whole network oldest first and
-	 * stopping at a page limit is what left recent messages unread.
+	 * A group keeps its conversation in the group's eVault, not its members',
+	 * so recent conversations are read from everywhere and the processor
+	 * keeps the ones that include somebody here.
 	 */
-	public function testOnlyThisPersonsEVaultIsRead(): void {
-		$calls = [];
-		$this->backfill($this->job($this->client($calls)));
+	public function testGroupConversationsAreFoundBeyondTheOwnEVault(): void {
+		$this->backfill($this->job());
 
-		foreach ($calls as $call) {
-			$this->assertSame(self::W3ID, $call['evault']);
-		}
+		$this->assertNull($this->walks[1]['evault']);
+		$this->assertNotNull($this->walks[1]['from']);
 	}
 
 	/**
-	 * Messages are only placed in conversations that exist here, so every
-	 * conversation is read, however old: one started before the window
-	 * would otherwise lose every message sent in it since.
+	 * The point of the change: messages from every conversation's own eVault
+	 * and every participant's, plus the person's own.
 	 */
-	public function testConversationsAreReadWithoutAWindow(): void {
-		$calls = [];
-		$this->backfill($this->job($this->client($calls)));
+	public function testMessagesAreReadFromEveryEVaultInvolved(): void {
+		$this->backfill($this->job(roomVaults: ['@group', '@bob']));
 
-		$this->assertNull($calls[0]['from']);
+		$this->assertSame([self::W3ID, '@group', '@bob'], $this->messageVaults);
+	}
+
+	public function testMessagesComeFromABoundedWindow(): void {
+		$this->backfill($this->job());
+
+		$from = strtotime((string)$this->walks[2]['from']);
+		$this->assertGreaterThan(time() - (120 * 86400), $from);
+		$this->assertLessThan(time(), $from);
 	}
 
 	/**
-	 * Messages still come from a bounded window.
-	 */
-	public function testMessagesAreFetchedFromABoundedWindow(): void {
-		$calls = [];
-		$this->backfill($this->job($this->client($calls)));
-
-		$this->assertNotNull($calls[1]['from'], 'the window must have a start');
-		$this->assertGreaterThan(
-			time() - (120 * 86400),
-			strtotime($calls[1]['from']),
-			'the window must not reach back indefinitely',
-		);
-		$this->assertLessThan(time(), strtotime($calls[1]['from']));
-	}
-
-	/**
-	 * Running out of pages with more to read is not a complete sync.
-	 */
-	public function testReportsAHistoryLongerThanThePageLimitAsIncomplete(): void {
-		$client = $this->createMock(AwarenessClient::class);
-		$client->method('isConfigured')->willReturn(true);
-		$client->method('fetchPackets')->willReturn(['packets' => [['eventId' => 'e']], 'nextCursor' => 'more', 'hasMore' => true]);
-		$processor = $this->createMock(AwarenessPacketProcessor::class);
-		$processor->method('process')->willReturn(true);
-
-		$this->backfill($this->job($client, $processor), ['w3id' => self::W3ID, 'force' => true]);
-
-		$status = $this->statusService($this->config(), $client)->get(self::W3ID);
-		$this->assertFalse($status['complete']);
-	}
-
-	/**
-	 * Every packet goes through the processor the webhook and the poll use, so
-	 * the echo guard, the sender attribution and the once-only claim all apply
-	 * without being re-implemented here.
-	 */
-	public function testPacketsAreAppliedThroughTheOrdinaryInboundPath(): void {
-		$calls = [];
-		$processor = $this->createMock(AwarenessPacketProcessor::class);
-		$processor->expects($this->atLeastOnce())->method('process')->willReturn(true);
-
-		$this->backfill($this->job($this->client($calls), $processor));
-	}
-
-	/**
-	 * A relink, or a callback the wallet retried, must not replay a month of
-	 * history again.
+	 * A relink, or a callback the wallet retried, must not replay history.
 	 */
 	public function testHistoryIsOnlyFetchedOncePerIdentity(): void {
-		$calls = [];
-		$client = $this->client($calls);
-		$job = $this->job($client);
-
+		$job = $this->job();
 		$this->backfill($job);
-		$firstRun = count($calls);
+		$first = count($this->walks);
 		$this->backfill($job);
 
-		$this->assertSame($firstRun, count($calls), 'a second attempt must do nothing');
+		$this->assertSame($first, count($this->walks));
 	}
 
 	/**
-	 * Two people linking are two separate histories.
+	 * Unless asked for: from settings, or by Talk on a first visit.
 	 */
-	public function testEachIdentityIsBackfilledSeparately(): void {
-		$calls = [];
-		$job = $this->job($this->client($calls));
+	public function testAFetchThatWasAskedForRunsAgain(): void {
+		$job = $this->job();
+		$this->backfill($job);
+		$first = count($this->walks);
+		$this->backfill($job, ['w3id' => self::W3ID, 'force' => true]);
 
-		$this->backfill($job, ['w3id' => '@first']);
-		$afterFirst = count($calls);
-		$this->backfill($job, ['w3id' => '@second']);
+		$this->assertGreaterThan($first, count($this->walks));
+	}
 
-		$this->assertGreaterThan($afterFirst, count($calls));
+	public function testReportsTheOutcome(): void {
+		$this->backfill($this->job(), ['w3id' => self::W3ID, 'force' => true]);
+
+		$this->assertSame(ChatSyncStatusService::STATE_DONE, $this->syncStatus()['state']);
+		$this->assertTrue($this->syncStatus()['complete']);
+	}
+
+	public function testReportsAnIncompleteFetch(): void {
+		$this->backfill($this->job(['applied' => 3, 'complete' => false]), ['w3id' => self::W3ID, 'force' => true]);
+
+		$this->assertSame(ChatSyncStatusService::STATE_DONE, $this->syncStatus()['state']);
+		$this->assertFalse($this->syncStatus()['complete']);
+	}
+
+	/**
+	 * Nothing readable at all is the service, which only an administrator
+	 * can fix, not a history with nothing in it.
+	 */
+	public function testReportsAnUnreachableService(): void {
+		$this->backfill($this->job(['applied' => 0, 'complete' => false]), ['w3id' => self::W3ID, 'force' => true]);
+
+		$this->assertSame(ChatSyncStatusService::STATE_FAILED, $this->syncStatus()['state']);
 	}
 
 	/**
 	 * Without credentials there is nothing to read, and the marker must not be
-	 * set: configuring the service later should still backfill.
+	 * set: configuring the service later should still fetch.
 	 */
 	public function testNothingIsAttemptedOrRecordedWhenUnconfigured(): void {
-		$calls = [];
-		$this->backfill($this->job($this->client($calls, configured: false)));
+		$this->backfill($this->job(configured: false));
 
-		$this->assertSame([], $calls);
-		$this->assertSame([], $this->appConfig, 'an unconfigured instance must stay backfillable');
+		$this->assertSame([], $this->walks);
+		$this->assertSame([], $this->appConfig);
 	}
 
-	/**
-	 * A read failure ends the backfill rather than skipping past it: carrying
-	 * on would leave a hole in the middle of someone's history with nothing to
-	 * show for it.
-	 */
-	public function testAReadFailureStopsTheWalk(): void {
-		$calls = [];
-		$processor = $this->createMock(AwarenessPacketProcessor::class);
-		$processor->expects($this->never())->method('process');
-
-		$this->backfill($this->job($this->client($calls, failing: true), $processor));
-
-		// The first page of each pass, tried and retried three times, then
-		// that pass stops.
-		$this->assertLessThanOrEqual(8, count($calls));
-	}
-
-	/**
-	 * Queued jobs carry whatever the caller passed, and a malformed argument
-	 * must not take the queue down with it.
-	 */
-	public function testAMissingIdentityIsIgnored(): void {
-		$calls = [];
-
-		$this->backfill($this->job($this->client($calls)), ['w3id' => '']);
-		$this->backfill($this->job($this->client($calls)), null);
-
-		$this->assertSame([], $calls);
-	}
-
-	/**
-	 * Asking for a sync is asking for the history again, so it runs even for
-	 * an identity that was backfilled when it linked.
-	 */
-	public function testASyncTheUserAskedForRunsAgain(): void {
-		$calls = [];
-		$job = $this->job($this->client($calls));
-
-		$this->backfill($job);
-		$firstRun = count($calls);
-		$this->backfill($job, ['w3id' => self::W3ID, 'force' => true]);
-
-		$this->assertGreaterThan($firstRun, count($calls));
-	}
-
-	/**
-	 * The person who asked can see how it went: what was applied, and
-	 * whether the walk reached the end.
-	 */
-	public function testReportsTheOutcome(): void {
-		$calls = [];
-		$client = $this->client($calls);
-		$this->backfill($this->job($client), ['w3id' => self::W3ID, 'force' => true]);
-
-		$status = $this->statusService($this->config(), $client)->get(self::W3ID);
-		$this->assertSame(ChatSyncStatusService::STATE_DONE, $status['state']);
-		$this->assertTrue($status['complete']);
-	}
-
-	/**
-	 * A service that could not be read at all is reported as a failure the
-	 * user can take to an administrator, not as a sync that found nothing.
-	 */
-	public function testReportsAnUnreachableService(): void {
-		$calls = [];
-		$client = $this->client($calls, failing: true);
-		$this->backfill($this->job($client), ['w3id' => self::W3ID, 'force' => true]);
-
-		$this->assertSame(ChatSyncStatusService::STATE_FAILED, $this->statusService($this->config(), $client)->get(self::W3ID)['state']);
-	}
-
-	/**
-	 * Asked for on an instance that cannot sync at all: say so, rather than
-	 * leaving the request looking queued forever.
-	 */
 	public function testReportsAnUnconfiguredServiceToWhoeverAsked(): void {
-		$calls = [];
-		$client = $this->client($calls, configured: false);
-		$this->backfill($this->job($client), ['w3id' => self::W3ID, 'force' => true]);
+		$this->backfill($this->job(configured: false), ['w3id' => self::W3ID, 'force' => true]);
 
-		$this->assertSame(ChatSyncStatusService::STATE_FAILED, $this->statusService($this->config(), $client)->get(self::W3ID)['state']);
+		$this->assertSame(ChatSyncStatusService::STATE_FAILED, $this->syncStatus()['state']);
 	}
 
-	/**
-	 * One timeout or rate limit used to end the whole backfill. A page that
-	 * fails is read again before giving up.
-	 */
-	public function testAFailedPageIsRetried(): void {
-		$attempts = 0;
-		$client = $this->createMock(AwarenessClient::class);
-		$client->method('isConfigured')->willReturn(true);
-		$client->method('fetchPackets')->willReturnCallback(function () use (&$attempts): ?array {
-			$attempts++;
-			// The first read fails; everything after succeeds.
-			return $attempts === 1 ? null : ['packets' => [], 'nextCursor' => null, 'hasMore' => false];
-		});
+	public function testAMissingIdentityIsIgnored(): void {
+		$this->backfill($this->job(), ['w3id' => '']);
+		$this->backfill($this->job(), null);
 
-		$this->backfill($this->job($client), ['w3id' => self::W3ID, 'force' => true]);
-
-		$status = $this->statusService($this->config(), $client)->get(self::W3ID);
-		$this->assertSame(ChatSyncStatusService::STATE_DONE, $status['state']);
-		$this->assertTrue($status['complete']);
+		$this->assertSame([], $this->walks);
 	}
 }
