@@ -1518,8 +1518,16 @@ class ChatSyncService {
 			}
 
 			$roomService = \OCP\Server::get(\OCA\Talk\Service\RoomService::class);
+			$room = $roomService->createOneToOneConversation($actor, $target);
 
-			return $roomService->createOneToOneConversation($actor, $target)->getToken();
+			// Talk adds only the first person to a new one-to-one, and adds
+			// the other when a message is sent through its chat API. Messages
+			// imported here never go through that API, so without this the
+			// other person was never added and the conversation simply did
+			// not exist for them.
+			\OCP\Server::get(\OCA\Talk\Service\ParticipantService::class)->ensureOneToOneRoomIsFilled($room);
+
+			return $room->getToken();
 		} catch (\Throwable $e) {
 			$this->logger->warning('[W3DS Sync] Could not create one-to-one room, falling back to a group', [
 				'participants' => $participantUids,
