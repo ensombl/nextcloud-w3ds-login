@@ -236,6 +236,9 @@ class TalkHistory {
 	 */
 	private const REORDERED = ['comment', 'object_shared', 'comment_deleted'];
 
+	/** Where an undated conversation with no messages sorts: last. */
+	private const UNDATED = '2000-01-01 00:00:00 UTC';
+
 	/** Every column that refers to a chat entry by id. */
 	private const REFERENCES = [
 		['comments', 'parent_id'],
@@ -292,15 +295,19 @@ class TalkHistory {
 		if ($newest === false) {
 			// Nothing said here yet, or only before the history window: the
 			// conversation dates from its own record, not from the notice
-			// written when this server created the room.
-			if ($chatTime !== null) {
-				$qb = $this->db->getQueryBuilder();
-				$qb->update('talk_rooms')
-					->set('last_activity', $qb->createNamedParameter(\DateTimeImmutable::createFromInterface($chatTime), IQueryBuilder::PARAM_DATE))
-					->where($qb->expr()->eq('id', $qb->createNamedParameter($roomId, IQueryBuilder::PARAM_INT)))
-					->executeStatement();
-				$this->clearTalkCaches();
-			}
+			// written when this server created the room. Most records carry
+			// no date at all, and a conversation with nothing in it and no
+			// date has nothing to rank it by: it goes below every
+			// conversation that does, until somebody writes in it.
+			$qb = $this->db->getQueryBuilder();
+			$qb->update('talk_rooms')
+				->set('last_activity', $qb->createNamedParameter(
+					$chatTime !== null ? \DateTimeImmutable::createFromInterface($chatTime) : new \DateTimeImmutable(self::UNDATED),
+					IQueryBuilder::PARAM_DATE,
+				))
+				->where($qb->expr()->eq('id', $qb->createNamedParameter($roomId, IQueryBuilder::PARAM_INT)))
+				->executeStatement();
+			$this->clearTalkCaches();
 			return;
 		}
 
