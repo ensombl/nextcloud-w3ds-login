@@ -29,7 +29,7 @@ Talk chat sync (requires Nextcloud Talk):
 - @ mentions translated between Talk and W3DS identities
 - W3DS users discoverable in the share picker and from inside a room
     ]]></description>
-    <version>0.14.0</version>
+    <version>0.14.1</version>
     <licence>AGPL-3.0-or-later</licence>
     <author>Ensombl Pte. Ltd.</author>
     <namespace>W3dsLogin</namespace>
@@ -51,6 +51,11 @@ Talk chat sync (requires Nextcloud Talk):
         <php min-version="8.1"/>
         <nextcloud min-version="30" max-version="33"/>
     </dependencies>
+    <repair-steps>
+        <post-migration>
+            <step>OCA\W3dsLogin\Migration\FillOneToOneRooms</step>
+        </post-migration>
+    </repair-steps>
     <commands>
         <command>OCA\W3dsLogin\Command\DedupeMappingsCommand</command>
         <command>OCA\W3dsLogin\Command\PruneEchoedMessagesCommand</command>

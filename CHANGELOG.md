@@ -9,6 +9,16 @@ Entries below are reconstructed from commit history.
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-10-19
+
+### Fixed
+
+- Imported one-to-one conversations now include both people. Talk adds only
+  the first person to a new one-to-one and adds the other when a message is
+  sent through its chat API, which imported messages never go through. The
+  other person, often the one the conversation was imported for, could not
+  see it. An upgrade step adds them to existing conversations.
+
 ## [0.14.0] - 2026-10-19
 
 ### Fixed
