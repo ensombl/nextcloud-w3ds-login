@@ -67,7 +67,7 @@ class AwarenessSyncJob extends TimedJob {
 	private const SUBSCRIPTION_CHECK_INTERVAL = 3600;
 
 	/** When the subscription was last confirmed, as a Unix timestamp. */
-	private const SUBSCRIPTION_CHECKED_KEY = 'awareness_subscription_checked';
+	public const SUBSCRIPTION_CHECKED_KEY = 'awareness_subscription_checked';
 
 	public function __construct(
 		ITimeFactory $time,

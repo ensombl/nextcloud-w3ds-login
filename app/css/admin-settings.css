@@ -1,0 +1,86 @@
+#w3ds-admin .w3ds-admin-form {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    max-width: 480px;
+}
+
+#w3ds-admin .w3ds-admin-form label {
+    margin-top: 12px;
+    font-weight: bold;
+}
+
+#w3ds-admin .w3ds-admin-form input {
+    width: 100%;
+    margin: 0;
+}
+
+#w3ds-admin .w3ds-admin-row {
+    display: flex;
+    gap: 8px;
+}
+
+#w3ds-admin .w3ds-admin-row input {
+    flex: 1;
+}
+
+#w3ds-admin .w3ds-admin-optional {
+    font-weight: normal;
+    color: var(--color-text-maxcontrast, #767676);
+}
+
+#w3ds-admin .w3ds-admin-field-hint {
+    font-size: 0.9em;
+    color: var(--color-text-maxcontrast, #767676);
+}
+
+#w3ds-admin .w3ds-admin-advanced {
+    margin-top: 12px;
+}
+
+#w3ds-admin .w3ds-admin-advanced summary {
+    cursor: pointer;
+}
+
+#w3ds-admin .w3ds-admin-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 16px;
+}
+
+#w3ds-admin .w3ds-admin-state,
+#w3ds-admin .w3ds-admin-message {
+    margin: 8px 0;
+}
+
+#w3ds-admin .w3ds-admin-message:empty {
+    display: none;
+}
+
+#w3ds-admin .w3ds-admin-success {
+    color: var(--color-success-text, var(--color-success, #46ba61));
+}
+
+#w3ds-admin .w3ds-admin-error {
+    color: var(--color-error-text, var(--color-error, #e9322d));
+}
+
+#w3ds-admin .w3ds-admin-facts {
+    display: block;
+    max-width: 640px;
+}
+
+#w3ds-admin .w3ds-admin-facts dt {
+    display: block;
+    margin-top: 12px;
+    font-weight: bold;
+}
+
+#w3ds-admin .w3ds-admin-facts dd {
+    display: block;
+    margin: 4px 0 0;
+}
+
+#w3ds-admin .w3ds-admin-facts code {
+    word-break: break-all;
+}

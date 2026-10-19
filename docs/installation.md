@@ -157,7 +157,9 @@ First, get them:
 1. Apply for access at the AaaS portal and wait for an administrator to approve the consumer.
 2. Issue an API key from the consumer dashboard. The plaintext key is shown exactly once.
 
-Then set them on the server, from the Nextcloud install directory:
+Then enter them under **Administration settings → W3DS**: the service URL and the API key, and optionally a webhook secret (**Generate** makes one). **Test connection** confirms the key is accepted and the consumer approved. The page also shows the webhook URL and warns when background jobs are not running.
+
+Or set them from the command line, in the Nextcloud install directory:
 
 ```bash
 sudo -u www-data php occ config:app:set w3ds_login awareness_base_url \
@@ -286,6 +288,8 @@ Only an account the plugin created can be folded. The link is refused, with "Ask
 - has calendar or contact entries, which are not moved.
 
 ### Troubleshooting
+
+**Linked users see no W3DS chats.** Open **Administration settings → W3DS** and run **Test connection**. Without an accepted key and an approved consumer, nothing is delivered. Users can then press **Sync W3DS chats** at the foot of Talk's conversation list, or in **Personal settings → Security**, to fetch their last 30 days of conversations again. The sync runs as a background job, so cron must be running.
 
 **Users from the identity provider have 64-character hex user IDs.** `user_oidc` is still hashing the IdP's `sub`. Configure `--unique-uid=0 --mapping-uid=preferred_username`, as described in the previous section, and delete the hashed accounts.
 

@@ -9,6 +9,21 @@ Entries below are reconstructed from commit history.
 
 ## [Unreleased]
 
+### Added
+
+- An admin settings page, Administration settings → W3DS, to connect the
+  awareness service that delivers incoming chats. It sets the service URL, API
+  key and webhook secret, which until now needed `occ config:app:set`.
+  - The key and secret are never shown back.
+  - "Test connection" checks that the key is accepted and the consumer
+    approved.
+  - The page warns when background jobs are not running.
+- A "Sync W3DS chats" button in Talk's conversation list and in personal
+  settings. It fetches the user's last 30 days of W3DS conversations again and
+  shows progress.
+  - It explains when sync cannot run: the account isn't linked, or the server
+    isn't connected to the awareness service.
+
 ## [0.9.0] - 2026-10-19
 
 ### Added
@@ -46,6 +61,8 @@ Entries below are reconstructed from commit history.
 - The linking dialogs show why linking could not start instead of silently
   resetting.
 - Wallet logins now record the last-login time.
+- eVaults hosted on a public IP address are reachable without turning off
+  Nextcloud's protection against requests to local addresses (#38).
 
 ## [0.8.0] - 2026-09-30
 

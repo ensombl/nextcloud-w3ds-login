@@ -1,0 +1,77 @@
+.w3ds-cs {
+    padding: 8px;
+    border-top: 1px solid var(--color-border, #ededed);
+}
+
+.w3ds-cs-button {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    min-height: var(--default-clickable-area, 34px);
+    margin: 0;
+    padding: 0 12px;
+    border: none;
+    border-radius: var(--border-radius-element, var(--border-radius-large, 8px));
+    background: transparent;
+    color: var(--color-main-text, #222);
+    font-weight: normal;
+    text-align: left;
+    cursor: pointer;
+}
+
+.w3ds-cs-button:hover,
+.w3ds-cs-button:focus-visible {
+    background: var(--color-background-hover, #f5f5f5);
+}
+
+.w3ds-cs-button:disabled {
+    cursor: default;
+    opacity: 0.7;
+}
+
+.w3ds-cs-icon {
+    display: inline-block;
+    width: 20px;
+    text-align: center;
+    font-size: 1.1em;
+}
+
+.w3ds-cs-busy .w3ds-cs-icon {
+    animation: w3ds-cs-spin 1s linear infinite;
+}
+
+@keyframes w3ds-cs-spin {
+    to { transform: rotate(360deg); }
+}
+
+.w3ds-cs-status {
+    padding: 0 12px;
+    font-size: 0.85em;
+    line-height: 1.4;
+    color: var(--color-text-maxcontrast, #767676);
+}
+
+.w3ds-cs-status:empty {
+    display: none;
+}
+
+.w3ds-cs-status.w3ds-cs-success {
+    color: var(--color-success-text, var(--color-success, #46ba61));
+}
+
+.w3ds-cs-status.w3ds-cs-error {
+    color: var(--color-error-text, var(--color-error, #e9322d));
+}
+
+.w3ds-cs-floating {
+    position: fixed;
+    left: 16px;
+    bottom: 16px;
+    z-index: 2000;
+    max-width: 280px;
+    border: 1px solid var(--color-border, #ededed);
+    border-radius: var(--border-radius-large, 8px);
+    background: var(--color-main-background, #fff);
+    box-shadow: 0 2px 8px var(--color-box-shadow, rgba(0, 0, 0, 0.15));
+}
