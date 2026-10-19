@@ -9,6 +9,15 @@ Entries below are reconstructed from commit history.
 
 ## [Unreleased]
 
+## [0.15.2] - 2026-10-19
+
+### Fixed
+
+- Conversations with no messages and no date in their own record (most
+  records carry none) are listed below every conversation with messages,
+  instead of sorting at the time this server created them. They rise
+  normally as soon as someone writes in them.
+
 ## [0.15.1] - 2026-10-19
 
 ### Fixed
