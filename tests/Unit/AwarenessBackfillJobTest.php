@@ -68,14 +68,18 @@ class AwarenessBackfillJobTest extends TestCase {
 	private function job(AwarenessClient $client, ?AwarenessPacketProcessor $processor = null): AwarenessBackfillJob {
 		$config = $this->config();
 
-		return new AwarenessBackfillJob(
-			$this->createMock(ITimeFactory::class),
-			$client,
-			$processor ?? $this->createMock(AwarenessPacketProcessor::class),
-			$config,
-			new NullLogger(),
-			$this->statusService($config, $client),
-		);
+		// Retries pause for real seconds; not here.
+		return $this->getMockBuilder(AwarenessBackfillJob::class)
+			->setConstructorArgs([
+				$this->createMock(ITimeFactory::class),
+				$client,
+				$processor ?? $this->createMock(AwarenessPacketProcessor::class),
+				$config,
+				new NullLogger(),
+				$this->statusService($config, $client),
+			])
+			->onlyMethods(['pause'])
+			->getMock();
 	}
 
 	private function statusService(IConfig $config, AwarenessClient $client): ChatSyncStatusService {
@@ -237,8 +241,9 @@ class AwarenessBackfillJobTest extends TestCase {
 
 		$this->backfill($this->job($this->client($calls, failing: true), $processor));
 
-		// One attempt per ontology group, then stop.
-		$this->assertLessThanOrEqual(2, count($calls));
+		// The first page of each pass, tried and retried three times, then
+		// that pass stops.
+		$this->assertLessThanOrEqual(8, count($calls));
 	}
 
 	/**
@@ -305,5 +310,26 @@ class AwarenessBackfillJobTest extends TestCase {
 		$this->backfill($this->job($client), ['w3id' => self::W3ID, 'force' => true]);
 
 		$this->assertSame(ChatSyncStatusService::STATE_FAILED, $this->statusService($this->config(), $client)->get(self::W3ID)['state']);
+	}
+
+	/**
+	 * One timeout or rate limit used to end the whole backfill. A page that
+	 * fails is read again before giving up.
+	 */
+	public function testAFailedPageIsRetried(): void {
+		$attempts = 0;
+		$client = $this->createMock(AwarenessClient::class);
+		$client->method('isConfigured')->willReturn(true);
+		$client->method('fetchPackets')->willReturnCallback(function () use (&$attempts): ?array {
+			$attempts++;
+			// The first read fails; everything after succeeds.
+			return $attempts === 1 ? null : ['packets' => [], 'nextCursor' => null, 'hasMore' => false];
+		});
+
+		$this->backfill($this->job($client), ['w3id' => self::W3ID, 'force' => true]);
+
+		$status = $this->statusService($this->config(), $client)->get(self::W3ID);
+		$this->assertSame(ChatSyncStatusService::STATE_DONE, $status['state']);
+		$this->assertTrue($status['complete']);
 	}
 }

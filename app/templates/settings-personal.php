@@ -27,7 +27,7 @@ $unlinkUrl = $_['unlinkUrl'];
                 <strong><?php p($linkedW3id); ?></strong>
             </p>
             <p class="w3ds-settings-note">
-                Missing conversations from other W3DS platforms? Fetch them again:
+                Talk keeps your W3DS conversations up to date while it is open. If something is still missing:
             </p>
             <div id="w3ds-chat-sync-slot"></div>
             <?php Util::addScript('w3ds_login', 'chat-sync'); ?>

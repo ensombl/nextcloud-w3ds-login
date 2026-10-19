@@ -123,6 +123,10 @@ class AwarenessPoller {
 		}
 	}
 
+	public function isConfigured(): bool {
+		return $this->awarenessClient->isConfigured();
+	}
+
 	/**
 	 * Seconds since a poll last completed, or null if none ever has.
 	 */

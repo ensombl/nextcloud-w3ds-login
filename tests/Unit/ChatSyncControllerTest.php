@@ -65,6 +65,7 @@ class ChatSyncControllerTest extends TestCase {
 	 */
 	public function testAPageSkipsAPollThatJustHappened(): void {
 		$poller = $this->createMock(AwarenessPoller::class);
+		$poller->method('isConfigured')->willReturn(true);
 		$poller->method('secondsSinceLastPoll')->willReturn(3);
 		$poller->expects($this->never())->method('poll');
 
@@ -75,11 +76,40 @@ class ChatSyncControllerTest extends TestCase {
 
 	public function testAPagePollsWhenNothingDidRecently(): void {
 		$poller = $this->createMock(AwarenessPoller::class);
-		$poller->method('secondsSinceLastPoll')->willReturn(120);
+		$poller->method('isConfigured')->willReturn(true);
+		$poller->method('secondsSinceLastPoll')->willReturnOnConsecutiveCalls(120, 0);
 		$poller->expects($this->once())->method('poll')->willReturn(4);
 
-		$response = $this->controller('@alice', $this->createMock(ChatSyncStatusService::class), $poller)->poll();
+		$data = $this->controller('@alice', $this->createMock(ChatSyncStatusService::class), $poller)->poll()->getData();
 
-		$this->assertSame(['polled' => true, 'applied' => 4], $response->getData());
+		$this->assertTrue($data['polled']);
+		$this->assertSame(4, $data['applied']);
+		$this->assertEqualsWithDelta(time(), $data['lastPolledAt'], 2);
+	}
+
+	/**
+	 * Opening a conversation fetches now, not up to half a minute later.
+	 */
+	public function testAnOpenConversationPollsEvenAfterARecentPoll(): void {
+		$poller = $this->createMock(AwarenessPoller::class);
+		$poller->method('isConfigured')->willReturn(true);
+		$poller->method('secondsSinceLastPoll')->willReturn(10);
+		$poller->expects($this->once())->method('poll')->willReturn(0);
+
+		$this->controller('@alice', $this->createMock(ChatSyncStatusService::class), $poller)->poll(chatOpen: true);
+	}
+
+	/**
+	 * The indicator says why nothing arrives, rather than claiming to sync.
+	 */
+	public function testAnUnconnectedServerIsReportedToThePage(): void {
+		$poller = $this->createMock(AwarenessPoller::class);
+		$poller->method('isConfigured')->willReturn(false);
+		$poller->expects($this->never())->method('poll');
+
+		$data = $this->controller('@alice', $this->createMock(ChatSyncStatusService::class), $poller)->poll()->getData();
+
+		$this->assertFalse($data['configured']);
+		$this->assertStringContainsString('administrator', $data['error']);
 	}
 }
