@@ -5,8 +5,9 @@ declare(strict_types=1);
 namespace OCA\W3dsLogin\BackgroundJob;
 
 use OCA\W3dsLogin\AppInfo\Application;
+use OCA\W3dsLogin\Db\W3dsMappingMapper;
 use OCA\W3dsLogin\Service\AwarenessClient;
-use OCA\W3dsLogin\Service\AwarenessPacketProcessor;
+use OCA\W3dsLogin\Service\ChatHistoryService;
 use OCA\W3dsLogin\Service\ChatSyncService;
 use OCA\W3dsLogin\Service\ChatSyncStatusService;
 use OCP\AppFramework\Utility\ITimeFactory;
@@ -37,39 +38,28 @@ use Psr\Log\LoggerInterface;
  */
 class AwarenessBackfillJob extends QueuedJob {
 	/**
-	 * How far back a person's messages are fetched.
-	 *
-	 * The read is restricted to their own eVault, so its cost grows with
-	 * their history rather than the network's. Their conversations
-	 * themselves are read without a window: a message is only placed in a
-	 * conversation that exists here, and a conversation started before the
-	 * window would otherwise drop every message sent in it since.
+	 * How far back conversations started elsewhere, and all messages, are
+	 * fetched. The person's own conversations are read without a window: a
+	 * message is only placed in a conversation that exists here, and one
+	 * started before the window would otherwise lose every message since.
 	 */
 	private const WINDOW_DAYS = 90;
 
 	/**
-	 * Pages read per ontology, at 500 packets each.
-	 *
-	 * A ceiling rather than an expectation -- one person's eVault rarely
-	 * fills more than a handful -- so a runaway history cannot hold the queue
-	 * indefinitely. Reaching it is reported as an incomplete sync.
+	 * Pages read per walk, at 500 packets each: a ceiling, not an
+	 * expectation, so a runaway history cannot hold the queue indefinitely.
+	 * Reaching it is reported as an incomplete sync.
 	 */
 	private const MAX_PAGES = 200;
 
-	/**
-	 * Pauses before re-reading a page that failed, in seconds. The service
-	 * rate-limits and occasionally times out; one bad response used to end
-	 * the whole backfill, leaving most of someone's history unread.
-	 */
-	private const RETRY_DELAYS = [2, 5, 15];
-
-	/** False when a page could not be read and the walk stopped short. */
-	private bool $complete = true;
+	/** eVaults read for messages, at most, in one history fetch. */
+	private const MAX_VAULTS = 500;
 
 	public function __construct(
 		ITimeFactory $time,
 		private AwarenessClient $awarenessClient,
-		private AwarenessPacketProcessor $processor,
+		private ChatHistoryService $history,
+		private W3dsMappingMapper $mappings,
 		private IConfig $config,
 		private LoggerInterface $logger,
 		private ChatSyncStatusService $status,
@@ -83,8 +73,8 @@ class AwarenessBackfillJob extends QueuedJob {
 			return;
 		}
 
-		// Asked for by the user, from the sync button: run even if this
-		// identity was backfilled before, which is the whole point of asking.
+		// Asked for by the user, or by Talk on their first visit: run even if
+		// this identity was fetched before, which is the point of asking.
 		$forced = is_array($argument) && ($argument['force'] ?? false) === true;
 
 		if (!$this->awarenessClient->isConfigured()) {
@@ -98,9 +88,9 @@ class AwarenessBackfillJob extends QueuedJob {
 			return;
 		}
 
-		// Linking is not rare enough to replay a month of history on every
-		// attempt: a user may link, unlink and link again, and the same job can
-		// be queued twice by a retried callback.
+		// Linking is not rare enough to replay history on every attempt: a
+		// user may link, unlink and link again, and the same job can be
+		// queued twice by a retried callback.
 		$marker = 'awareness_backfilled_' . md5($w3id);
 		if (!$forced && $this->config->getAppValue(Application::APP_ID, $marker, '') !== '') {
 			return;
@@ -110,109 +100,67 @@ class AwarenessBackfillJob extends QueuedJob {
 
 		$from = gmdate('Y-m-d\TH:i:s\Z', time() - (self::WINDOW_DAYS * 86400));
 
-		// Conversations first. A message whose chat has no local room is
-		// dropped, not deferred, so reading them in the other order would
-		// discard most of what this job exists to fetch.
-		$this->complete = true;
 		try {
-			$chats = $this->replay([ChatSyncService::CHAT_SCHEMA_ID], null, $w3id);
-			$messages = $this->replay(
+			// Conversations first. A message whose chat has no local room is
+			// dropped, not deferred, so reading them in the other order would
+			// discard most of what this job exists to fetch.
+			//
+			// The ones in this person's own eVault, however old; then every
+			// conversation from the window, because a group keeps its
+			// conversation in the group's eVault rather than its members',
+			// and only the processor can tell which of those include them.
+			$own = $this->history->walk([ChatSyncService::CHAT_SCHEMA_ID], null, $w3id, self::MAX_PAGES);
+			$groups = $this->history->walk([ChatSyncService::CHAT_SCHEMA_ID], $from, null, self::MAX_PAGES);
+
+			// Then the messages, from every eVault that holds any: each
+			// conversation's own and each participant's. Messages are not
+			// copied to whoever reads them.
+			$vaults = $this->vaultsFor($w3id);
+			$messages = $this->history->fetchFromVaults(
+				array_slice($vaults, 0, self::MAX_VAULTS),
 				[ChatSyncService::MESSAGE_SCHEMA_ID, AwarenessClient::FILE_ONTOLOGY],
 				$from,
-				$w3id,
+				self::MAX_PAGES,
 			);
 		} catch (\Throwable $e) {
 			$this->status->markFailed($w3id, 'Fetching conversations failed. Try again later.');
 			throw $e;
 		}
-		if (!$this->complete && $chats === 0 && $messages === 0) {
+
+		$chats = $own['applied'] + $groups['applied'];
+		$complete = $own['complete'] && $groups['complete'] && $messages['complete'] && count($vaults) <= self::MAX_VAULTS;
+		if (!$complete && $chats === 0 && $messages['applied'] === 0) {
 			// Nothing at all could be read: the service is unreachable or
 			// refused the key, which only an administrator can fix.
 			$this->status->markFailed($w3id, 'Could not reach the awareness service. Ask an administrator to check it under Administration settings → W3DS.');
 		} else {
-			$this->status->markDone($w3id, $chats, $messages, $this->complete);
+			$this->status->markDone($w3id, $chats, $messages['applied'], $complete);
 		}
 
-		$this->logger->info('[W3DS Awareness] Backfilled history for a newly linked user', [
+		$this->logger->info('[W3DS Awareness] Fetched history', [
 			'w3id' => $w3id,
 			'chatsApplied' => $chats,
-			'messagesApplied' => $messages,
+			'messagesApplied' => $messages['applied'],
+			'vaultsRead' => min(count($vaults), self::MAX_VAULTS),
+			'complete' => $complete,
 			'since' => $from,
 		]);
 	}
 
 	/**
-	 * Walk one slice of one person's history, applying whatever belongs here.
-	 *
-	 * Restricted to their eVault, which holds a copy of every conversation
-	 * and message they are part of. Reading the whole network instead -- the
-	 * service's only other option -- meant walking everyone's traffic oldest
-	 * first and stopping at a page limit, which on a busy network ran out
-	 * before reaching the recent messages people actually miss.
-	 *
-	 * @param string[] $ontologies
-	 * @return int Packets that resulted in local work.
+	 * @return list<string>
 	 */
-	private function replay(array $ontologies, ?string $from, string $w3id): int {
-		$cursor = null;
-		$applied = 0;
-
-		for ($page = 0; $page < self::MAX_PAGES; $page++) {
-			$result = $this->fetchWithRetry($cursor, $ontologies, $from, $w3id);
-
-			// A failed read ends the backfill rather than skipping past it.
-			// Continuing would leave a hole in the middle of someone's history
-			// with nothing to signal it; stopping leaves the live poll to
-			// carry on from the present, which is the normal state anyway.
-			if ($result === null) {
-				$this->logger->warning('[W3DS Awareness] Backfill stopped early: could not read history');
-				$this->complete = false;
-
-				return $applied;
-			}
-
-			foreach ($result['packets'] as $packet) {
-				// Re-apply rather than skip. Most of this history has already
-				// been seen by the live poll, and a conversation ingested
-				// before this person had an account here was created without
-				// them; only handing the chat back to the handler adds them.
-				if ($this->processor->process($packet, reapply: true)) {
-					$applied++;
-				}
-			}
-
-			$cursor = $result['nextCursor'];
-			if (!$result['hasMore'] || $cursor === null) {
-				return $applied;
-			}
+	private function vaultsFor(string $w3id): array {
+		try {
+			$uid = $this->mappings->findByW3id($w3id)->getNcUid();
+		} catch (\Throwable) {
+			return [$w3id];
 		}
 
-		// Out of pages with more still to read.
-		$this->complete = false;
-		$this->logger->warning('[W3DS Awareness] Backfill stopped at its page limit', ['w3id' => $w3id]);
+		// Their own eVault too: it holds what they sent.
+		$vaults = $this->history->vaultsForUser($uid);
+		array_unshift($vaults, $w3id);
 
-		return $applied;
-	}
-
-	/**
-	 * @param string[] $ontologies
-	 * @return array{packets: list<array<string, mixed>>, nextCursor: ?string, hasMore: bool}|null
-	 */
-	private function fetchWithRetry(?string $cursor, array $ontologies, ?string $from, string $w3id): ?array {
-		$result = $this->awarenessClient->fetchPackets($cursor, $ontologies, $from, $w3id);
-		foreach (self::RETRY_DELAYS as $delay) {
-			if ($result !== null) {
-				break;
-			}
-			$this->pause($delay);
-			$result = $this->awarenessClient->fetchPackets($cursor, $ontologies, $from, $w3id);
-		}
-
-		return $result;
-	}
-
-	/** Separate so tests need not wait. */
-	protected function pause(int $seconds): void {
-		sleep($seconds);
+		return array_values(array_unique($vaults));
 	}
 }

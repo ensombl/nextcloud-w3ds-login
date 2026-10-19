@@ -10,6 +10,8 @@ use OCA\W3dsLogin\Service\ChatSyncService;
 use OCA\W3dsLogin\Service\EvaultClient;
 use OCA\W3dsLogin\Service\UserProvisioningService;
 use OCP\AppFramework\Db\DoesNotExistException;
+use OCP\IUser;
+use OCP\IUserManager;
 use PHPUnit\Framework\TestCase;
 
 /**
@@ -34,8 +36,9 @@ class ChatSyncServiceChatMembershipTest extends TestCase {
 	/**
 	 * @param list<string> $linked eNames that have an account on this server.
 	 * @param array<string, string> $profiles Envelope ID to eName, as the eVault would resolve.
+	 * @param array<string, int> $madeByThisApp eNames whose account this app made, with their last login (0 = never).
 	 */
-	private function service(array $linked, array $profiles = []): ChatSyncService {
+	private function service(array $linked, array $profiles = [], array $madeByThisApp = []): ChatSyncService {
 		$service = (new \ReflectionClass(ChatSyncService::class))->newInstanceWithoutConstructor();
 
 		$mapper = $this->createMock(W3dsMappingMapper::class);
@@ -45,7 +48,11 @@ class ChatSyncServiceChatMembershipTest extends TestCase {
 					throw new DoesNotExistException('no such mapping');
 				}
 
-				return new W3dsMapping();
+				$mapping = new W3dsMapping();
+				$mapping->setW3id($w3id);
+				$mapping->setNcUid('uid-' . $w3id);
+
+				return $mapping;
 			},
 		);
 
@@ -57,11 +64,22 @@ class ChatSyncServiceChatMembershipTest extends TestCase {
 		// Provisioning is the side effect this decision must not have.
 		$provisioning = $this->createMock(UserProvisioningService::class);
 		$provisioning->expects($this->never())->method('findOrCreateUser');
+		$provisioning->method('isAppProvisioned')->willReturnCallback(
+			static fn (string $uid): bool => array_key_exists(substr($uid, 4), $madeByThisApp),
+		);
+
+		$users = $this->createMock(IUserManager::class);
+		$users->method('get')->willReturnCallback(function (string $uid) use ($madeByThisApp): IUser {
+			$user = $this->createMock(IUser::class);
+			$user->method('getLastLogin')->willReturn($madeByThisApp[substr($uid, 4)] ?? 0);
+			return $user;
+		});
 
 		foreach ([
 			'w3dsMappingMapper' => $mapper,
 			'evaultClient' => $evault,
 			'userProvisioning' => $provisioning,
+			'userManager' => $users,
 		] as $name => $value) {
 			$prop = new \ReflectionProperty(ChatSyncService::class, $name);
 			$prop->setAccessible(true);
@@ -182,5 +200,26 @@ class ChatSyncServiceChatMembershipTest extends TestCase {
 			$gate,
 			'the gate must run before participant resolution, which provisions accounts',
 		);
+	}
+
+	/**
+	 * This app makes an account for every peer it shows as a sender. Such an
+	 * account is not somebody here: counting it made every chat that peer is
+	 * in, anywhere on the network, into a room on this server.
+	 */
+	public function testAnAccountThisAppMadeForAPeerIsNotSomebodyHere(): void {
+		$service = $this->service([self::STRANGER], [], [self::STRANGER => 0]);
+		$data = ['participantIds' => [self::STRANGER, '@another-person']];
+
+		$this->assertFalse($this->involvesLinkedUser($service, $data, '@another-person'));
+	}
+
+	/**
+	 * Unless its owner has signed in to it, with their wallet.
+	 */
+	public function testAnAccountThisAppMadeCountsOnceItsOwnerSignsIn(): void {
+		$service = $this->service([self::LINKED], [], [self::LINKED => 1700000000]);
+
+		$this->assertTrue($this->involvesLinkedUser($service, ['participantIds' => [self::LINKED]], self::STRANGER));
 	}
 }
