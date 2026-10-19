@@ -26,6 +26,12 @@ $unlinkUrl = $_['unlinkUrl'];
                 Your account is linked to
                 <strong><?php p($linkedW3id); ?></strong>
             </p>
+            <p class="w3ds-settings-note">
+                Missing conversations from other W3DS platforms? Fetch them again:
+            </p>
+            <div id="w3ds-chat-sync-slot"></div>
+            <?php Util::addScript('w3ds_login', 'chat-sync'); ?>
+            <?php Util::addStyle('w3ds_login', 'chat-sync'); ?>
             <?php if ($hasEmail): ?>
                 <button id="w3ds-unlink-btn" type="button" class="button">
                     Unlink W3DS identity
@@ -81,6 +87,16 @@ $unlinkUrl = $_['unlinkUrl'];
         margin-top: 0.5rem;
         font-size: 0.85rem;
         color: var(--color-text-maxcontrast, #767676);
+    }
+
+    #w3ds-settings #w3ds-chat-sync-slot {
+        max-width: 360px;
+        margin-bottom: 1rem;
+    }
+
+    #w3ds-settings #w3ds-chat-sync-slot .w3ds-cs {
+        padding: 0;
+        border-top: none;
     }
 
     #w3ds-settings .w3ds-settings-error {

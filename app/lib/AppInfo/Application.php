@@ -8,6 +8,7 @@ use OCA\W3dsLogin\BackgroundJob\AwarenessSyncJob;
 use OCA\W3dsLogin\BackgroundJob\TentativeUserCleanupJob;
 use OCA\W3dsLogin\Listener\AttendeesAddedTentativeFlipListener;
 use OCA\W3dsLogin\Listener\AttendeesChangedListener;
+use OCA\W3dsLogin\Listener\ChatSyncButtonListener;
 use OCA\W3dsLogin\Listener\LinkPromptListener;
 use OCA\W3dsLogin\Listener\LoginProfileSyncListener;
 use OCA\W3dsLogin\Listener\MessageSentListener;
@@ -88,6 +89,7 @@ class Application extends App implements IBootstrap {
 		// one scan so their account can sync.
 		$context->registerEventListener(self::OIDC_TOKEN_OBTAINED_EVENT, OidcTokenListener::class);
 		$context->registerEventListener(BeforeTemplateRenderedEvent::class, LinkPromptListener::class);
+		$context->registerEventListener(BeforeTemplateRenderedEvent::class, ChatSyncButtonListener::class);
 
 		// Every interactive login of a linked user pulls their eVault
 		// profile, after the IdP has written its claims, so the eVault wins.

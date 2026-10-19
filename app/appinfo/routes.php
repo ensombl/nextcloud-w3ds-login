@@ -17,6 +17,14 @@ return [
 		['name' => 'settings#unlink', 'url' => '/settings/unlink', 'verb' => 'POST'],
 		['name' => 'settings#linkDismiss', 'url' => '/settings/link/dismiss', 'verb' => 'POST'],
 
+		// Awareness service settings (admin only).
+		['name' => 'admin_settings#save', 'url' => '/admin/settings', 'verb' => 'POST'],
+		['name' => 'admin_settings#test', 'url' => '/admin/settings/test', 'verb' => 'POST'],
+
+		// Fetch the signed-in user's W3DS conversations again, on request.
+		['name' => 'chat_sync#start', 'url' => '/chats/sync', 'verb' => 'POST'],
+		['name' => 'chat_sync#status', 'url' => '/chats/sync', 'verb' => 'GET'],
+
 
 		// Awareness packets pushed by AaaS (public; authenticated by the
 		// subscription secret rather than a session).

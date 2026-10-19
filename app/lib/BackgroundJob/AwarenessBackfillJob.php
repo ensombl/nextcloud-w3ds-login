@@ -8,6 +8,7 @@ use OCA\W3dsLogin\AppInfo\Application;
 use OCA\W3dsLogin\Service\AwarenessClient;
 use OCA\W3dsLogin\Service\AwarenessPacketProcessor;
 use OCA\W3dsLogin\Service\ChatSyncService;
+use OCA\W3dsLogin\Service\ChatSyncStatusService;
 use OCP\AppFramework\Utility\ITimeFactory;
 use OCP\BackgroundJob\QueuedJob;
 use OCP\IConfig;
@@ -54,12 +55,16 @@ class AwarenessBackfillJob extends QueuedJob {
 	 */
 	private const MAX_PAGES = 60;
 
+	/** False when a page could not be read and the walk stopped short. */
+	private bool $complete = true;
+
 	public function __construct(
 		ITimeFactory $time,
 		private AwarenessClient $awarenessClient,
 		private AwarenessPacketProcessor $processor,
 		private IConfig $config,
 		private LoggerInterface $logger,
+		private ChatSyncStatusService $status,
 	) {
 		parent::__construct($time);
 	}
@@ -70,10 +75,17 @@ class AwarenessBackfillJob extends QueuedJob {
 			return;
 		}
 
+		// Asked for by the user, from the sync button: run even if this
+		// identity was backfilled before, which is the whole point of asking.
+		$forced = is_array($argument) && ($argument['force'] ?? false) === true;
+
 		if (!$this->awarenessClient->isConfigured()) {
 			$this->logger->info('[W3DS Awareness] Skipping backfill, no awareness service configured', [
 				'w3id' => $w3id,
 			]);
+			if ($forced) {
+				$this->status->markFailed($w3id, 'The awareness service is not configured on this server.');
+			}
 
 			return;
 		}
@@ -82,21 +94,35 @@ class AwarenessBackfillJob extends QueuedJob {
 		// attempt: a user may link, unlink and link again, and the same job can
 		// be queued twice by a retried callback.
 		$marker = 'awareness_backfilled_' . md5($w3id);
-		if ($this->config->getAppValue(Application::APP_ID, $marker, '') !== '') {
+		if (!$forced && $this->config->getAppValue(Application::APP_ID, $marker, '') !== '') {
 			return;
 		}
 		$this->config->setAppValue(Application::APP_ID, $marker, (string)time());
+		$this->status->markRunning($w3id);
 
 		$from = gmdate('Y-m-d\TH:i:s\Z', time() - (self::WINDOW_DAYS * 86400));
 
 		// Conversations first. A message whose chat has no local room is
 		// dropped, not deferred, so reading them in the other order would
 		// discard most of what this job exists to fetch.
-		$chats = $this->replay([ChatSyncService::CHAT_SCHEMA_ID], $from);
-		$messages = $this->replay(
-			[ChatSyncService::MESSAGE_SCHEMA_ID, AwarenessClient::FILE_ONTOLOGY],
-			$from,
-		);
+		$this->complete = true;
+		try {
+			$chats = $this->replay([ChatSyncService::CHAT_SCHEMA_ID], $from);
+			$messages = $this->replay(
+				[ChatSyncService::MESSAGE_SCHEMA_ID, AwarenessClient::FILE_ONTOLOGY],
+				$from,
+			);
+		} catch (\Throwable $e) {
+			$this->status->markFailed($w3id, 'Fetching conversations failed. Try again later.');
+			throw $e;
+		}
+		if (!$this->complete && $chats === 0 && $messages === 0) {
+			// Nothing at all could be read: the service is unreachable or
+			// refused the key, which only an administrator can fix.
+			$this->status->markFailed($w3id, 'Could not reach the awareness service. Ask an administrator to check it under Administration settings → W3DS.');
+		} else {
+			$this->status->markDone($w3id, $chats, $messages, $this->complete);
+		}
 
 		$this->logger->info('[W3DS Awareness] Backfilled history for a newly linked user', [
 			'w3id' => $w3id,
@@ -131,6 +157,7 @@ class AwarenessBackfillJob extends QueuedJob {
 			// carry on from the present, which is the normal state anyway.
 			if ($result === null) {
 				$this->logger->warning('[W3DS Awareness] Backfill stopped early: could not read history');
+				$this->complete = false;
 
 				break;
 			}

@@ -7,6 +7,7 @@ namespace OCA\W3dsLogin\Settings;
 use OCA\W3dsLogin\AppInfo\Application;
 use OCA\W3dsLogin\Service\UserProvisioningService;
 use OCP\AppFramework\Http\TemplateResponse;
+use OCP\AppFramework\Services\IInitialState;
 use OCP\IURLGenerator;
 use OCP\IUserSession;
 use OCP\Settings\ISettings;
@@ -16,6 +17,7 @@ class PersonalSettings implements ISettings {
 		private UserProvisioningService $provisioningService,
 		private IUserSession $userSession,
 		private IURLGenerator $urlGenerator,
+		private IInitialState $initialState,
 	) {
 	}
 
@@ -35,6 +37,11 @@ class PersonalSettings implements ISettings {
 			$unlinkUrl = $this->urlGenerator->linkToRoute(
 				Application::APP_ID . '.settings.unlink',
 			);
+			if ($linkedW3id !== null) {
+				$this->initialState->provideInitialState('chat-sync', [
+					'url' => $this->urlGenerator->linkToRoute(Application::APP_ID . '.chat_sync.start'),
+				]);
+			}
 		}
 
 		return new TemplateResponse(

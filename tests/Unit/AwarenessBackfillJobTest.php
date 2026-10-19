@@ -8,7 +8,9 @@ use OCA\W3dsLogin\BackgroundJob\AwarenessBackfillJob;
 use OCA\W3dsLogin\Service\AwarenessClient;
 use OCA\W3dsLogin\Service\AwarenessPacketProcessor;
 use OCA\W3dsLogin\Service\ChatSyncService;
+use OCA\W3dsLogin\Service\ChatSyncStatusService;
 use OCP\AppFramework\Utility\ITimeFactory;
+use OCP\BackgroundJob\IJobList;
 use OCP\IConfig;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\NullLogger;
@@ -64,13 +66,20 @@ class AwarenessBackfillJobTest extends TestCase {
 	}
 
 	private function job(AwarenessClient $client, ?AwarenessPacketProcessor $processor = null): AwarenessBackfillJob {
+		$config = $this->config();
+
 		return new AwarenessBackfillJob(
 			$this->createMock(ITimeFactory::class),
 			$client,
 			$processor ?? $this->createMock(AwarenessPacketProcessor::class),
-			$this->config(),
+			$config,
 			new NullLogger(),
+			$this->statusService($config, $client),
 		);
+	}
+
+	private function statusService(IConfig $config, AwarenessClient $client): ChatSyncStatusService {
+		return new ChatSyncStatusService($config, $this->createMock(IJobList::class), $client);
 	}
 
 	private function backfill(AwarenessBackfillJob $job, mixed $argument = ['w3id' => self::W3ID]): void {
@@ -204,5 +213,58 @@ class AwarenessBackfillJobTest extends TestCase {
 		$this->backfill($this->job($this->client($calls)), null);
 
 		$this->assertSame([], $calls);
+	}
+
+	/**
+	 * Asking for a sync is asking for the history again, so it runs even for
+	 * an identity that was backfilled when it linked.
+	 */
+	public function testASyncTheUserAskedForRunsAgain(): void {
+		$calls = [];
+		$job = $this->job($this->client($calls));
+
+		$this->backfill($job);
+		$firstRun = count($calls);
+		$this->backfill($job, ['w3id' => self::W3ID, 'force' => true]);
+
+		$this->assertGreaterThan($firstRun, count($calls));
+	}
+
+	/**
+	 * The person who asked can see how it went: what was applied, and
+	 * whether the walk reached the end.
+	 */
+	public function testReportsTheOutcome(): void {
+		$calls = [];
+		$client = $this->client($calls);
+		$this->backfill($this->job($client), ['w3id' => self::W3ID, 'force' => true]);
+
+		$status = $this->statusService($this->config(), $client)->get(self::W3ID);
+		$this->assertSame(ChatSyncStatusService::STATE_DONE, $status['state']);
+		$this->assertTrue($status['complete']);
+	}
+
+	/**
+	 * A service that could not be read at all is reported as a failure the
+	 * user can take to an administrator, not as a sync that found nothing.
+	 */
+	public function testReportsAnUnreachableService(): void {
+		$calls = [];
+		$client = $this->client($calls, failing: true);
+		$this->backfill($this->job($client), ['w3id' => self::W3ID, 'force' => true]);
+
+		$this->assertSame(ChatSyncStatusService::STATE_FAILED, $this->statusService($this->config(), $client)->get(self::W3ID)['state']);
+	}
+
+	/**
+	 * Asked for on an instance that cannot sync at all: say so, rather than
+	 * leaving the request looking queued forever.
+	 */
+	public function testReportsAnUnconfiguredServiceToWhoeverAsked(): void {
+		$calls = [];
+		$client = $this->client($calls, configured: false);
+		$this->backfill($this->job($client), ['w3id' => self::W3ID, 'force' => true]);
+
+		$this->assertSame(ChatSyncStatusService::STATE_FAILED, $this->statusService($this->config(), $client)->get(self::W3ID)['state']);
 	}
 }

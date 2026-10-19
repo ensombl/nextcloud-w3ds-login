@@ -56,6 +56,8 @@ Talk chat sync (requires Nextcloud Talk):
         <command>OCA\W3dsLogin\Command\PruneEchoedMessagesCommand</command>
     </commands>
     <settings>
+        <admin>OCA\W3dsLogin\Settings\AdminSettings</admin>
+        <admin-section>OCA\W3dsLogin\Settings\AdminSection</admin-section>
         <personal>OCA\W3dsLogin\Settings\PersonalSettings</personal>
         <personal-section>security</personal-section>
     </settings>
