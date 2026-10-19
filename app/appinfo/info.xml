@@ -54,6 +54,7 @@ Talk chat sync (requires Nextcloud Talk):
     <commands>
         <command>OCA\W3dsLogin\Command\DedupeMappingsCommand</command>
         <command>OCA\W3dsLogin\Command\PruneEchoedMessagesCommand</command>
+        <command>OCA\W3dsLogin\Command\AwarenessPollCommand</command>
     </commands>
     <settings>
         <admin>OCA\W3dsLogin\Settings\AdminSettings</admin>

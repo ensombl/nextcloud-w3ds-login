@@ -4,12 +4,14 @@ declare(strict_types=1);
 
 namespace OCA\W3dsLogin\Tests\Unit;
 
-use OCA\W3dsLogin\BackgroundJob\AwarenessSyncJob;
 use OCA\W3dsLogin\Service\AwarenessClient;
 use OCA\W3dsLogin\Service\AwarenessPacketProcessor;
-use OCP\AppFramework\Utility\ITimeFactory;
+use OCA\W3dsLogin\Service\AwarenessPoller;
+use OCP\IAppConfig;
 use OCP\IConfig;
 use OCP\IURLGenerator;
+use OCP\Lock\ILockingProvider;
+use OCP\Lock\LockedException;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\NullLogger;
 
@@ -21,9 +23,11 @@ use Psr\Log\NullLogger;
  * message that silently never appears in a conversation, so the position it
  * resumes from is the part worth testing.
  */
-class AwarenessSyncJobTest extends TestCase {
+class AwarenessPollerTest extends TestCase {
 	/** @var array<string, string> */
 	private array $appConfig = [];
+
+	private bool $locked = false;
 
 	private function config(): IConfig {
 		$config = $this->createMock(IConfig::class);
@@ -40,23 +44,28 @@ class AwarenessSyncJobTest extends TestCase {
 		return $config;
 	}
 
-	private function job(AwarenessClient $client, ?AwarenessPacketProcessor $processor = null): AwarenessSyncJob {
+	private function job(AwarenessClient $client, ?AwarenessPacketProcessor $processor = null): AwarenessPoller {
 		$processor ??= $this->createMock(AwarenessPacketProcessor::class);
+		$locks = $this->createMock(ILockingProvider::class);
+		$locks->method('acquireLock')->willReturnCallback(function (): void {
+			if ($this->locked) {
+				throw new LockedException('w3ds_login/awareness_poll');
+			}
+		});
 
-		return new AwarenessSyncJob(
-			$this->createMock(ITimeFactory::class),
+		return new AwarenessPoller(
 			$client,
 			$processor,
 			$this->config(),
 			$this->createMock(IURLGenerator::class),
+			$locks,
+			$this->createMock(IAppConfig::class),
 			new NullLogger(),
 		);
 	}
 
-	private function tick(AwarenessSyncJob $job): void {
-		$method = new \ReflectionMethod(AwarenessSyncJob::class, 'run');
-		$method->setAccessible(true);
-		$method->invoke($job, null);
+	private function tick(AwarenessPoller $poller): ?int {
+		return $poller->poll();
 	}
 
 	/**
@@ -174,7 +183,7 @@ class AwarenessSyncJobTest extends TestCase {
 	}
 
 	/**
-	 * Without credentials the job does nothing rather than issuing
+	 * Without credentials the poller does nothing rather than issuing
 	 * unauthenticated requests once a minute forever.
 	 */
 	public function testNothingIsReadWhenTheServiceIsNotConfigured(): void {
@@ -267,5 +276,33 @@ class AwarenessSyncJobTest extends TestCase {
 		$client->expects($this->never())->method('ensureSubscription');
 
 		$this->tick($this->job($client));
+	}
+
+	/**
+	 * The worker, cron and open Talk pages all poll. Two of them reading the
+	 * stream from the same cursor at once would apply the same page twice
+	 * and race to store where they got to.
+	 */
+	public function testAPollAlreadyRunningElsewhereIsNotJoined(): void {
+		$this->locked = true;
+		$client = $this->createMock(AwarenessClient::class);
+		$client->method('isConfigured')->willReturn(true);
+		$client->expects($this->never())->method('fetchPackets');
+
+		$this->assertNull($this->tick($this->job($client)));
+	}
+
+	/**
+	 * The admin page shows when messages were last checked for, which is how
+	 * an admin tells whether the poll worker is alive.
+	 */
+	public function testRecordsWhenItLastPolled(): void {
+		$calls = [];
+		$poller = $this->job($this->client($calls, [$this->page([['eventId' => 'e1']], null)]));
+
+		$this->assertNull($poller->secondsSinceLastPoll());
+		$this->tick($poller);
+
+		$this->assertLessThan(5, $poller->secondsSinceLastPoll());
 	}
 }

@@ -189,6 +189,36 @@ A `status` of `approved` means step 1 completed. Anything else, and packets will
 
 Webhook delivery needs your Nextcloud to be reachable from the awareness service at `https://<your-host>/apps/w3ds_login/api/webhook`. If it is not, the background job still reads the same packets from the service's history within a minute, so an instance behind NAT works, just less promptly.
 
+#### Getting messages within seconds: the poll worker
+
+Incoming messages are fetched by polling the awareness service; nothing is pushed to the server. Three things poll, and only one runs at a time:
+- **The poll worker** (recommended): every 30 seconds.
+- **Open Talk pages**: every 30 seconds while someone has Talk open.
+- **The background job**: on every cron run, so every 5 minutes on most servers.
+
+Run the worker next to Nextcloud. With systemd, as `/etc/systemd/system/w3ds-awareness-poll.service`:
+
+```ini
+[Unit]
+Description=W3DS awareness poll for Nextcloud
+After=network-online.target mariadb.service postgresql.service
+
+[Service]
+User=www-data
+ExecStart=/usr/bin/php /var/www/nextcloud/occ w3ds_login:awareness-poll --interval=30
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl enable --now w3ds-awareness-poll
+```
+
+The worker exits after an hour (`--max-runtime`) and systemd restarts it with fresh memory. With Docker, run the same command in a second container from the Nextcloud image, sharing its volumes, with `restart: unless-stopped`. **Administration settings → W3DS** shows when messages were last checked for, so you can tell whether the worker is alive.
+
 Chat sync also needs cron on the system scheduler:
 
 ```bash
@@ -289,7 +319,7 @@ Only an account the plugin created can be folded. The link is refused, with "Ask
 
 ### Troubleshooting
 
-**Linked users see no W3DS chats.** Open **Administration settings → W3DS** and run **Test connection**. Without an accepted key and an approved consumer, nothing is delivered. Users can then press **Sync W3DS chats** at the foot of Talk's conversation list, or in **Personal settings → Security**, to fetch their last 30 days of conversations again. The sync runs as a background job, so cron must be running.
+**Linked users see no W3DS chats.** Open **Administration settings → W3DS** and run **Test connection**. Without an accepted key and an approved consumer, nothing is delivered. Users can then press **Sync W3DS chats** at the foot of Talk's conversation list, or in **Personal settings → Security**. That fetches every conversation in their eVault, plus the last 90 days of its messages. The sync runs as a background job, so cron must be running.
 
 **Users from the identity provider have 64-character hex user IDs.** `user_oidc` is still hashing the IdP's `sub`. Configure `--unique-uid=0 --mapping-uid=preferred_username`, as described in the previous section, and delete the hashed accounts.
 

@@ -9,6 +9,31 @@ Entries below are reconstructed from commit history.
 
 ## [Unreleased]
 
+### Added
+
+- New messages can arrive within 30 seconds instead of with the next cron run:
+  - `occ w3ds_login:awareness-poll` polls the awareness service every 30
+    seconds; run it as a service next to Nextcloud;
+  - open Talk pages also trigger a poll every 30 seconds, so chats stay live
+    without the worker while anyone is using Talk.
+
+  A lock ensures only one poll reads the stream at a time. The admin page shows
+  when messages were last checked for.
+
+### Fixed
+
+- "Sync W3DS chats", and the history fetched when someone links, now reach
+  every message.
+  - They used to read the whole network's traffic oldest-first and stop at a
+    page limit. On a busy network that ran out before the recent messages, and
+    still reported success.
+  - They now read only the user's own eVault: every conversation, and 90 days
+    of messages.
+  - A conversation older than the window no longer loses the messages sent in
+    it since.
+- The background poll is marked time-sensitive, so Nextcloud no longer defers
+  it to a maintenance window.
+
 ## [0.10.0] - 2026-10-19
 
 ### Added

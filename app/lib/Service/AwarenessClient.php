@@ -40,9 +40,10 @@ class AwarenessClient {
 	 * The service accepts up to 500. The instance carries packets for every
 	 * platform in the ecosystem -- hundreds of thousands of them -- so the
 	 * ontology filter, not the page size, is what makes this tractable; a
-	 * large page mainly saves round trips while catching up after downtime.
+	 * large page mainly saves round trips while catching up after downtime,
+	 * which is exactly when a short polling interval needs them saved.
 	 */
-	private const PAGE_SIZE = 200;
+	private const PAGE_SIZE = 500;
 
 	public function __construct(
 		private IClientService $clientService,
@@ -77,13 +78,18 @@ class AwarenessClient {
 	 * poll -- which is what stops a fresh install replaying the entire history
 	 * of the ecosystem into someone's Talk.
 	 *
+	 * Passing $evault narrows the read to packets from one eVault. Each
+	 * participant's eVault holds a copy of every chat and message they are
+	 * in, so that is one person's history without the rest of the network's.
+	 *
 	 * @param string[] $ontologies Schema IDs to receive; empty means everything.
+	 * @param string|null $evault The owning eName (`@...`) to restrict to.
 	 * @return array{packets: list<array<string, mixed>>, nextCursor: ?string, hasMore: bool}|null
 	 *                                                                                             Null on failure, which the caller must treat as "try again later"
 	 *                                                                                             rather than "no packets" -- advancing the cursor past an error
 	 *                                                                                             would skip messages permanently.
 	 */
-	public function fetchPackets(?string $cursor, array $ontologies = [], ?string $from = null): ?array {
+	public function fetchPackets(?string $cursor, array $ontologies = [], ?string $from = null, ?string $evault = null): ?array {
 		if (!$this->isConfigured()) {
 			return null;
 		}
@@ -96,6 +102,9 @@ class AwarenessClient {
 			$query['cursor'] = $cursor;
 		} elseif ($from !== null && $from !== '') {
 			$query['from'] = $from;
+		}
+		if ($evault !== null && $evault !== '') {
+			$query['evault'] = $evault;
 		}
 
 		try {

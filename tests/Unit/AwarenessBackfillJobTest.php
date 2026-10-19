@@ -44,15 +44,15 @@ class AwarenessBackfillJobTest extends TestCase {
 	}
 
 	/**
-	 * @param list<array{ontologies: list<string>, from: ?string, cursor: ?string}> $calls
+	 * @param list<array{ontologies: list<string>, from: ?string, cursor: ?string, evault: ?string}> $calls
 	 */
 	private function client(array &$calls, bool $configured = true, bool $failing = false): AwarenessClient {
 		$client = $this->createMock(AwarenessClient::class);
 		$client->method('isConfigured')->willReturn($configured);
 
 		$client->method('fetchPackets')->willReturnCallback(
-			static function (?string $cursor, array $ontologies = [], ?string $from = null) use (&$calls, $failing): ?array {
-				$calls[] = ['ontologies' => $ontologies, 'from' => $from, 'cursor' => $cursor];
+			static function (?string $cursor, array $ontologies = [], ?string $from = null, ?string $evault = null) use (&$calls, $failing): ?array {
+				$calls[] = ['ontologies' => $ontologies, 'from' => $from, 'cursor' => $cursor, 'evault' => $evault];
 
 				if ($failing) {
 					return null;
@@ -114,21 +114,60 @@ class AwarenessBackfillJobTest extends TestCase {
 	}
 
 	/**
-	 * Bounded on purpose. The service holds the whole ecosystem's history, and
-	 * replaying all of it on every login is what once turned one echo bug into
-	 * every attachment a user had received being re-sent to everyone.
+	 * Only this person's packets. Reading the whole network oldest first and
+	 * stopping at a page limit is what left recent messages unread.
 	 */
-	public function testHistoryIsFetchedFromABoundedWindow(): void {
+	public function testOnlyThisPersonsEVaultIsRead(): void {
 		$calls = [];
 		$this->backfill($this->job($this->client($calls)));
 
-		$this->assertNotNull($calls[0]['from'], 'the window must have a start');
+		foreach ($calls as $call) {
+			$this->assertSame(self::W3ID, $call['evault']);
+		}
+	}
+
+	/**
+	 * Messages are only placed in conversations that exist here, so every
+	 * conversation is read, however old: one started before the window
+	 * would otherwise lose every message sent in it since.
+	 */
+	public function testConversationsAreReadWithoutAWindow(): void {
+		$calls = [];
+		$this->backfill($this->job($this->client($calls)));
+
+		$this->assertNull($calls[0]['from']);
+	}
+
+	/**
+	 * Messages still come from a bounded window.
+	 */
+	public function testMessagesAreFetchedFromABoundedWindow(): void {
+		$calls = [];
+		$this->backfill($this->job($this->client($calls)));
+
+		$this->assertNotNull($calls[1]['from'], 'the window must have a start');
 		$this->assertGreaterThan(
-			time() - (90 * 86400),
-			strtotime($calls[0]['from']),
+			time() - (120 * 86400),
+			strtotime($calls[1]['from']),
 			'the window must not reach back indefinitely',
 		);
-		$this->assertLessThan(time(), strtotime($calls[0]['from']));
+		$this->assertLessThan(time(), strtotime($calls[1]['from']));
+	}
+
+	/**
+	 * Running out of pages with more to read is not a complete sync.
+	 */
+	public function testReportsAHistoryLongerThanThePageLimitAsIncomplete(): void {
+		$client = $this->createMock(AwarenessClient::class);
+		$client->method('isConfigured')->willReturn(true);
+		$client->method('fetchPackets')->willReturn(['packets' => [['eventId' => 'e']], 'nextCursor' => 'more', 'hasMore' => true]);
+		$processor = $this->createMock(AwarenessPacketProcessor::class);
+		$processor->method('process')->willReturn(true);
+
+		$this->backfill($this->job($client, $processor), ['w3id' => self::W3ID, 'force' => true]);
+
+		$status = $this->statusService($this->config(), $client)->get(self::W3ID);
+		$this->assertFalse($status['complete']);
 	}
 
 	/**

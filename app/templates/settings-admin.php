@@ -52,6 +52,8 @@ Util::addStyle('w3ds_login', 'admin-settings');
     <dl class="w3ds-admin-facts">
         <dt>Webhook URL</dt>
         <dd><code id="w3ds-admin-webhook-url"></code></dd>
+        <dt>Last check for new messages</dt>
+        <dd id="w3ds-admin-last-poll"></dd>
         <dt>Background jobs</dt>
         <dd id="w3ds-admin-cron"></dd>
     </dl>
