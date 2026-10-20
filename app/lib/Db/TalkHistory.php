@@ -236,7 +236,7 @@ class TalkHistory {
 	 */
 	private const REORDERED = ['comment', 'object_shared', 'comment_deleted'];
 
-	/** Where an undated conversation with no messages sorts: last. */
+	/** Where a conversation with no messages sorts: last. */
 	private const UNDATED = '2000-01-01 00:00:00 UTC';
 
 	/** Every column that refers to a chat entry by id. */
@@ -271,10 +271,9 @@ class TalkHistory {
 	 * message, and updates both whenever anything is written -- an imported
 	 * message from last month, or a notice that someone was added -- so an
 	 * imported conversation jumped to the top as if active right now. Both
-	 * are set from the newest entry by the time it was sent; a conversation
-	 * with no messages here is dated by $chatTime, from its own record.
+	 * are set from the newest entry by the time it was sent.
 	 */
-	public function refreshRoomActivity(string $roomToken, ?\DateTimeInterface $chatTime = null): void {
+	public function refreshRoomActivity(string $roomToken): void {
 		$roomId = $this->roomId($roomToken);
 		if ($roomId === null) {
 			return;
@@ -293,18 +292,15 @@ class TalkHistory {
 		$newest = $result->fetch();
 		$result->closeCursor();
 		if ($newest === false) {
-			// Nothing said here yet, or only before the history window: the
-			// conversation dates from its own record, not from the notice
-			// written when this server created the room. Most records carry
-			// no date at all, and a conversation with nothing in it and no
-			// date has nothing to rank it by: it goes below every
-			// conversation that does, until somebody writes in it.
+			// Nothing said here yet, or only before the history window. The
+			// notice written when this server created the room is not
+			// activity, and a conversation record's own dates change with
+			// every membership edit, so neither says when anyone last spoke:
+			// it goes below every conversation with messages, until somebody
+			// writes in it.
 			$qb = $this->db->getQueryBuilder();
 			$qb->update('talk_rooms')
-				->set('last_activity', $qb->createNamedParameter(
-					$chatTime !== null ? \DateTimeImmutable::createFromInterface($chatTime) : new \DateTimeImmutable(self::UNDATED),
-					IQueryBuilder::PARAM_DATE,
-				))
+				->set('last_activity', $qb->createNamedParameter(new \DateTimeImmutable(self::UNDATED), IQueryBuilder::PARAM_DATE))
 				->where($qb->expr()->eq('id', $qb->createNamedParameter($roomId, IQueryBuilder::PARAM_INT)))
 				->executeStatement();
 			$this->clearTalkCaches();

@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace OCA\W3dsLogin\Command;
 
 use OCA\W3dsLogin\Db\TalkHistory;
-use OCA\W3dsLogin\Service\EvaultClient;
 use OCP\IDBConnection;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\InputInterface;
@@ -24,7 +23,6 @@ class ResequenceRoomsCommand extends Command {
 	public function __construct(
 		private IDBConnection $db,
 		private TalkHistory $talkHistory,
-		private EvaultClient $evaultClient,
 	) {
 		parent::__construct();
 	}
@@ -56,7 +54,7 @@ class ResequenceRoomsCommand extends Command {
 			try {
 				$count = $this->talkHistory->resequence($token);
 				// And its place in the conversation list.
-				$this->talkHistory->refreshRoomActivity($token, $this->chatTime($token));
+				$this->talkHistory->refreshRoomActivity($token);
 			} catch (\Throwable $e) {
 				$output->writeln(sprintf('  <error>%s: %s</error>', $token, $e->getMessage()));
 				continue;
@@ -71,62 +69,5 @@ class ResequenceRoomsCommand extends Command {
 		$output->writeln(sprintf('<info>%d conversation(s) reordered, %d entries moved.</info>', $rooms, $moved));
 
 		return 0;
-	}
-
-	/**
-	 * When the conversation's own record says it last changed, for a room
-	 * with no messages here. Read from the eVault that holds it.
-	 */
-	private function chatTime(string $token): ?\DateTimeImmutable {
-		$qb = $this->db->getQueryBuilder();
-		$qb->select('global_id', 'owner_w3id')
-			->from('w3ds_id_mappings')
-			->where($qb->expr()->eq('entity_type', $qb->createNamedParameter('chat')))
-			->andWhere($qb->expr()->eq('local_id', $qb->createNamedParameter($token)))
-			->setMaxResults(1);
-		$result = $qb->executeQuery();
-		$row = $result->fetch();
-		$result->closeCursor();
-		if ($row === false || !$this->hasNoMessages($token)) {
-			return null;
-		}
-
-		$parsed = $this->evaultClient->fetchMetaEnvelopeById((string)$row['owner_w3id'], (string)$row['global_id'])['parsed'] ?? null;
-		foreach ([$parsed['updatedAt'] ?? null, $parsed['createdAt'] ?? null] as $value) {
-			if (is_string($value) && $value !== '') {
-				try {
-					return new \DateTimeImmutable($value);
-				} catch (\Throwable) {
-				}
-			}
-		}
-
-		return null;
-	}
-
-	private function hasNoMessages(string $token): bool {
-		$qb = $this->db->getQueryBuilder();
-		$qb->select('id')->from('talk_rooms')
-			->where($qb->expr()->eq('token', $qb->createNamedParameter($token)))
-			->setMaxResults(1);
-		$result = $qb->executeQuery();
-		$roomId = $result->fetchOne();
-		$result->closeCursor();
-		if ($roomId === false) {
-			return false;
-		}
-
-		$qb = $this->db->getQueryBuilder();
-		$qb->select('id')
-			->from('comments')
-			->where($qb->expr()->eq('object_type', $qb->createNamedParameter('chat')))
-			->andWhere($qb->expr()->eq('object_id', $qb->createNamedParameter((string)$roomId)))
-			->andWhere($qb->expr()->in('verb', $qb->createNamedParameter(['comment', 'object_shared'], \OCP\DB\QueryBuilder\IQueryBuilder::PARAM_STR_ARRAY)))
-			->setMaxResults(1);
-		$result = $qb->executeQuery();
-		$found = $result->fetchOne() !== false;
-		$result->closeCursor();
-
-		return !$found;
 	}
 }

@@ -9,6 +9,15 @@ Entries below are reconstructed from commit history.
 
 ## [Unreleased]
 
+## [0.15.3] - 2026-10-20
+
+### Fixed
+
+- Every conversation with no messages is listed below the conversations
+  with messages. Dating them by their own record put groups nobody has
+  written in above active ones, because a record's dates change with every
+  membership edit.
+
 ## [0.15.2] - 2026-10-19
 
 ### Fixed
