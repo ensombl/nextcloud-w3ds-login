@@ -42,22 +42,23 @@ class ReadStateServiceTest extends TestCase {
 		$mapper = $this->createMock(IdMappingMapper::class);
 		$mapper->method('getLocalId')->willReturnCallback(fn (string $type, string $id) => $type === 'chat' && $id === 'chat-1' ? 'room' : null);
 
-		// Querying it needs a database; lastMessageUpTo() is stubbed instead.
+		// Querying it needs a database; readMarkerUpTo() is stubbed instead.
 		$talkHistory = (new \ReflectionClass(TalkHistory::class))->newInstanceWithoutConstructor();
 
 		// IDBConnection cannot be mocked against the OCP stubs, so the
 		// collaborators are set directly; what reads the database is stubbed.
 		$service = $this->getMockBuilder(ReadStateService::class)
 			->disableOriginalConstructor()
-			->onlyMethods(['syncedRooms', 'membersWithEName', 'setReadMarker', 'lastMessageUpTo'])
+			->onlyMethods(['syncedRooms', 'membersWithEName', 'setReadMarker', 'readMarkerUpTo'])
 			->getMock();
 		foreach (['history' => $history, 'chatVaults' => $vaults, 'idMappingMapper' => $mapper, 'talkHistory' => $talkHistory, 'logger' => new NullLogger()] as $name => $value) {
 			(new \ReflectionProperty(ReadStateService::class, $name))->setValue($service, $value);
 		}
 		$service->method('syncedRooms')->willReturn(['room']);
-		// Messages at 10:00 (id 10), 11:00 (id 11) and 12:00 (id 12).
-		$service->method('lastMessageUpTo')->willReturnCallback(
-			fn (string $token, \DateTimeImmutable $until): ?int => (int)$until->format('G') >= 10 ? min(12, (int)$until->format('G')) : null,
+		// Notices up to id 9, then messages at 10:00 (id 10), 11:00 (id 11)
+		// and 12:00 (id 12).
+		$service->method('readMarkerUpTo')->willReturnCallback(
+			fn (string $token, ?\DateTimeImmutable $until): ?int => $until === null ? 9 : max(9, min(12, (int)$until->format('G'))),
 		);
 		$service->method('membersWithEName')->willReturn(['alice' => '@alice', 'bob' => '@bob', 'carol' => '@carol']);
 		$this->set = [];
@@ -87,8 +88,9 @@ class ReadStateServiceTest extends TestCase {
 
 		$this->assertSame(['rooms' => 1, 'markers' => 3, 'skipped' => 0], $result);
 		// Alice read up to noon (the receipt's eName in another case), Bob
-		// sent the noon message, and nothing names Carol.
-		$this->assertSame(['alice' => 12, 'bob' => 12, 'carol' => 0], $this->set);
+		// sent the noon message, and nothing names Carol: she has read only
+		// the notices before the first message.
+		$this->assertSame(['alice' => 12, 'bob' => 12, 'carol' => 9], $this->set);
 	}
 
 	public function testAReceiptLaterCopiesDropDoesNotUnreadAMessage(): void {

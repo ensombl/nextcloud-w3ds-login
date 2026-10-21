@@ -9,6 +9,15 @@ Entries below are reconstructed from commit history.
 
 ## [Unreleased]
 
+## [0.16.1] - 2026-10-21
+
+### Fixed
+
+- Rebuilding read state no longer leaves conversations nobody has read in
+  marked as never opened, which Talk shows as one unread message even when
+  they hold none. Someone who has read nothing is marked up to the notices
+  before the first message, and Talk counts only messages as unread.
+
 ## [0.16.0] - 2026-10-21
 
 ### Added

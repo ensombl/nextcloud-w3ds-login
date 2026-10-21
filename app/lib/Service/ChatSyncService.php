@@ -1771,7 +1771,7 @@ class ChatSyncService {
 	 * read. Never back: reading in Talk counts too.
 	 */
 	private function advanceReadMarker(string $roomToken, string $uid, \DateTimeImmutable $until): void {
-		$messageId = $this->talkHistory->lastMessageUpTo($roomToken, $until);
+		$messageId = $this->talkHistory->readMarkerUpTo($roomToken, $until);
 		if ($messageId === null) {
 			return;
 		}
