@@ -20,6 +20,12 @@ class ReadStateServiceTest extends TestCase {
 	/** @var array<string, int> uid => marker set */
 	private array $set = [];
 
+	/** @var array<string, int> uid => their newest message in the room */
+	private array $ownNewest = [];
+
+	/** @var array<string, string> envelope id => comment id showing it */
+	private array $comments = [];
+
 	/**
 	 * @param array<string, list<array<string, mixed>>> $packetsByVault
 	 * @param array<string, bool> $completeByVault
@@ -40,7 +46,11 @@ class ReadStateServiceTest extends TestCase {
 		$vaults->method('forRoom')->willReturn(['@alice', '@bob']);
 
 		$mapper = $this->createMock(IdMappingMapper::class);
-		$mapper->method('getLocalId')->willReturnCallback(fn (string $type, string $id) => $type === 'chat' && $id === 'chat-1' ? 'room' : null);
+		$mapper->method('getLocalId')->willReturnCallback(fn (string $type, string $id) => match ($type) {
+			'chat' => $id === 'chat-1' ? 'room' : null,
+			'message' => $this->comments[$id] ?? null,
+			default => null,
+		});
 
 		// Querying it needs a database; readMarkerUpTo() is stubbed instead.
 		$talkHistory = (new \ReflectionClass(TalkHistory::class))->newInstanceWithoutConstructor();
@@ -49,12 +59,13 @@ class ReadStateServiceTest extends TestCase {
 		// collaborators are set directly; what reads the database is stubbed.
 		$service = $this->getMockBuilder(ReadStateService::class)
 			->disableOriginalConstructor()
-			->onlyMethods(['syncedRooms', 'membersWithEName', 'setReadMarker', 'readMarkerUpTo'])
+			->onlyMethods(['syncedRooms', 'membersWithEName', 'setReadMarker', 'readMarkerUpTo', 'newestOwnEntry'])
 			->getMock();
 		foreach (['history' => $history, 'chatVaults' => $vaults, 'idMappingMapper' => $mapper, 'talkHistory' => $talkHistory, 'logger' => new NullLogger()] as $name => $value) {
 			(new \ReflectionProperty(ReadStateService::class, $name))->setValue($service, $value);
 		}
 		$service->method('syncedRooms')->willReturn(['room']);
+		$service->method('newestOwnEntry')->willReturnCallback(fn (string $token, string $uid): ?int => $this->ownNewest[$uid] ?? null);
 		// Notices up to id 9, then messages at 10:00 (id 10), 11:00 (id 11)
 		// and 12:00 (id 12).
 		$service->method('readMarkerUpTo')->willReturnCallback(
@@ -118,5 +129,31 @@ class ReadStateServiceTest extends TestCase {
 
 		$this->assertSame(['rooms' => 0, 'markers' => 0, 'skipped' => 1], $result);
 		$this->assertSame([], $this->set);
+	}
+
+	public function testEveryoneHasReadWhatTheyPosted(): void {
+		// Carol's message names her by a profile envelope id, not an eName.
+		$this->ownNewest = ['carol' => 11];
+		$message = $this->message('11:00', '@nobody');
+		unset($message['data']['senderEName']);
+		$message['data']['senderId'] = 'profile-envelope-of-carol';
+
+		$this->rebuild(['@alice' => [$message]]);
+
+		$this->assertSame(11, $this->set['carol']);
+	}
+
+	/**
+	 * Some comments were dated when they were imported, not when they were
+	 * sent; a receipt reaches them through the mapping instead.
+	 */
+	public function testAReceiptReachesItsCommentWhateverItsDate(): void {
+		$this->comments = ['env-misdated' => '14'];
+		$message = $this->message('10:00', '@bob', ['@alice']);
+		$message['id'] = 'env-misdated';
+
+		$this->rebuild(['@alice' => [$message]]);
+
+		$this->assertSame(14, $this->set['alice']);
 	}
 }

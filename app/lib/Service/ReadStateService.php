@@ -51,8 +51,10 @@ class ReadStateService {
 			$vaults = array_merge($vaults, $vaultsByRoom[$token]);
 		}
 
-		/** @var array<string, array<string, \DateTimeImmutable>> $readUntil room token => eName => newest read */
+		/** @var array<string, array<string, \DateTimeImmutable>> $readUntil room token => eName => newest read, by when it was sent */
 		$readUntil = [];
+		/** @var array<string, array<string, int>> $readUpTo room token => eName => newest read, by the comment showing it */
+		$readUpTo = [];
 		/** @var array<string, ?string> $roomOfChat */
 		$roomOfChat = [];
 		$incomplete = [];
@@ -65,26 +67,37 @@ class ReadStateService {
 				self::FROM,
 				$vault,
 				self::MAX_PAGES,
-				collect: function (array $packet) use (&$readUntil, &$roomOfChat): void {
+				collect: function (array $packet) use (&$readUntil, &$readUpTo, &$roomOfChat): void {
 					$data = is_array($packet['data'] ?? null) ? $packet['data'] : [];
 					$chatId = $data['chatId'] ?? null;
-					$createdAt = $data['createdAt'] ?? null;
-					if (($data['isReference'] ?? false) === true || !is_string($chatId) || $chatId === ''
-						|| !is_string($createdAt) || $createdAt === '') {
+					if (($data['isReference'] ?? false) === true || !is_string($chatId) || $chatId === '') {
 						return;
 					}
 					$token = $roomOfChat[$chatId] ??= $this->idMappingMapper->getLocalId('chat', $chatId);
-					if ($token === null) {
+					$readers = ChatSyncService::readersOf($data);
+					if ($token === null || $readers === []) {
 						return;
 					}
-					try {
-						$sentAt = new \DateTimeImmutable($createdAt);
-					} catch (\Throwable) {
-						return;
+
+					// The comment showing it, when known, is exact. Its send
+					// time is the fallback: some comments were dated when
+					// they were imported, not when they were sent.
+					$commentId = $this->commentFor(is_string($packet['id'] ?? null) ? $packet['id'] : '', $chatId, $data);
+					$sentAt = null;
+					$createdAt = $data['createdAt'] ?? null;
+					if (is_string($createdAt) && $createdAt !== '') {
+						try {
+							$sentAt = new \DateTimeImmutable($createdAt);
+						} catch (\Throwable) {
+						}
 					}
-					foreach (ChatSyncService::readersOf($data) as $reader) {
+
+					foreach ($readers as $reader) {
 						$key = strtolower($reader);
-						if (!isset($readUntil[$token][$key]) || $sentAt > $readUntil[$token][$key]) {
+						if ($commentId !== null && $commentId > ($readUpTo[$token][$key] ?? 0)) {
+							$readUpTo[$token][$key] = $commentId;
+						}
+						if ($sentAt !== null && (!isset($readUntil[$token][$key]) || $sentAt > $readUntil[$token][$key])) {
 							$readUntil[$token][$key] = $sentAt;
 						}
 					}
@@ -108,9 +121,15 @@ class ReadStateService {
 				}
 			}
 			foreach ($this->membersWithEName($token) as $uid => $w3id) {
-				$until = $readUntil[$token][strtolower($w3id)] ?? null;
-				$messageId = $this->readMarkerUpTo($token, $until);
-				if ($messageId !== null && $this->setReadMarker($token, $uid, $messageId)) {
+				$key = strtolower($w3id);
+				$messageId = $this->readMarkerUpTo($token, $readUntil[$token][$key] ?? null);
+				if ($messageId === null) {
+					continue;
+				}
+				// Everyone has read what they posted themselves, and what a
+				// receipt names by its comment.
+				$messageId = max($messageId, $readUpTo[$token][$key] ?? 0, $this->newestOwnEntry($token, $uid) ?? 0);
+				if ($this->setReadMarker($token, $uid, $messageId)) {
 					$markers++;
 				}
 			}
@@ -164,6 +183,32 @@ class ReadStateService {
 		$result->closeCursor();
 
 		return $members;
+	}
+
+	/**
+	 * The Talk comment showing a message envelope, from the mappings sync
+	 * keeps: directly, or through the message's inner id for a copy.
+	 *
+	 * @param array<string, mixed> $data
+	 */
+	protected function commentFor(string $envelopeId, string $chatId, array $data): ?int {
+		$localId = $envelopeId !== '' ? $this->idMappingMapper->getLocalId('message', $envelopeId) : null;
+		if ($localId !== null && ctype_digit($localId)) {
+			return (int)$localId;
+		}
+		$innerId = $data['id'] ?? null;
+		if (is_string($innerId) && $innerId !== '') {
+			$localId = $this->idMappingMapper->getLocalId('message_comment', $chatId . '|' . $innerId);
+			if ($localId !== null && ctype_digit($localId)) {
+				return (int)$localId;
+			}
+		}
+
+		return null;
+	}
+
+	protected function newestOwnEntry(string $roomToken, string $uid): ?int {
+		return $this->talkHistory->newestOwnEntry($roomToken, $uid);
 	}
 
 	protected function readMarkerUpTo(string $roomToken, ?\DateTimeImmutable $until): ?int {

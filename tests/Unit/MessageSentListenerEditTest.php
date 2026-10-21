@@ -70,8 +70,8 @@ class MessageSentListenerEditTest extends TestCase {
 			public function getParent(): IComment {
 				return $this->edited;
 			}
-			public function getParticipant(): object {
-				return $this->participant;
+			public function getParticipant(): ?object {
+				return null;
 			}
 			public function getRoom(): object {
 				return $this->room;
@@ -79,8 +79,12 @@ class MessageSentListenerEditTest extends TestCase {
 		};
 	}
 
-	private function notice(): IComment {
-		return $this->comment('900', 'system', 'alice', json_encode(['message' => 'message_edited', 'parameters' => ['message' => '77']]));
+	/**
+	 * Talk writes the notice as whoever made the edit, and raises the event
+	 * without a participant.
+	 */
+	private function notice(string $editor = 'alice'): IComment {
+		return $this->comment('900', 'system', $editor, json_encode(['message' => 'message_edited', 'parameters' => ['message' => '77']]));
 	}
 
 	public function testTheAuthorsEditIsPushed(): void {
@@ -97,7 +101,7 @@ class MessageSentListenerEditTest extends TestCase {
 		$sync->expects($this->never())->method('pushMessageEdit');
 
 		(new MessageSentListener($sync, new NullLogger()))
-			->handle($this->event($this->notice(), $this->comment('77', 'comment', 'alice', 'new words'), 'moderator'));
+			->handle($this->event($this->notice('moderator'), $this->comment('77', 'comment', 'alice', 'new words'), 'moderator'));
 	}
 
 	public function testAnEditWrittenByInboundSyncIsNotPushedBack(): void {
