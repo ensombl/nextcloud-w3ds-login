@@ -352,25 +352,45 @@ class TalkHistory {
 	}
 
 	/**
-	 * This app's own record of which envelope each entry mirrors.
+	 * This app's own records naming entries by id: which envelope each
+	 * mirrors, which comment shows a message's copies, and the texts each
+	 * has shown.
 	 *
 	 * @param array<int, int> $moves
 	 */
 	private function moveMappings(array $moves): void {
 		foreach ($moves as $old => $new) {
-			$qb = $this->db->getQueryBuilder();
-			$qb->update('w3ds_id_mappings')
-				->set('local_id', $qb->createNamedParameter('resequence:' . $new))
-				->where($qb->expr()->eq('entity_type', $qb->createNamedParameter('message')))
-				->andWhere($qb->expr()->eq('local_id', $qb->createNamedParameter((string)$old)))
-				->executeStatement();
+			$this->moveMapping((string)$old, 'resequence:' . $new);
 		}
 		foreach ($moves as $new) {
+			$this->moveMapping('resequence:' . $new, (string)$new);
+		}
+	}
+
+	private function moveMapping(string $from, string $to): void {
+		$qb = $this->db->getQueryBuilder();
+		$qb->update('w3ds_id_mappings')
+			->set('local_id', $qb->createNamedParameter($to))
+			->where($qb->expr()->in('entity_type', $qb->createNamedParameter(['message', 'message_comment'], IQueryBuilder::PARAM_STR_ARRAY)))
+			->andWhere($qb->expr()->eq('local_id', $qb->createNamedParameter($from)))
+			->executeStatement();
+
+		// Texts are keyed "<comment id>|<hash>", on both sides.
+		$qb = $this->db->getQueryBuilder();
+		$qb->select('id', 'local_id')
+			->from('w3ds_id_mappings')
+			->where($qb->expr()->eq('entity_type', $qb->createNamedParameter('message_text')))
+			->andWhere($qb->expr()->like('local_id', $qb->createNamedParameter($this->db->escapeLikeParameter($from . '|') . '%')));
+		$result = $qb->executeQuery();
+		$rows = $result->fetchAll();
+		$result->closeCursor();
+		foreach ($rows as $row) {
+			$key = $to . substr((string)$row['local_id'], strlen($from));
 			$qb = $this->db->getQueryBuilder();
 			$qb->update('w3ds_id_mappings')
-				->set('local_id', $qb->createNamedParameter((string)$new))
-				->where($qb->expr()->eq('entity_type', $qb->createNamedParameter('message')))
-				->andWhere($qb->expr()->eq('local_id', $qb->createNamedParameter('resequence:' . $new)))
+				->set('local_id', $qb->createNamedParameter($key))
+				->set('global_id', $qb->createNamedParameter($key))
+				->where($qb->expr()->eq('id', $qb->createNamedParameter((int)$row['id'], IQueryBuilder::PARAM_INT)))
 				->executeStatement();
 		}
 	}

@@ -76,6 +76,13 @@ class MessageSentListener implements IEventListener {
 			$message = $comment->getMessage();
 			$verb = $comment->getVerb();
 
+			// An edit is announced by a system message naming the edited
+			// comment, which the event carries as its parent.
+			if ($verb === 'system' && $this->isEditNotice($message)) {
+				$this->pushEdit($event, $roomToken);
+				return;
+			}
+
 			// We now hear SystemMessageSentEvent too, because that is the only
 			// event a file share emits. Talk's other system messages (joins,
 			// leaves, calls, renames, read markers) are room bookkeeping, not
@@ -118,6 +125,30 @@ class MessageSentListener implements IEventListener {
 				'eventClass' => $eventClass,
 			]);
 		}
+	}
+
+	private function isEditNotice(string $message): bool {
+		$decoded = json_decode($message, true);
+
+		return is_array($decoded) && ($decoded['message'] ?? null) === 'message_edited';
+	}
+
+	/**
+	 * Carry an edit to the eVault when its author made it. A moderator's
+	 * edit of someone else's message stays here: it is not theirs to sign.
+	 */
+	private function pushEdit(Event $event, string $roomToken): void {
+		$edited = method_exists($event, 'getParent') ? $event->getParent() : null;
+		$editor = method_exists($event, 'getParticipant') ? $event->getParticipant() : null;
+		if ($edited === null || $editor === null
+			|| $edited->getVerb() !== 'comment' || $edited->getActorType() !== 'users'
+			|| $editor->getAttendee()->getActorType() !== 'users'
+			|| $editor->getAttendee()->getActorId() !== $edited->getActorId()) {
+			return;
+		}
+
+		\ignore_user_abort(true);
+		$this->chatSyncService->pushMessageEdit($edited->getActorId(), (string)$edited->getId(), $edited->getMessage(), $roomToken);
 	}
 
 	/**
