@@ -109,8 +109,8 @@ class ReadStateService {
 			}
 			foreach ($this->membersWithEName($token) as $uid => $w3id) {
 				$until = $readUntil[$token][strtolower($w3id)] ?? null;
-				$messageId = $until !== null ? ($this->lastMessageUpTo($token, $until) ?? 0) : 0;
-				if ($this->setReadMarker($token, $uid, $messageId)) {
+				$messageId = $this->readMarkerUpTo($token, $until);
+				if ($messageId !== null && $this->setReadMarker($token, $uid, $messageId)) {
 					$markers++;
 				}
 			}
@@ -166,8 +166,8 @@ class ReadStateService {
 		return $members;
 	}
 
-	protected function lastMessageUpTo(string $roomToken, \DateTimeImmutable $until): ?int {
-		return $this->talkHistory->lastMessageUpTo($roomToken, $until);
+	protected function readMarkerUpTo(string $roomToken, ?\DateTimeImmutable $until): ?int {
+		return $this->talkHistory->readMarkerUpTo($roomToken, $until);
 	}
 
 	/**

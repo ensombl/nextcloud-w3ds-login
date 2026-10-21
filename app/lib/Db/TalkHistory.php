@@ -318,27 +318,51 @@ class TalkHistory {
 	}
 
 	/**
-	 * The newest message or file in the room sent at or before $until: the
-	 * furthest someone who has read up to $until has read.
+	 * The read marker for someone who has read every message sent up to
+	 * $until, or none when null: the newest entry before the first message
+	 * they have not read.
+	 *
+	 * Never 0 for a room with entries. Talk takes 0 as "never opened" and
+	 * shows the conversation as unread whatever it holds, so someone who has
+	 * read nothing is marked up to the notices before the first message --
+	 * which Talk does not count as unread anyway.
 	 */
-	public function lastMessageUpTo(string $roomToken, \DateTimeInterface $until): ?int {
+	public function readMarkerUpTo(string $roomToken, ?\DateTimeInterface $until): ?int {
 		$roomId = $this->roomId($roomToken);
 		if ($roomId === null) {
 			return null;
 		}
 
 		$qb = $this->db->getQueryBuilder();
-		$qb->select($qb->func()->max('id'))
+		$qb->select($qb->func()->min('id'))
 			->from('comments')
 			->where($qb->expr()->eq('object_type', $qb->createNamedParameter('chat')))
 			->andWhere($qb->expr()->eq('object_id', $qb->createNamedParameter((string)$roomId)))
-			->andWhere($qb->expr()->in('verb', $qb->createNamedParameter(self::REORDERED, IQueryBuilder::PARAM_STR_ARRAY)))
-			->andWhere($qb->expr()->lte('creation_timestamp', $qb->createNamedParameter($until, IQueryBuilder::PARAM_DATE)));
+			->andWhere($qb->expr()->in('verb', $qb->createNamedParameter(self::REORDERED, IQueryBuilder::PARAM_STR_ARRAY)));
+		if ($until !== null) {
+			$qb->andWhere($qb->expr()->gt('creation_timestamp', $qb->createNamedParameter($until, IQueryBuilder::PARAM_DATE)));
+		}
 		$result = $qb->executeQuery();
-		$id = $result->fetchOne();
+		$firstUnread = $result->fetchOne();
 		$result->closeCursor();
 
-		return $id === null || $id === false ? null : (int)$id;
+		$qb = $this->db->getQueryBuilder();
+		$qb->select($qb->func()->max('id'))
+			->from('comments')
+			->where($qb->expr()->eq('object_type', $qb->createNamedParameter('chat')))
+			->andWhere($qb->expr()->eq('object_id', $qb->createNamedParameter((string)$roomId)));
+		if ($firstUnread !== null && $firstUnread !== false) {
+			$qb->andWhere($qb->expr()->lt('id', $qb->createNamedParameter((int)$firstUnread, IQueryBuilder::PARAM_INT)));
+		}
+		$result = $qb->executeQuery();
+		$marker = $result->fetchOne();
+		$result->closeCursor();
+		if ($marker !== null && $marker !== false) {
+			return (int)$marker;
+		}
+
+		// The first entry is itself unread: mark just before it.
+		return $firstUnread !== null && $firstUnread !== false ? max(1, (int)$firstUnread - 1) : null;
 	}
 
 	private function maxCommentId(): int {
