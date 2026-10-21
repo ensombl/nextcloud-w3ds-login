@@ -810,6 +810,11 @@ class ChatSyncService {
 		}
 
 		$wire = $this->mentionTranslator->toWire($message);
+		// The words replaced are still in older packets and other copies;
+		// remembering them keeps a replay from putting them back.
+		if (is_string($payload['content'] ?? null)) {
+			$this->rememberCommentText($commentId, $payload['content'], $w3id);
+		}
 		$payload['content'] = $wire;
 		$payload['updatedAt'] = $this->toIso8601(time());
 		if ($this->evaultClient->updateMetaEnvelope($w3id, $globalId, self::MESSAGE_SCHEMA_ID, $payload, $this->roomAudience($w3id, $roomToken))) {
@@ -994,7 +999,7 @@ class ChatSyncService {
 			if ($roomToken !== null) {
 				$commentId = $this->commentForEnvelope($existingLocalId, $chatGlobalId, $data, $ownerW3id);
 				if ($commentId !== null) {
-					$this->applyInboundEdit($roomToken, $commentId, $data);
+					$this->applyInboundEdit($roomToken, $commentId, $data, $ownerW3id);
 				}
 				$this->noteReadReceipts($roomToken, $data);
 			}
@@ -1071,7 +1076,7 @@ class ChatSyncService {
 			$this->rememberMessageCopy($globalId, $ownerW3id);
 			$commentId = $this->idMappingMapper->getLocalId(self::MESSAGE_COMMENT_ENTITY, $innerKey);
 			if ($commentId !== null) {
-				$this->applyInboundEdit($roomToken, $commentId, $data);
+				$this->applyInboundEdit($roomToken, $commentId, $data, $ownerW3id);
 			}
 			$this->noteReadReceipts($roomToken, $data);
 			return;
@@ -1186,7 +1191,7 @@ class ChatSyncService {
 					);
 					$this->rememberInnerMessage($innerKey, $ownerW3id);
 					$this->backdateImportedShare((int)$share->getId(), $roomToken, $data['createdAt'] ?? null);
-					$this->noteReadReceipts($roomToken, $data);
+					$this->noteReadReceipts($roomToken, $data, $senderUid);
 					return;
 				}
 
@@ -1207,6 +1212,12 @@ class ChatSyncService {
 			// So the attribution stays in the text. It is weaker than a
 			// server-rendered quote -- a user could type the same words -- but
 			// it is the only representation Talk will actually display here.
+			// Nothing to show -- a call notice, or a message emptied on its
+			// platform -- would be a blank bubble counted as unread.
+			if (trim($content) === '' && $forwardedFrom === null) {
+				return;
+			}
+
 			$quotedLocalId = $this->localCommentForForward($forwardedFrom, $roomToken);
 			$content = $this->attributeForward($content, $forwardedFrom, $ownerW3id);
 
@@ -1236,7 +1247,7 @@ class ChatSyncService {
 			$this->rememberInnerMessage($innerKey, $ownerW3id);
 			$this->rememberMessageComment($innerKey, $localMessageId, $ownerW3id);
 			$this->rememberCommentText($localMessageId, $rawContent, $ownerW3id);
-			$this->noteReadReceipts($roomToken, $data);
+			$this->noteReadReceipts($roomToken, $data, $senderUid);
 		} catch (\Throwable $e) {
 			$this->logger->error('Failed to create local message from webhook', [
 				'globalId' => $globalId,
@@ -1580,7 +1591,7 @@ class ChatSyncService {
 	 *
 	 * @param array<string, mixed> $data
 	 */
-	private function applyInboundEdit(string $roomToken, string $commentId, array $data): void {
+	private function applyInboundEdit(string $roomToken, string $commentId, array $data, string $ownerW3id): void {
 		if (!ctype_digit($commentId) || ($data['type'] ?? 'text') !== 'text'
 			|| isset($data['forwardedFrom']) || $this->pickAttachmentUri($data) !== null) {
 			return;
@@ -1601,14 +1612,22 @@ class ChatSyncService {
 			return;
 		}
 
+		// Nothing older than the comment's last edit can be newer text: a
+		// replay of the original envelope, or a copy nobody updated.
+		$lastEdited = (int)(($comment->getMetaData() ?? [])['last_edited_time'] ?? 0);
+		$updatedAt = is_string($data['updatedAt'] ?? null) ? strtotime($data['updatedAt']) : false;
+		if ($lastEdited > 0 && ($updatedAt === false || $updatedAt <= $lastEdited)) {
+			return;
+		}
+
 		// Comments from before texts were recorded: what one shows now has
 		// been shown, so a copy still carrying it is not an edit back.
 		$shown = $comment->getMessage();
 		$shownWire = $this->mentionTranslator->toWire($shown);
-		$this->rememberCommentText($commentId, $shownWire, '');
+		$this->rememberCommentText($commentId, $shownWire, $ownerW3id);
 		$text = $this->mentionTranslator->toTalk($wire);
 		if ($text === $shown || $shownWire === $wire) {
-			$this->rememberCommentText($commentId, $wire, '');
+			$this->rememberCommentText($commentId, $wire, $ownerW3id);
 			return;
 		}
 
@@ -1620,7 +1639,7 @@ class ChatSyncService {
 			// Talk raises its edit event while this runs; duringIngest() is
 			// what keeps that from being pushed straight back out.
 			$this->duringIngest($authorUid, fn () => $chatManager->editMessage($room, $comment, $participant, $editedAt, $text));
-			$this->rememberCommentText($commentId, $wire, '');
+			$this->rememberCommentText($commentId, $wire, $ownerW3id);
 			$this->logger->info('[W3DS Sync] Applied an edit made elsewhere', [
 				'roomToken' => $roomToken,
 				'localId' => $commentId,
@@ -1706,7 +1725,7 @@ class ChatSyncService {
 	 *
 	 * @param array<string, mixed> $data
 	 */
-	private function noteReadReceipts(string $roomToken, array $data): void {
+	private function noteReadReceipts(string $roomToken, array $data, ?string $senderUid = null): void {
 		$createdAt = $data['createdAt'] ?? null;
 		if (!is_string($createdAt) || $createdAt === '') {
 			return;
@@ -1717,11 +1736,14 @@ class ChatSyncService {
 			return;
 		}
 
+		// The sender is named by a profile envelope id often enough that
+		// readersOf() cannot always find them; whoever posted it here is
+		// known, and has read it.
+		$uids = $senderUid !== null ? [$senderUid] : [];
 		foreach (self::readersOf($data) as $reader) {
-			$uid = $this->readerUid($reader);
-			if ($uid === null) {
-				continue;
-			}
+			$uids[] = $this->readerUid($reader);
+		}
+		foreach (array_unique(array_filter($uids, 'is_string')) as $uid) {
 			$current = $this->readUntil[$roomToken][$uid] ?? null;
 			if ($current === null || $sentAt > $current) {
 				$this->readUntil[$roomToken][$uid] = $sentAt;
@@ -1775,6 +1797,8 @@ class ChatSyncService {
 		if ($messageId === null) {
 			return;
 		}
+		// Whatever the receipts say, they have read what they posted.
+		$messageId = max($messageId, $this->talkHistory->newestOwnEntry($roomToken, $uid) ?? 0);
 		try {
 			$room = \OCP\Server::get(\OCA\Talk\Manager::class)->getRoomByToken($roomToken);
 			$participantService = \OCP\Server::get(\OCA\Talk\Service\ParticipantService::class);

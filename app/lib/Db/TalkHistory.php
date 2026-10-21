@@ -340,6 +340,7 @@ class TalkHistory {
 			->andWhere($qb->expr()->eq('object_id', $qb->createNamedParameter((string)$roomId)))
 			->andWhere($qb->expr()->in('verb', $qb->createNamedParameter(self::REORDERED, IQueryBuilder::PARAM_STR_ARRAY)));
 		if ($until !== null) {
+			$until = \DateTimeImmutable::createFromInterface($until)->setTimezone(new \DateTimeZone('UTC'));
 			$qb->andWhere($qb->expr()->gt('creation_timestamp', $qb->createNamedParameter($until, IQueryBuilder::PARAM_DATE)));
 		}
 		$result = $qb->executeQuery();
@@ -363,6 +364,31 @@ class TalkHistory {
 
 		// The first entry is itself unread: mark just before it.
 		return $firstUnread !== null && $firstUnread !== false ? max(1, (int)$firstUnread - 1) : null;
+	}
+
+	/**
+	 * The newest message or file this person posted in the room: they have
+	 * read at least that far, whatever the receipts say.
+	 */
+	public function newestOwnEntry(string $roomToken, string $uid): ?int {
+		$roomId = $this->roomId($roomToken);
+		if ($roomId === null) {
+			return null;
+		}
+
+		$qb = $this->db->getQueryBuilder();
+		$qb->select($qb->func()->max('id'))
+			->from('comments')
+			->where($qb->expr()->eq('object_type', $qb->createNamedParameter('chat')))
+			->andWhere($qb->expr()->eq('object_id', $qb->createNamedParameter((string)$roomId)))
+			->andWhere($qb->expr()->in('verb', $qb->createNamedParameter(self::REORDERED, IQueryBuilder::PARAM_STR_ARRAY)))
+			->andWhere($qb->expr()->eq('actor_type', $qb->createNamedParameter('users')))
+			->andWhere($qb->expr()->eq('actor_id', $qb->createNamedParameter($uid)));
+		$result = $qb->executeQuery();
+		$id = $result->fetchOne();
+		$result->closeCursor();
+
+		return $id === null || $id === false ? null : (int)$id;
 	}
 
 	private function maxCommentId(): int {

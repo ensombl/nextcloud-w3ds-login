@@ -9,6 +9,23 @@ Entries below are reconstructed from commit history.
 
 ## [Unreleased]
 
+## [0.16.2] - 2026-10-22
+
+### Fixed
+
+- Edits made in Talk reach the eVault. Talk announces an edit without the
+  person who made it, so every edit was skipped; the editor is now read from
+  the edit notice.
+- The texts a message has shown are recorded, so a replayed or out-of-date
+  copy no longer puts old words back and adds an edit notice each time. An
+  envelope not newer than the message's last edit is ignored too.
+- Everyone has read what they posted themselves: senders named by a profile
+  envelope id instead of an eName no longer see their own messages as unread.
+- Read receipts reach the message they name even when it was dated when it
+  was imported rather than when it was sent.
+- Messages with nothing to show, such as call notices, are no longer posted
+  as blank messages counted as unread.
+
 ## [0.16.1] - 2026-10-21
 
 ### Fixed

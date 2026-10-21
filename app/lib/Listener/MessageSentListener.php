@@ -6,6 +6,7 @@ namespace OCA\W3dsLogin\Listener;
 
 use OCA\W3dsLogin\Service\AttachmentSyncService;
 use OCA\W3dsLogin\Service\ChatSyncService;
+use OCP\Comments\IComment;
 use OCP\EventDispatcher\Event;
 use OCP\EventDispatcher\IEventListener;
 use Psr\Log\LoggerInterface;
@@ -79,7 +80,7 @@ class MessageSentListener implements IEventListener {
 			// An edit is announced by a system message naming the edited
 			// comment, which the event carries as its parent.
 			if ($verb === 'system' && $this->isEditNotice($message)) {
-				$this->pushEdit($event, $roomToken);
+				$this->pushEdit($event, $comment, $roomToken);
 				return;
 			}
 
@@ -137,13 +138,14 @@ class MessageSentListener implements IEventListener {
 	 * Carry an edit to the eVault when its author made it. A moderator's
 	 * edit of someone else's message stays here: it is not theirs to sign.
 	 */
-	private function pushEdit(Event $event, string $roomToken): void {
+	private function pushEdit(Event $event, IComment $notice, string $roomToken): void {
+		// Talk raises this event without a participant; the notice itself
+		// is written by whoever made the edit.
 		$edited = method_exists($event, 'getParent') ? $event->getParent() : null;
-		$editor = method_exists($event, 'getParticipant') ? $event->getParticipant() : null;
-		if ($edited === null || $editor === null
+		if (!$edited instanceof IComment
 			|| $edited->getVerb() !== 'comment' || $edited->getActorType() !== 'users'
-			|| $editor->getAttendee()->getActorType() !== 'users'
-			|| $editor->getAttendee()->getActorId() !== $edited->getActorId()) {
+			|| $notice->getActorType() !== 'users'
+			|| $notice->getActorId() !== $edited->getActorId()) {
 			return;
 		}
 

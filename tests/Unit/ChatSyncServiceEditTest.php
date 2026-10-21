@@ -72,8 +72,11 @@ class ChatSyncServiceEditTest extends TestCase {
 	public function testAnEditMadeHereUpdatesTheAuthorsEnvelope(): void {
 		$mapper = $this->createMock(IdMappingMapper::class);
 		$mapper->method('findByLocalId')->with('message', '77')->willReturn($this->mapping('env-1', '@alice'));
-		$mapper->expects($this->once())->method('storeMapping')
-			->with('message_text', '77|' . sha1('fixed typo'), '77|' . sha1('fixed typo'));
+		$stored = [];
+		$mapper->method('storeMapping')->willReturnCallback(function (string $type, string $local) use (&$stored): IdMapping {
+			$stored[] = $type . ':' . $local;
+			return new IdMapping();
+		});
 
 		$evault = $this->createMock(EvaultClient::class);
 		$evault->method('fetchMetaEnvelopeById')->with('@alice', 'env-1')->willReturn([
@@ -105,6 +108,10 @@ class ChatSyncServiceEditTest extends TestCase {
 		}
 
 		$service->pushMessageEdit('alice', '77', 'fixed typo', 'room');
+
+		// Both the new words and the ones they replaced: a replay of the
+		// original envelope must not put the typo back.
+		$this->assertSame(['message_text:77|' . sha1('fixd typo'), 'message_text:77|' . sha1('fixed typo')], $stored);
 	}
 
 	public function testSomeoneElsesMessageIsLeftAlone(): void {
@@ -193,7 +200,7 @@ class ChatSyncServiceEditTest extends TestCase {
 		$mapper->expects($this->never())->method('storeMapping');
 
 		$method = new \ReflectionMethod(ChatSyncService::class, 'applyInboundEdit');
-		$method->invoke($this->service(['idMappingMapper' => $mapper]), 'room', '77', ['type' => 'text', 'content' => 'old words']);
+		$method->invoke($this->service(['idMappingMapper' => $mapper]), 'room', '77', ['type' => 'text', 'content' => 'old words'], '@bob');
 	}
 
 	/**
@@ -206,7 +213,7 @@ class ChatSyncServiceEditTest extends TestCase {
 		$mapper->expects($this->never())->method('storeMapping');
 
 		$method = new \ReflectionMethod(ChatSyncService::class, 'applyInboundEdit');
-		$method->invoke($this->service(['idMappingMapper' => $mapper]), 'room', '77', $data);
+		$method->invoke($this->service(['idMappingMapper' => $mapper]), 'room', '77', $data, '@bob');
 	}
 
 	/**
