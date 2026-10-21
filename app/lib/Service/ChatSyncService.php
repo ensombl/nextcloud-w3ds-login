@@ -21,6 +21,18 @@ class ChatSyncService {
 	private const MESSAGE_INNER_ENTITY = 'message_inner';
 
 	/**
+	 * Mapping rows from a message's inner identity (global) to the Talk
+	 * comment showing it (local), so an edit arriving on any copy finds it.
+	 */
+	private const MESSAGE_COMMENT_ENTITY = 'message_comment';
+
+	/**
+	 * Mapping rows recording each text a comment has shown, keyed
+	 * "<comment id>|<sha1 of the text as sent>"; see applyInboundEdit().
+	 */
+	private const MESSAGE_TEXT_ENTITY = 'message_text';
+
+	/**
 	 * Rooms that received something older than their newest entry, and so
 	 * need their order restored; see flushResequencing().
 	 *
@@ -669,20 +681,10 @@ class ChatSyncService {
 			'isSystemMessage' => false,
 		];
 
-		$acl = [$w3id]; // At minimum, sender can access
-
 		// Everyone in the room needs to be able to read the message, and
-		// needs a pointer to it in their own vault. Resolved from the live
-		// room rather than the payload: the payload carries envelope IDs,
-		// and references are addressed by eName.
-		[$participantUids] = $this->readRoomState($roomToken, []);
-		$participantW3ids = $this->resolveParticipantW3ids($participantUids);
-		if (!in_array($w3id, $participantW3ids, true)) {
-			$participantW3ids[] = $w3id;
-		}
-		if (count($participantW3ids) > 1) {
-			$acl = $participantW3ids;
-		}
+		// needs a pointer to it in their own vault.
+		$participantW3ids = $this->roomAudience($w3id, $roomToken);
+		$acl = $participantW3ids;
 
 		// A file share carries no user text -- the comment message is a JSON
 		// share reference and the bytes live in Nextcloud. Upload the blob and
@@ -741,7 +743,10 @@ class ChatSyncService {
 				$this->idMappingMapper->storeMapping('message', $localId, $globalId, $w3id);
 				// Copies of this message come back from participants' eVaults
 				// under other envelope ids; the inner id is how they are known.
-				$this->rememberInnerMessage($this->innerMessageKey($chatGlobalId, $payload), $w3id);
+				$innerKey = $this->innerMessageKey($chatGlobalId, $payload);
+				$this->rememberInnerMessage($innerKey, $w3id);
+				$this->rememberMessageComment($innerKey, $localId, $w3id);
+				$this->rememberCommentText($localId, $payload['content'], $w3id);
 				$this->logger->info('[W3DS Sync] Pushed new message to eVault', [
 					'localId' => $localId,
 					'globalId' => $globalId,
@@ -751,6 +756,70 @@ class ChatSyncService {
 			} else {
 				$this->logger->error('[W3DS Sync] Failed to create message MetaEnvelope', ['localId' => $localId]);
 			}
+		}
+	}
+
+	/**
+	 * Everyone in the room by eName, the sender included. Resolved from the
+	 * live room rather than a payload: payloads carry envelope IDs, and
+	 * references and ACLs are addressed by eName.
+	 *
+	 * @return list<string>
+	 */
+	protected function roomAudience(string $w3id, string $roomToken): array {
+		[$participantUids] = $this->readRoomState($roomToken, []);
+		$participantW3ids = $this->resolveParticipantW3ids($participantUids);
+		if (!in_array($w3id, $participantW3ids, true)) {
+			$participantW3ids[] = $w3id;
+		}
+
+		return array_values($participantW3ids);
+	}
+
+	/**
+	 * Carry an edit made in Talk to the message's envelope.
+	 *
+	 * Only the author's own envelope is changed: a message ingested from
+	 * someone else lives in their eVault, and the copies other platforms keep
+	 * in participants' eVaults are theirs to update.
+	 */
+	public function pushMessageEdit(string $ncUid, string $commentId, string $message, string $roomToken): void {
+		$w3id = $this->userProvisioning->getLinkedW3id($ncUid);
+		if ($w3id === null) {
+			return;
+		}
+
+		try {
+			$mapping = $this->idMappingMapper->findByLocalId('message', $commentId);
+		} catch (DoesNotExistException) {
+			// Never synced, so there is nothing elsewhere to correct.
+			return;
+		}
+		if ($mapping->getOwnerW3id() !== $w3id) {
+			return;
+		}
+
+		$globalId = $mapping->getGlobalId();
+		$payload = $this->evaultClient->fetchMetaEnvelopeById($w3id, $globalId)['parsed'] ?? null;
+		if (!is_array($payload)) {
+			$this->logger->warning('[W3DS Sync] Cannot push edit: message envelope not readable', [
+				'localId' => $commentId,
+				'globalId' => $globalId,
+			]);
+			return;
+		}
+
+		$wire = $this->mentionTranslator->toWire($message);
+		$payload['content'] = $wire;
+		$payload['updatedAt'] = $this->toIso8601(time());
+		if ($this->evaultClient->updateMetaEnvelope($w3id, $globalId, self::MESSAGE_SCHEMA_ID, $payload, $this->roomAudience($w3id, $roomToken))) {
+			// The update comes back through the stream; this is how it is
+			// recognised as ours rather than applied as an edit again.
+			$this->rememberCommentText($commentId, $wire, $w3id);
+			$this->logger->info('[W3DS Sync] Pushed message edit to eVault', [
+				'localId' => $commentId,
+				'globalId' => $globalId,
+			]);
 		}
 	}
 
@@ -918,10 +987,15 @@ class ChatSyncService {
 		// Check for duplicate
 		$existingLocalId = $this->idMappingMapper->getLocalId('message', $globalId);
 		if ($existingLocalId !== null) {
-			// Already here, but the envelope may say more about who has
-			// read it by now.
-			$roomToken = $this->idMappingMapper->getLocalId('chat', (string)($data['chatId'] ?? ''));
+			// Already here, but the envelope may have been edited since, and
+			// may say more about who has read it by now.
+			$chatGlobalId = (string)($data['chatId'] ?? '');
+			$roomToken = $this->idMappingMapper->getLocalId('chat', $chatGlobalId);
 			if ($roomToken !== null) {
+				$commentId = $this->commentForEnvelope($existingLocalId, $chatGlobalId, $data, $ownerW3id);
+				if ($commentId !== null) {
+					$this->applyInboundEdit($roomToken, $commentId, $data);
+				}
 				$this->noteReadReceipts($roomToken, $data);
 			}
 			return;
@@ -995,6 +1069,10 @@ class ChatSyncService {
 		$innerKey = $this->innerMessageKey($chatGlobalId, $data);
 		if ($innerKey !== null && $this->idMappingMapper->getLocalId(self::MESSAGE_INNER_ENTITY, $innerKey) !== null) {
 			$this->rememberMessageCopy($globalId, $ownerW3id);
+			$commentId = $this->idMappingMapper->getLocalId(self::MESSAGE_COMMENT_ENTITY, $innerKey);
+			if ($commentId !== null) {
+				$this->applyInboundEdit($roomToken, $commentId, $data);
+			}
 			$this->noteReadReceipts($roomToken, $data);
 			return;
 		}
@@ -1156,6 +1234,8 @@ class ChatSyncService {
 			// fresh envelope.
 			$this->idMappingMapper->storeMapping('message', $localMessageId, $globalId, $ownerW3id, 'inbound');
 			$this->rememberInnerMessage($innerKey, $ownerW3id);
+			$this->rememberMessageComment($innerKey, $localMessageId, $ownerW3id);
+			$this->rememberCommentText($localMessageId, $rawContent, $ownerW3id);
 			$this->noteReadReceipts($roomToken, $data);
 		} catch (\Throwable $e) {
 			$this->logger->error('Failed to create local message from webhook', [
@@ -1439,6 +1519,122 @@ class ChatSyncService {
 	}
 
 	/**
+	 * The Talk comment showing an envelope already seen, or null for one
+	 * shown as a file share. An envelope mapped to its comment directly also
+	 * records the comment for its copies, which carry only the inner id.
+	 *
+	 * @param array<string, mixed> $data
+	 */
+	private function commentForEnvelope(string $localId, string $chatGlobalId, array $data, string $ownerW3id): ?string {
+		$innerKey = $this->innerMessageKey($chatGlobalId, $data);
+		if (ctype_digit($localId)) {
+			$this->rememberMessageComment($innerKey, $localId, $ownerW3id);
+			return $localId;
+		}
+		if (str_starts_with($localId, 'copy:') && $innerKey !== null) {
+			return $this->idMappingMapper->getLocalId(self::MESSAGE_COMMENT_ENTITY, $innerKey);
+		}
+
+		return null;
+	}
+
+	private function rememberMessageComment(?string $innerKey, string $commentId, string $ownerW3id): void {
+		if ($innerKey === null || $this->idMappingMapper->getLocalId(self::MESSAGE_COMMENT_ENTITY, $innerKey) !== null) {
+			return;
+		}
+		try {
+			$this->idMappingMapper->storeMapping(self::MESSAGE_COMMENT_ENTITY, $commentId, $innerKey, $ownerW3id, 'inbound');
+		} catch (\Throwable) {
+			// Recorded concurrently, or the comment already has its row.
+		}
+	}
+
+	private function rememberCommentText(string $commentId, string $wire, string $ownerW3id): void {
+		$key = $commentId . '|' . sha1($wire);
+		if ($this->idMappingMapper->getGlobalId(self::MESSAGE_TEXT_ENTITY, $key) !== null) {
+			return;
+		}
+		try {
+			$this->idMappingMapper->storeMapping(self::MESSAGE_TEXT_ENTITY, $key, $key, $ownerW3id, 'inbound');
+		} catch (\Throwable) {
+			// Recorded concurrently; either row says the same.
+		}
+	}
+
+	private function hasShownText(string $commentId, string $wire): bool {
+		return $this->idMappingMapper->getGlobalId(self::MESSAGE_TEXT_ENTITY, $commentId . '|' . sha1($wire)) !== null;
+	}
+
+	/**
+	 * Show a message's new text when it was edited elsewhere.
+	 *
+	 * An edit arrives as the same envelope with different content. It can
+	 * also arrive out of date: copies of one message sit in several eVaults,
+	 * a platform may update only some of them, and a history fetch reads
+	 * them all again. So every text a comment has shown is remembered, and
+	 * only one it has never shown counts as an edit -- a stale copy never
+	 * puts the old words back.
+	 *
+	 * Text messages only: a forward shows text this side composed, and a
+	 * file share's caption is part of the share.
+	 *
+	 * @param array<string, mixed> $data
+	 */
+	private function applyInboundEdit(string $roomToken, string $commentId, array $data): void {
+		if (!ctype_digit($commentId) || ($data['type'] ?? 'text') !== 'text'
+			|| isset($data['forwardedFrom']) || $this->pickAttachmentUri($data) !== null) {
+			return;
+		}
+		$wire = $data['content'] ?? null;
+		if (!is_string($wire) || trim($wire) === '' || $this->hasShownText($commentId, $wire)) {
+			return;
+		}
+
+		try {
+			$room = \OCP\Server::get(\OCA\Talk\Manager::class)->getRoomByToken($roomToken);
+			$chatManager = \OCP\Server::get(\OCA\Talk\Chat\ChatManager::class);
+			$comment = $chatManager->getComment($room, $commentId);
+		} catch (\Throwable) {
+			return;
+		}
+		if ($comment->getVerb() !== 'comment' || $comment->getActorType() !== 'users') {
+			return;
+		}
+
+		// Comments from before texts were recorded: what one shows now has
+		// been shown, so a copy still carrying it is not an edit back.
+		$shown = $comment->getMessage();
+		$shownWire = $this->mentionTranslator->toWire($shown);
+		$this->rememberCommentText($commentId, $shownWire, '');
+		$text = $this->mentionTranslator->toTalk($wire);
+		if ($text === $shown || $shownWire === $wire) {
+			$this->rememberCommentText($commentId, $wire, '');
+			return;
+		}
+
+		$authorUid = $comment->getActorId();
+		try {
+			$participant = \OCP\Server::get(\OCA\Talk\Service\ParticipantService::class)
+				->getParticipant($room, $authorUid, false);
+			$editedAt = $this->parseCreatedAt(is_string($data['updatedAt'] ?? null) ? $data['updatedAt'] : null);
+			// Talk raises its edit event while this runs; duringIngest() is
+			// what keeps that from being pushed straight back out.
+			$this->duringIngest($authorUid, fn () => $chatManager->editMessage($room, $comment, $participant, $editedAt, $text));
+			$this->rememberCommentText($commentId, $wire, '');
+			$this->logger->info('[W3DS Sync] Applied an edit made elsewhere', [
+				'roomToken' => $roomToken,
+				'localId' => $commentId,
+			]);
+		} catch (\Throwable $e) {
+			$this->logger->warning('[W3DS Sync] Could not apply an edit made elsewhere', [
+				'roomToken' => $roomToken,
+				'localId' => $commentId,
+				'exception' => $e->getMessage(),
+			]);
+		}
+	}
+
+	/**
 	 * Bring every room that received messages up to date: its order, who has
 	 * read what, and its place in the conversation list.
 	 *
@@ -1521,6 +1717,27 @@ class ChatSyncService {
 			return;
 		}
 
+		foreach (self::readersOf($data) as $reader) {
+			$uid = $this->readerUid($reader);
+			if ($uid === null) {
+				continue;
+			}
+			$current = $this->readUntil[$roomToken][$uid] ?? null;
+			if ($current === null || $sentAt > $current) {
+				$this->readUntil[$roomToken][$uid] = $sentAt;
+			}
+		}
+		$this->touchRoom($roomToken);
+	}
+
+	/**
+	 * Everyone a message envelope says has read it, by eName: its sender,
+	 * and the eNames in `readBy` and `readByAt`.
+	 *
+	 * @param array<string, mixed> $data
+	 * @return list<string>
+	 */
+	public static function readersOf(array $data): array {
 		$readers = [];
 		foreach ([$data['senderEName'] ?? null, $data['senderId'] ?? null] as $sender) {
 			if (is_string($sender) && str_starts_with($sender, '@')) {
@@ -1534,17 +1751,7 @@ class ChatSyncService {
 			$readers = array_merge($readers, array_filter(array_keys($data['readByAt']), 'is_string'));
 		}
 
-		foreach (array_unique($readers) as $reader) {
-			$uid = $this->readerUid($reader);
-			if ($uid === null) {
-				continue;
-			}
-			$current = $this->readUntil[$roomToken][$uid] ?? null;
-			if ($current === null || $sentAt > $current) {
-				$this->readUntil[$roomToken][$uid] = $sentAt;
-			}
-		}
-		$this->touchRoom($roomToken);
+		return array_values(array_unique($readers));
 	}
 
 	private function readerUid(string $w3id): ?string {

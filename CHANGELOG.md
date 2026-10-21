@@ -9,6 +9,18 @@ Entries below are reconstructed from commit history.
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-10-21
+
+### Added
+
+- Edits sync both ways. Editing a message in Talk updates its envelope in
+  the author's eVault; an edit made on another platform updates the message
+  in Talk, whichever copy of the message carries it. Out-of-date copies never
+  put old words back.
+- `occ w3ds_login:rebuild-read-state` sets every read marker in synced
+  conversations to exactly what the messages' read receipts say, forward or
+  back, including for the peers whose markers Talk shows as read ticks.
+
 ## [0.15.3] - 2026-10-20
 
 ### Fixed
